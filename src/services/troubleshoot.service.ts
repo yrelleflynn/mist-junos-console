@@ -1,0 +1,2497 @@
+/**
+ * troubleshoot.service.ts — Cloud connectivity troubleshooting engine
+ *
+ * Runs a series of Junos CLI checks to determine why a switch
+ * cannot connect to the Mist cloud. Checks are run sequentially
+ * and results are reported via callbacks.
+ */
+
+import { CommandRunnerService, CommandResult } from './command-runner.service';
+import { MistApiService, MistDeviceEvent, MistAuditLog } from './mist-api.service';
+import { MistCloud, MistEndpoint } from '../config/mist-clouds.config';
+
+export type CheckStatus = 'pending' | 'running' | 'pass' | 'fail' | 'warn' | 'skip' | 'info';
+
+export interface CheckResult {
+  id: string;
+  name: string;
+  status: CheckStatus;
+  detail: string;
+  raw?: string;
+  remediation?: string;
+  commands?: string[];
+}
+
+export type CheckProgressCallback = (result: CheckResult) => void;
+
+export interface LldpNeighbor {
+  localInterface: string;
+  parentInterface: string;
+  chassisId: string;     // MAC address of the upstream switch
+  portInfo: string;      // Port description/name on the upstream switch (Mist port alias)
+  systemName: string;    // Hostname of the upstream switch
+}
+
+export interface UpstreamPortConfig {
+  neighborName: string;
+  neighborMac: string;
+  neighborDeviceId: string | null;
+  neighborSiteId: string | null;
+  remotePortInfo: string;
+  remoteInterface: string | null;
+  usageProfile: string | null;    // Mist port usage profile name (e.g. "Trunk_uplink")
+  portMode: string | null;        // 'trunk' | 'access' | null
+  allNetworks: boolean;
+  nativeVlan: string | null;
+  vlans: string[];
+  voipNetwork: string | null;
+  speed: string | null;
+  duplex: string | null;
+  rawPortConfig: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  networkDefinitions: Record<string, any>;
+}
+
+export interface TroubleshootOptions {
+  cloud: MistCloud;
+  uplinkPort?: string;
+  siteId?: string;
+  deviceId?: string;
+  onProgress: CheckProgressCallback;
+}
+
+export class TroubleshootService {
+  private runner: CommandRunnerService;
+  private mistApi: MistApiService | null;
+
+  constructor(runner: CommandRunnerService, mistApi?: MistApiService) {
+    this.runner = runner;
+    this.mistApi = mistApi || null;
+  }
+
+  /**
+   * Run all cloud connectivity checks.
+   * Returns the final array of results.
+   */
+  async runAll(options: TroubleshootOptions): Promise<CheckResult[]> {
+    const results: CheckResult[] = [];
+    const { cloud, onProgress } = options;
+
+    /** Helper to push a result and report progress */
+    const report = (result: CheckResult) => {
+      results.push(result);
+      onProgress(result);
+    };
+
+    /** Helper to skip remaining checks with a reason */
+    const skipRemaining = (reason: string, checkNames: string[]) => {
+      for (const name of checkNames) {
+        report({ id: `skip-${name.replace(/\s+/g, '-').toLowerCase()}`, name, status: 'skip', detail: `Skipped — ${reason}` });
+      }
+    };
+
+    // Disable pagination first
+    await this.runner.ensureOperationalMode();
+
+    // 1. LLDP — detect uplink
+    let uplinkPort = options.uplinkPort || '';
+    const lldpResult = await this.checkLldp(uplinkPort);
+    report(lldpResult.result);
+
+    if (!uplinkPort && lldpResult.detectedPort) {
+      uplinkPort = lldpResult.detectedPort;
+    }
+
+    // 1b. Look up upstream switch port config in Mist
+    let upstreamConfig: UpstreamPortConfig | null = null;
+    if (lldpResult.uplinkNeighbor) {
+      const upstreamResult = await this.lookupUpstreamPortConfig(lldpResult.uplinkNeighbor);
+      report(upstreamResult.result);
+      upstreamConfig = upstreamResult.config;
+    }
+
+    // 2. Port Status
+    const portResult = await this.checkPortStatus(uplinkPort);
+    report(portResult);
+
+    // 2b. Interface Error Counters (only if port is up)
+    if (uplinkPort && portResult.status === 'pass') {
+      const errorResult = await this.checkInterfaceErrors(uplinkPort);
+      report(errorResult);
+    }
+
+    // 3. VLAN Config
+    const vlanResult = await this.checkVlanConfig(uplinkPort);
+    report(vlanResult);
+
+    // 3b. Uplink Port Config Comparison (if upstream config is known)
+    if (upstreamConfig && uplinkPort) {
+      const compResults = await this.compareUplinkConfig(
+        uplinkPort, upstreamConfig, options.siteId, options.deviceId,
+      );
+      for (const r of compResults) report(r);
+    }
+
+    // 4. Interface IP — CRITICAL: no IP means nothing beyond this will work
+    const ipResult = await this.checkInterfaceIp();
+    report(ipResult.result);
+
+    if (ipResult.result.status === 'fail') {
+      skipRemaining('no management IP address', [
+        'DHCP Lease Details', 'ARP Table', 'Default Gateway',
+        'DNS Configuration', 'DNS Resolution & Reachability',
+        'Route to Mist Endpoints',
+        'Mist Agent Version', 'Mist Agent Processes', 'Outbound SSH Config', 'Active Cloud Connections',
+      ]);
+      return results;
+    }
+
+    // 4b. DHCP Lease Details
+    const dhcpResult = await this.checkDhcpLease();
+    report(dhcpResult);
+
+    // 5. ARP
+    const arpResult = await this.checkArp();
+    report(arpResult);
+
+    // 6. Default Route — CRITICAL: no route means no cloud connectivity
+    const routeResult = await this.checkDefaultRoute();
+    report(routeResult);
+
+    if (routeResult.status === 'fail') {
+      skipRemaining('no default route', [
+        'DNS Configuration', 'DNS Resolution & Reachability',
+        'Route to Mist Endpoints',
+        'Mist Agent Version', 'Mist Agent Processes', 'Outbound SSH Config', 'Active Cloud Connections',
+      ]);
+      return results;
+    }
+
+    // 7. DNS Config
+    const dnsConfigResult = await this.checkDnsConfig();
+    report(dnsConfigResult);
+
+    // 8. DNS Resolution — CRITICAL: if DNS doesn't resolve, skip endpoint checks
+    const dnsResolveResult = await this.checkDnsResolution(cloud);
+    report(dnsResolveResult);
+
+    if (dnsResolveResult.status === 'fail') {
+      skipRemaining('DNS resolution failed', [
+        'Route to Mist Endpoints',
+        'Mist Agent Version', 'Mist Agent Processes', 'Outbound SSH Config', 'Active Cloud Connections',
+      ]);
+      return results;
+    }
+
+    // 9. Route Table Check for Mist Endpoints
+    const routeCheckResult = await this.checkRouteToMistEndpoints(cloud);
+    report(routeCheckResult);
+
+    // 10. Mist Cloud Status
+    const mistResults = await this.checkMistCloudStatus(ipResult.mgmtIp, cloud, options.siteId, options.deviceId);
+    for (const r of mistResults) {
+      report(r);
+    }
+
+    return results;
+  }
+
+  /**
+   * Standalone Firewall Policy Check.
+   * Tests each Mist cloud endpoint with telnet (port allowed/denied) and
+   * SSL cert check on port 443 (inspecting/not inspecting).
+   */
+  async checkFirewallPolicy(cloud: MistCloud): Promise<CheckResult[]> {
+    await this.runner.ensureOperationalMode();
+    const results: CheckResult[] = [];
+
+    if (cloud.switchEndpoints.length === 0) {
+      results.push({
+        id: 'fw-check',
+        name: 'Firewall Policy Check',
+        status: 'skip',
+        detail: 'No endpoints configured for this cloud region',
+      });
+      return results;
+    }
+
+    // Phase 1: Telnet reachability for all endpoints (from Junos CLI)
+    for (const endpoint of cloud.switchEndpoints) {
+      const reachResult = await this.checkEndpointReachability(endpoint);
+
+      // Rewrite the result to use firewall-focused language
+      const fwId = `fw-policy-${endpoint.host.replace(/\./g, '-')}-${endpoint.port}`;
+      const fwName = `${endpoint.host}:${endpoint.port}`;
+
+      if (reachResult.status === 'pass') {
+        results.push({
+          id: fwId,
+          name: fwName,
+          status: 'pass',
+          detail: `Firewall Policy: ALLOWED traffic (TCP ${endpoint.port})`,
+          raw: reachResult.raw,
+        });
+      } else if (reachResult.status === 'fail') {
+        results.push({
+          id: fwId,
+          name: fwName,
+          status: 'fail',
+          detail: `Firewall Policy: DENIED traffic (TCP ${endpoint.port})`,
+          raw: reachResult.raw,
+        });
+
+        // Traceroute on failure
+        const traceResult = await this.checkTraceroute(endpoint);
+        results.push(traceResult);
+      } else {
+        results.push({
+          id: fwId,
+          name: fwName,
+          status: reachResult.status,
+          detail: `Firewall Policy: ${reachResult.detail}`,
+          raw: reachResult.raw,
+        });
+      }
+    }
+
+    // Phase 2: SSL cert check for port 443 endpoints (requires shell)
+    const port443Endpoints = cloud.switchEndpoints.filter((e) => e.port === 443);
+
+    if (port443Endpoints.length > 0) {
+      for (const endpoint of port443Endpoints) {
+        const certResult = await this.checkSslCertificate(endpoint);
+
+        // Rewrite the result to use firewall inspection language
+        const inspId = `fw-inspect-${endpoint.host.replace(/\./g, '-')}`;
+        const inspName = `Inspection: ${endpoint.host}`;
+
+        if (certResult.status === 'pass') {
+          results.push({
+            id: inspId,
+            name: inspName,
+            status: 'pass',
+            detail: `Firewall NOT inspecting connection — ${certResult.detail.replace('Certificate OK — ', '')}`,
+            raw: certResult.raw,
+          });
+        } else if (certResult.status === 'fail') {
+          results.push({
+            id: inspId,
+            name: inspName,
+            status: 'fail',
+            detail: `Firewall INSPECTING connection — ${certResult.detail}`,
+            raw: certResult.raw,
+          });
+        } else {
+          results.push({
+            id: inspId,
+            name: inspName,
+            status: certResult.status,
+            detail: certResult.detail,
+            raw: certResult.raw,
+          });
+        }
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Standalone Mist cloud status check.
+   * Can be called independently from the full troubleshoot flow.
+   * @param mgmtIp — management IP to grep connections for (optional, auto-detects if not provided)
+   * @param cloud — Mist cloud config for validating destination IPs against known endpoints
+   */
+  async checkMistCloudStatus(mgmtIp?: string | null, cloud?: MistCloud | null, siteId?: string, deviceId?: string): Promise<CheckResult[]> {
+    await this.runner.ensureOperationalMode();
+    const results: CheckResult[] = [];
+
+    // If no mgmt IP provided, detect it
+    if (!mgmtIp) {
+      const ipResult = await this.checkInterfaceIp();
+      mgmtIp = ipResult.mgmtIp;
+    }
+
+    // 10a. Mist Agent Version
+    results.push(await this.checkMistAgentVersion());
+
+    // 10b. Mist Agent Processes (mcd/jmd running)
+    results.push(await this.checkMistAgentProcesses());
+
+    // 10c. Outbound SSH Configuration
+    const sshResult = await this.checkOutboundSshConfig();
+    results.push(sshResult.result);
+
+    // 10d. Active Cloud Connections (grep on management IP, validate against cloud endpoints)
+    results.push(await this.checkActiveCloudConnections(mgmtIp, cloud));
+
+    // 10e. Offline Timeline (Mist events + switch logs correlation)
+    const timelineResults = await this.checkOfflineTimeline(siteId, deviceId);
+    results.push(...timelineResults);
+
+    return results;
+  }
+
+  // ---- Individual checks ----
+
+  /**
+   * Look up the LLDP neighbor in Mist inventory and extract the port config
+   * for the port our switch is connected to.
+   */
+  async lookupUpstreamPortConfig(neighbor: LldpNeighbor): Promise<{ result: CheckResult; config: UpstreamPortConfig | null }> {
+    const id = 'upstream-port-config';
+    const name = 'Upstream Switch Port Config';
+
+    if (!this.mistApi?.isConfigured) {
+      return {
+        result: { id, name, status: 'skip', detail: 'Mist API not configured — cannot look up upstream switch' },
+        config: null,
+      };
+    }
+
+    // Step 1: Find the upstream switch in Mist by MAC then by name
+    let upstreamDevice = await this.mistApi.findDeviceByMac(neighbor.chassisId);
+    if (!upstreamDevice && neighbor.systemName) {
+      upstreamDevice = await this.mistApi.findDeviceByName(neighbor.systemName);
+    }
+
+    if (!upstreamDevice) {
+      return {
+        result: {
+          id, name, status: 'info' as CheckStatus,
+          detail: `Upstream device "${neighbor.systemName || 'unknown'}" (${neighbor.chassisId}) is not managed in Mist. It may be a non-Mist switch, router, or firewall. Port config must be verified manually on the upstream device.`,
+          raw: `LLDP Neighbor Details:\n  System Name: ${neighbor.systemName || '(not advertised)'}\n  Chassis ID:  ${neighbor.chassisId}\n  Port Info:   ${neighbor.portInfo}\n  Local Port:  ${neighbor.localInterface}\n\nThis device was not found in the Mist inventory.\nIt could be a third-party switch, router, firewall, or\na Juniper device not yet adopted into this Mist org.\n\nTo verify connectivity, check the port configuration\non the upstream device manually and ensure:\n  - The port is configured as a trunk (if tagged VLANs needed)\n  - The management VLAN is allowed on the trunk\n  - STP is not blocking the port`,
+        },
+        config: null,
+      };
+    }
+
+    if (!upstreamDevice.site_id) {
+      return {
+        result: {
+          id, name, status: 'warn',
+          detail: `Upstream switch "${upstreamDevice.name || neighbor.systemName}" found in Mist but not assigned to a site`,
+        },
+        config: null,
+      };
+    }
+
+    // Step 2: Pull the upstream switch's config from Mist
+    let upstreamConfig;
+    try {
+      upstreamConfig = await this.mistApi.getDeviceConfig(upstreamDevice.site_id, upstreamDevice.id);
+    } catch {
+      return {
+        result: {
+          id, name, status: 'warn',
+          detail: `Found upstream switch "${upstreamDevice.name}" but could not fetch its config`,
+        },
+        config: null,
+      };
+    }
+
+    // Step 3: Find the port our switch is connected to
+    // port_config maps interface → { usage: "profile_name", ... }
+    // port_usages defines the profile details (mode, VLANs, speed, etc.)
+    const portInfo = neighbor.portInfo;
+    let remoteInterface: string | null = null;
+    let usageProfile: string | null = null;
+    let portMode: string | null = null;
+    let allNetworks = false;
+    let nativeVlan: string | null = null;
+    let voipNetwork: string | null = null;
+    const vlans: string[] = [];
+    let speed: string | null = null;
+    let duplex: string | null = null;
+    let rawPortConfig = '';
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const portUsages: Record<string, any> = upstreamConfig.port_usages || {};
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const portConfig: Record<string, any> = upstreamConfig.port_config || {};
+
+    // Try to find the port in port_config by matching:
+    // 1. LLDP port info matches the interface name key (e.g. "xe-0/1/0")
+    // 2. LLDP port info matches the port description
+    // 3. LLDP port info matches the port usage profile name
+    for (const [ifName, pCfg] of Object.entries(portConfig)) {
+      const desc = pCfg?.description || '';
+      const usage = pCfg?.usage || '';
+
+      if (ifName === portInfo ||
+          ifName.includes(portInfo) ||
+          portInfo.includes(ifName) ||
+          (desc && desc === portInfo) ||
+          (usage && usage === portInfo)) {
+        remoteInterface = ifName;
+        usageProfile = usage;
+        rawPortConfig = `Interface: ${ifName}\n` + JSON.stringify(pCfg, null, 2);
+        break;
+      }
+    }
+
+    // If not found by LLDP port info, check all port_config entries
+    // and also try getting LLDP detail for the actual remote interface name
+    if (!remoteInterface) {
+      // The LLDP port info might be a Mist port name/description that doesn't
+      // directly match port_config keys. Try to get more detail from LLDP.
+      const lldpDetailCmd = await this.runner.execute(
+        `show lldp neighbors interface ${neighbor.localInterface} detail`,
+        15000,
+        3000,
+      );
+      if (lldpDetailCmd.success) {
+        // Look for "Port ID" which shows the actual interface name
+        const portIdMatch = lldpDetailCmd.output.match(/Port ID\s*:\s*(\S+)/i);
+        if (portIdMatch) {
+          const remotePortId = portIdMatch[1];
+          // Try to match this against port_config keys
+          for (const [ifName, pCfg] of Object.entries(portConfig)) {
+            if (ifName === remotePortId || ifName.includes(remotePortId)) {
+              remoteInterface = ifName;
+              usageProfile = pCfg?.usage || '';
+              rawPortConfig = `Interface: ${ifName} (matched via LLDP Port ID: ${remotePortId})\n` + JSON.stringify(pCfg, null, 2);
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // Resolve the usage profile to get mode, VLANs, speed, duplex
+    if (usageProfile && portUsages[usageProfile]) {
+      const profile = portUsages[usageProfile];
+      portMode = profile.mode || null;
+      allNetworks = !!profile.all_networks;
+      nativeVlan = profile.port_network || null;
+      voipNetwork = profile.voip_network || null;
+      speed = profile.speed || null;
+      duplex = profile.duplex || null;
+
+      if (profile.networks && Array.isArray(profile.networks)) {
+        vlans.push(...profile.networks);
+      }
+
+      rawPortConfig += '\n\nPort Usage Profile: ' + usageProfile + '\n' + JSON.stringify(profile, null, 2);
+    }
+
+    // Also check additional_config_cmds for any port-specific config
+    if (upstreamConfig.additional_config_cmds && Array.isArray(upstreamConfig.additional_config_cmds)) {
+      const portCmds = upstreamConfig.additional_config_cmds.filter(
+        (c: string) => typeof c === 'string' && c.trim().length > 0 &&
+          (c.includes(portInfo) || (remoteInterface && c.includes(remoteInterface)))
+      );
+      if (portCmds.length > 0) {
+        rawPortConfig += '\n\nAdditional CLI commands:\n' + portCmds.join('\n');
+      }
+    }
+
+    // Build the config object
+    const config: UpstreamPortConfig = {
+      neighborName: upstreamDevice.name || neighbor.systemName,
+      neighborMac: neighbor.chassisId,
+      neighborDeviceId: upstreamDevice.id,
+      neighborSiteId: upstreamDevice.site_id,
+      remotePortInfo: portInfo,
+      remoteInterface,
+      usageProfile,
+      portMode,
+      allNetworks,
+      nativeVlan,
+      vlans,
+      voipNetwork,
+      speed,
+      duplex,
+      rawPortConfig: rawPortConfig || 'No specific port config found in Mist',
+      networkDefinitions: upstreamConfig.networks || {},
+    };
+
+    // Build detail summary
+    let detail = `Upstream: ${config.neighborName}`;
+    if (remoteInterface) {
+      detail += ` port ${remoteInterface}`;
+    }
+    if (usageProfile) {
+      detail += ` [${usageProfile}]`;
+    }
+    if (portMode) {
+      detail += ` ${portMode.toUpperCase()}`;
+      if (portMode === 'trunk') {
+        if (allNetworks) {
+          detail += ' (all VLANs)';
+        } else if (vlans.length > 0) {
+          detail += ` tagged: ${vlans.join(', ')}`;
+        }
+        if (nativeVlan) {
+          detail += ` native: ${nativeVlan}`;
+        }
+      } else if (portMode === 'access') {
+        if (nativeVlan) {
+          detail += ` VLAN: ${nativeVlan}`;
+        }
+      }
+    }
+    if (voipNetwork) {
+      detail += ` VoIP: ${voipNetwork}`;
+    }
+    if (speed || duplex) {
+      detail += ` | ${speed || 'auto'}/${duplex || 'auto'}`;
+    }
+    if (!remoteInterface && !portMode) {
+      detail += ` — port "${portInfo}" not found in Mist config (may use default profile)`;
+    }
+
+    // Build raw output
+    let raw = `Upstream switch: ${config.neighborName} (${config.neighborMac})\n`;
+    raw += `Mist device ID: ${config.neighborDeviceId}\n`;
+    raw += `LLDP port info: ${portInfo}\n`;
+    raw += `Matched interface: ${remoteInterface || 'not found'}\n`;
+    raw += `Usage profile: ${usageProfile || 'none'}\n`;
+    raw += `Mode: ${portMode || 'unknown'}\n`;
+    raw += `All networks: ${allNetworks}\n`;
+    raw += `Native VLAN: ${nativeVlan || 'none'}\n`;
+    raw += `Tagged VLANs: ${vlans.length > 0 ? vlans.join(', ') : 'none'}\n`;
+    raw += `VoIP network: ${voipNetwork || 'none'}\n`;
+    raw += `Speed: ${speed || 'auto'}\n`;
+    raw += `Duplex: ${duplex || 'auto'}\n\n`;
+    raw += config.rawPortConfig;
+
+    // Add network/VLAN definitions if available
+    if (upstreamConfig.networks && typeof upstreamConfig.networks === 'object' && Object.keys(upstreamConfig.networks).length > 0) {
+      raw += '\n\nNetwork definitions:\n' + JSON.stringify(upstreamConfig.networks, null, 2);
+    }
+
+    return {
+      result: { id, name, status: remoteInterface ? 'pass' : 'warn', detail, raw },
+      config,
+    };
+  }
+
+  /**
+   * Compare the upstream switch port config to the local switch uplink config.
+   * Generates the exact 'set' commands needed to make the local port match.
+   */
+  private async compareUplinkConfig(
+    localPort: string,
+    upstream: UpstreamPortConfig,
+    ourSiteId?: string,
+    ourDeviceId?: string,
+  ): Promise<CheckResult[]> {
+    const results: CheckResult[] = [];
+    const id = 'uplink-config-compare';
+    const name = 'Uplink Config Match';
+
+    // Helper to resolve VLAN name to ID from upstream network definitions
+    const resolveVlanId = (vlanName: string): string | null => {
+      const net = upstream.networkDefinitions?.[vlanName];
+      if (net?.vlan_id) return String(net.vlan_id);
+      return null;
+    };
+
+    // Helper to generate VLAN creation command with resolved ID
+    const vlanCreateCmd = (vlanName: string): string => {
+      const vlanId = resolveVlanId(vlanName);
+      if (vlanId) return `set vlans ${vlanName} vlan-id ${vlanId}`;
+      return `set vlans ${vlanName} vlan-id <vlan-id>`;
+    };
+
+    // Pull the current config for the local uplink port
+    const configCmd = await this.runner.execute(`show configuration interfaces ${localPort} | display set`, 15000, 3000);
+    const currentConfig = configCmd.success ? configCmd.output : '';
+
+    // Pull the current VLANs
+    const vlanCmd = await this.runner.execute('show configuration vlans | display set', 15000, 3000);
+    const currentVlans = vlanCmd.success ? vlanCmd.output : '';
+
+    // Build the expected config and the fix commands
+    const commands: string[] = [];
+    const mismatches: string[] = [];
+    const matches: string[] = [];
+
+    // 1. Port mode (trunk vs access)
+    const upstreamMode = upstream.portMode || 'trunk';
+    const currentHasTrunk = currentConfig.includes('interface-mode trunk');
+    const currentHasAccess = currentConfig.includes('interface-mode access');
+
+    if (upstreamMode === 'trunk') {
+      if (!currentHasTrunk) {
+        mismatches.push(`Port mode: upstream is TRUNK, local is ${currentHasAccess ? 'ACCESS' : 'not configured'}`);
+        commands.push(`set interfaces ${localPort} unit 0 family ethernet-switching interface-mode trunk`);
+      } else {
+        matches.push('Port mode: trunk ✓');
+      }
+
+      // 2. VLANs on trunk
+      if (upstream.allNetworks) {
+        // Trunk allows all VLANs — set vlan members all
+        if (!currentConfig.includes('vlan members all')) {
+          mismatches.push('Trunk VLANs: upstream allows ALL, local does not');
+          commands.push(`set interfaces ${localPort} unit 0 family ethernet-switching vlan members all`);
+        } else {
+          matches.push('Trunk VLANs: all ✓');
+        }
+      } else if (upstream.vlans.length > 0) {
+        // Specific tagged VLANs
+        for (const vlan of upstream.vlans) {
+          if (!currentConfig.includes(`vlan members ${vlan}`)) {
+            mismatches.push(`Tagged VLAN: "${vlan}" missing from local port`);
+            // Check if the VLAN exists on the switch
+            if (!currentVlans.includes(`set vlans ${vlan}`)) {
+              commands.push(vlanCreateCmd(vlan));
+            }
+            commands.push(`set interfaces ${localPort} unit 0 family ethernet-switching vlan members ${vlan}`);
+          } else {
+            matches.push(`Tagged VLAN: ${vlan} ✓`);
+          }
+        }
+      }
+
+      // 3. Native VLAN on trunk
+      if (upstream.nativeVlan) {
+        if (!currentConfig.includes(`native-vlan-id`) && !currentConfig.includes(`port-network ${upstream.nativeVlan}`)) {
+          mismatches.push(`Native VLAN: upstream has "${upstream.nativeVlan}", local not set`);
+          // Check if the VLAN exists
+          if (!currentVlans.includes(`set vlans ${upstream.nativeVlan}`)) {
+            commands.push(vlanCreateCmd(upstream.nativeVlan!));
+          }
+          commands.push(`set interfaces ${localPort} native-vlan-id ${upstream.nativeVlan}`);
+        } else {
+          matches.push(`Native VLAN: ${upstream.nativeVlan} ✓`);
+        }
+      }
+
+    } else if (upstreamMode === 'access') {
+      if (!currentHasAccess) {
+        mismatches.push(`Port mode: upstream is ACCESS, local is ${currentHasTrunk ? 'TRUNK' : 'not configured'}`);
+        commands.push(`set interfaces ${localPort} unit 0 family ethernet-switching interface-mode access`);
+      } else {
+        matches.push('Port mode: access ✓');
+      }
+
+      // Access VLAN
+      if (upstream.nativeVlan) {
+        if (!currentConfig.includes(`vlan members ${upstream.nativeVlan}`)) {
+          mismatches.push(`Access VLAN: upstream has "${upstream.nativeVlan}", local not set`);
+          if (!currentVlans.includes(`set vlans ${upstream.nativeVlan}`)) {
+            commands.push(vlanCreateCmd(upstream.nativeVlan!));
+          }
+          commands.push(`set interfaces ${localPort} unit 0 family ethernet-switching vlan members ${upstream.nativeVlan}`);
+        } else {
+          matches.push(`Access VLAN: ${upstream.nativeVlan} ✓`);
+        }
+      }
+    }
+
+    // 4. VoIP VLAN (if configured upstream)
+    if (upstream.voipNetwork) {
+      if (!currentConfig.includes(`vlan members ${upstream.voipNetwork}`)) {
+        mismatches.push(`VoIP VLAN: "${upstream.voipNetwork}" missing from local port`);
+        if (!currentVlans.includes(`set vlans ${upstream.voipNetwork}`)) {
+          commands.push(vlanCreateCmd(upstream.voipNetwork!));
+        }
+        commands.push(`set interfaces ${localPort} unit 0 family ethernet-switching vlan members ${upstream.voipNetwork}`);
+      } else {
+        matches.push(`VoIP VLAN: ${upstream.voipNetwork} ✓`);
+      }
+    }
+
+    // 5. Speed/duplex (only flag if upstream is not auto and local differs)
+    if (upstream.speed && upstream.speed !== 'auto') {
+      if (!currentConfig.includes(`speed ${upstream.speed}`)) {
+        mismatches.push(`Speed: upstream is ${upstream.speed}, local is auto/different`);
+        commands.push(`set interfaces ${localPort} ether-options speed ${upstream.speed}`);
+      } else {
+        matches.push(`Speed: ${upstream.speed} ✓`);
+      }
+    }
+    if (upstream.duplex && upstream.duplex !== 'auto') {
+      if (!currentConfig.includes(`duplex ${upstream.duplex}`)) {
+        mismatches.push(`Duplex: upstream is ${upstream.duplex}, local is auto/different`);
+        commands.push(`set interfaces ${localPort} ether-options duplex ${upstream.duplex}`);
+      } else {
+        matches.push(`Duplex: ${upstream.duplex} ✓`);
+      }
+    }
+
+    // Build result
+    let raw = `Upstream: ${upstream.neighborName} port ${upstream.remoteInterface || upstream.remotePortInfo}\n`;
+    raw += `Profile: ${upstream.usageProfile || 'default'} (${upstreamMode})\n`;
+    raw += `All networks: ${upstream.allNetworks}\n`;
+    raw += `Native VLAN: ${upstream.nativeVlan || 'none'}\n`;
+    raw += `Tagged VLANs: ${upstream.vlans.length > 0 ? upstream.vlans.join(', ') : 'none'}\n`;
+    raw += `VoIP: ${upstream.voipNetwork || 'none'}\n`;
+    raw += `Speed/Duplex: ${upstream.speed || 'auto'}/${upstream.duplex || 'auto'}\n\n`;
+
+    raw += `--- Local port ${localPort} current config ---\n`;
+    raw += currentConfig || '(no config found — factory default)\n';
+    raw += '\n\n--- Comparison ---\n';
+    raw += matches.map((m) => `  ✓ ${m}`).join('\n');
+    if (matches.length > 0 && mismatches.length > 0) raw += '\n';
+    raw += mismatches.map((m) => `  ✗ ${m}`).join('\n');
+
+    if (commands.length > 0) {
+      raw += '\n\n--- Commands to apply ---\n';
+      raw += commands.join('\n');
+    }
+
+    if (mismatches.length === 0) {
+      results.push({
+        id, name, status: 'pass',
+        detail: `Uplink ${localPort} config matches upstream (${matches.length} items verified)`,
+        raw,
+      });
+    } else {
+      const hasPlaceholders = commands.some((c) => /<\w+>/.test(c));
+      results.push({
+        id, name, status: 'fail',
+        detail: `${mismatches.length} mismatch(es) — ${commands.length} commands to fix`,
+        raw,
+        remediation: `The local uplink port ${localPort} does not match the upstream switch (${upstream.neighborName}) port config.\n\nMismatches:\n${mismatches.map((m) => `  • ${m}`).join('\n')}\n\n${hasPlaceholders ? 'Note: Some commands contain <vlan-id> placeholders — replace with the actual VLAN ID from the upstream network definition.' : 'The commands below will configure the local port to match the upstream.'}`,
+        commands: hasPlaceholders ? undefined : commands,
+      });
+    }
+
+    // Step 6: Check if our switch is in Mist and compare Mist intended config
+    if (this.mistApi?.isConfigured && ourSiteId && ourDeviceId && mismatches.length > 0) {
+      const mistCheckResult = await this.checkMistUplinkConfig(localPort, upstream, ourSiteId, ourDeviceId);
+      results.push(mistCheckResult);
+    }
+
+    return results;
+  }
+
+  /**
+   * Check if the Mist intended config for our switch matches the upstream expectations.
+   * If not, offer to update via PUT API.
+   */
+  private async checkMistUplinkConfig(
+    localPort: string,
+    upstream: UpstreamPortConfig,
+    siteId: string,
+    deviceId: string,
+  ): Promise<CheckResult> {
+    const id = 'mist-uplink-config';
+    const name = 'Mist Config for Uplink Port';
+
+    try {
+      const ourMistConfig = await this.mistApi!.getDeviceConfig(siteId, deviceId);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ourPortConfig: Record<string, any> = ourMistConfig.port_config || {};
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ourPortUsages: Record<string, any> = ourMistConfig.port_usages || {};
+
+      // Check if the uplink port has a config in Mist
+      const portEntry = ourPortConfig[localPort];
+      const usageName = portEntry?.usage;
+      const usageProfile = usageName ? ourPortUsages[usageName] : null;
+
+      const mistMode = usageProfile?.mode || null;
+      const mistAllNetworks = !!usageProfile?.all_networks;
+      const mistNativeVlan = usageProfile?.port_network || null;
+      const mistVlans: string[] = usageProfile?.networks || [];
+
+      const upstreamMode = upstream.portMode || 'trunk';
+      const mistMismatches: string[] = [];
+
+      // Compare Mist config against upstream expectations
+      if (!portEntry) {
+        mistMismatches.push(`Port ${localPort} has no device-level config in Mist (using site/template default)`);
+      } else if (!usageProfile) {
+        mistMismatches.push(`Port ${localPort} uses profile "${usageName}" but it's not defined in device port_usages`);
+      } else {
+        if (mistMode !== upstreamMode) {
+          mistMismatches.push(`Mist mode: ${mistMode || 'not set'}, upstream expects: ${upstreamMode}`);
+        }
+        if (upstreamMode === 'trunk') {
+          if (upstream.allNetworks && !mistAllNetworks) {
+            mistMismatches.push('Upstream allows all networks but Mist does not have all_networks enabled');
+          }
+          if (upstream.nativeVlan && mistNativeVlan !== upstream.nativeVlan) {
+            mistMismatches.push(`Mist native VLAN: ${mistNativeVlan || 'none'}, upstream expects: ${upstream.nativeVlan}`);
+          }
+        } else if (upstreamMode === 'access') {
+          if (upstream.nativeVlan && mistNativeVlan !== upstream.nativeVlan) {
+            mistMismatches.push(`Mist access VLAN: ${mistNativeVlan || 'none'}, upstream expects: ${upstream.nativeVlan}`);
+          }
+        }
+      }
+
+      if (mistMismatches.length === 0) {
+        return {
+          id, name, status: 'pass',
+          detail: `Mist config for ${localPort} matches upstream expectations`,
+          raw: `Mist port config:\n${JSON.stringify(portEntry, null, 2)}\n\nUsage profile:\n${JSON.stringify(usageProfile, null, 2)}`,
+        };
+      }
+
+      // Build the Mist API update payload
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const newUsageProfile: Record<string, any> = {
+        mode: upstreamMode,
+        all_networks: upstream.allNetworks,
+        speed: upstream.speed || 'auto',
+        duplex: upstream.duplex || 'auto',
+      };
+      if (upstream.nativeVlan) {
+        newUsageProfile.port_network = upstream.nativeVlan;
+      }
+      if (upstream.vlans.length > 0) {
+        newUsageProfile.networks = upstream.vlans;
+      }
+      if (upstream.voipNetwork) {
+        newUsageProfile.voip_network = upstream.voipNetwork;
+      }
+
+      const profileName = usageName || `uplink_${localPort.replace(/[\/\-]/g, '_')}`;
+      const updatePayload = {
+        port_usages: {
+          ...ourPortUsages,
+          [profileName]: { ...newUsageProfile, name: profileName },
+        },
+        port_config: {
+          ...ourPortConfig,
+          [localPort]: { usage: profileName },
+        },
+      };
+
+      return {
+        id, name, status: 'warn',
+        detail: `Mist config for ${localPort} differs from upstream — ${mistMismatches.length} issue(s). Update available.`,
+        raw: `Mismatches:\n${mistMismatches.map((m) => `  ✗ ${m}`).join('\n')}\n\nCurrent Mist port config:\n${JSON.stringify(portEntry, null, 2)}\n\nProposed Mist update:\n${JSON.stringify(updatePayload, null, 2)}`,
+        remediation: `Mist will push config to this switch that doesn't match the upstream port.\nIf not corrected in Mist, the switch may lose connectivity after the next config push.\n\nMismatches:\n${mistMismatches.map((m) => `  • ${m}`).join('\n')}\n\nClick "Run Fix" to update the Mist device config via API.`,
+        commands: [`__mist_api_update__${siteId}__${deviceId}__${JSON.stringify(updatePayload)}`],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        id, name, status: 'warn',
+        detail: `Could not check Mist config: ${msg}`,
+      };
+    }
+  }
+
+  private async checkLldp(userPort: string): Promise<{
+    result: CheckResult;
+    detectedPort: string | null;
+    uplinkNeighbor: LldpNeighbor | null;
+  }> {
+    const id = 'lldp';
+    const name = 'LLDP Neighbors';
+
+    const cmd = await this.runner.execute('show lldp neighbors', 20000, 3000);
+    if (!cmd.success) {
+      return {
+        result: { id, name, status: 'fail', detail: cmd.error || 'Command failed', raw: cmd.output },
+        detectedPort: null,
+        uplinkNeighbor: null,
+      };
+    }
+
+    const lines = cmd.output.split('\n').filter((l) => l.trim().length > 0);
+
+    // Find the header line to determine column positions
+    const headerLine = lines.find((l) => /Local Interface/i.test(l));
+    let colPositions = { localIf: 0, parentIf: 0, chassisId: 0, portInfo: 0, systemName: 0 };
+
+    if (headerLine) {
+      colPositions = {
+        localIf: headerLine.indexOf('Local Interface'),
+        parentIf: headerLine.indexOf('Parent Interface'),
+        chassisId: headerLine.indexOf('Chassis Id'),
+        portInfo: headerLine.indexOf('Port info'),
+        systemName: headerLine.indexOf('System Name'),
+      };
+    }
+
+    // Parse LLDP neighbor lines
+    const neighborLines = lines.filter((l) => /^(ge-|xe-|et-|mge-)/.test(l.trim()));
+
+    if (neighborLines.length === 0) {
+      return {
+        result: { id, name, status: 'fail', detail: 'No LLDP neighbors found', raw: cmd.output },
+        detectedPort: null,
+        uplinkNeighbor: null,
+      };
+    }
+
+    // Parse the first neighbor (uplink) using column positions
+    const parseLine = (line: string): LldpNeighbor => {
+      if (colPositions.systemName > 0) {
+        // Use column positions from header
+        return {
+          localInterface: line.substring(colPositions.localIf, colPositions.parentIf).trim(),
+          parentInterface: line.substring(colPositions.parentIf, colPositions.chassisId).trim(),
+          chassisId: line.substring(colPositions.chassisId, colPositions.portInfo).trim(),
+          portInfo: line.substring(colPositions.portInfo, colPositions.systemName).trim(),
+          systemName: line.substring(colPositions.systemName).trim(),
+        };
+      }
+      // Fallback: split by whitespace (less reliable for multi-word port info)
+      const parts = line.trim().split(/\s{2,}/);
+      return {
+        localInterface: parts[0] || '',
+        parentInterface: parts[1] || '',
+        chassisId: parts[2] || '',
+        portInfo: parts[3] || '',
+        systemName: parts[4] || '',
+      };
+    };
+
+    // Parse all neighbors
+    const neighbors = neighborLines.map(parseLine);
+
+    // Find the uplink neighbor
+    let uplinkNeighbor: LldpNeighbor | null = null;
+    let detectedPort: string | null = null;
+
+    if (userPort) {
+      uplinkNeighbor = neighbors.find((n) => n.localInterface === userPort) || neighbors[0];
+      detectedPort = userPort;
+    } else {
+      uplinkNeighbor = neighbors[0];
+      detectedPort = uplinkNeighbor.localInterface || null;
+    }
+
+    const count = neighbors.length;
+    let detail = `${count} neighbor(s). Uplink: ${detectedPort || 'none'}`;
+    if (uplinkNeighbor) {
+      detail += ` → ${uplinkNeighbor.systemName || 'unknown'} (${uplinkNeighbor.portInfo || 'unknown port'})`;
+    }
+
+    return {
+      result: { id, name, status: 'pass', detail, raw: cmd.output },
+      detectedPort,
+      uplinkNeighbor,
+    };
+  }
+
+  private async checkPortStatus(port: string): Promise<CheckResult> {
+    const id = 'port-status';
+    const name = 'Uplink Port Status';
+
+    if (!port) {
+      return { id, name, status: 'skip', detail: 'No uplink port identified' };
+    }
+
+    const cmd = await this.runner.execute(`show interfaces ${port} terse`);
+    if (!cmd.success) {
+      return { id, name, status: 'fail', detail: cmd.error || 'Command failed', raw: cmd.output };
+    }
+
+    const isUp = /\bup\b/i.test(cmd.output);
+    if (!isUp) {
+      return { id, name, status: 'fail', detail: `Port ${port} is not up`, raw: cmd.output };
+    }
+
+    // Get speed/duplex
+    const detailCmd = await this.runner.execute(`show interfaces ${port}`);
+    const speedMatch = detailCmd.output.match(/Speed:\s*(\S+)/i) || detailCmd.output.match(/(\d+[mMgG]bps)/);
+    const speed = speedMatch ? speedMatch[1] : 'unknown';
+
+    return { id, name, status: 'pass', detail: `Port ${port} is up (${speed})`, raw: cmd.output };
+  }
+
+  private async checkInterfaceErrors(port: string): Promise<CheckResult> {
+    const id = 'interface-errors';
+    const name = 'Uplink Interface Errors';
+
+    const cmd = await this.runner.execute(`show interfaces ${port} extensive | match error`, 15000);
+    if (!cmd.success) {
+      return { id, name, status: 'warn', detail: 'Could not retrieve error counters', raw: cmd.output };
+    }
+
+    // Parse error counters — look for non-zero values
+    const errorLines = cmd.output.split('\n').filter((l) => l.trim().length > 0);
+    const errors: { name: string; count: number }[] = [];
+
+    for (const line of errorLines) {
+      // Match patterns like "Input errors: 5" or "CRC/Align errors: 0"
+      const match = line.match(/([\w\/\s-]+errors?|drops|discards|CRC|framing|runts|giants|collisions)\s*:\s*(\d+)/i);
+      if (match) {
+        const count = parseInt(match[2], 10);
+        if (count > 0) {
+          errors.push({ name: match[1].trim(), count });
+        }
+      }
+    }
+
+    if (errors.length === 0) {
+      return { id, name, status: 'pass', detail: `No errors on ${port}`, raw: cmd.output };
+    }
+
+    const errorSummary = errors.map((e) => `${e.name}: ${e.count}`).join(', ');
+    return { id, name, status: 'warn', detail: `${port}: ${errorSummary}`, raw: cmd.output };
+  }
+
+  private async checkVlanConfig(port: string): Promise<CheckResult> {
+    const id = 'vlan-config';
+    const name = 'VLAN Configuration';
+
+    if (!port) {
+      return { id, name, status: 'skip', detail: 'No uplink port identified' };
+    }
+
+    const cmd = await this.runner.execute(`show vlans interface ${port}`);
+    if (!cmd.success) {
+      return { id, name, status: 'fail', detail: cmd.error || 'Command failed', raw: cmd.output };
+    }
+
+    // Check for VLAN entries
+    const vlanLines = cmd.output.split('\n').filter((l) => /\d+/.test(l) && !/^(Routing|Name|VLAN)/.test(l.trim()));
+
+    if (vlanLines.length === 0) {
+      // Try alternate command
+      const altCmd = await this.runner.execute(`show ethernet-switching interface ${port}`);
+      if (altCmd.output.includes('trunk') || altCmd.output.includes('access')) {
+        return { id, name, status: 'pass', detail: `VLANs configured on ${port}`, raw: altCmd.output };
+      }
+      return { id, name, status: 'warn', detail: `No VLANs found on ${port}`, raw: cmd.output };
+    }
+
+    return { id, name, status: 'pass', detail: `${vlanLines.length} VLAN(s) on ${port}`, raw: cmd.output };
+  }
+
+  private async checkInterfaceIp(): Promise<{ result: CheckResult; mgmtIp: string | null }> {
+    const id = 'mgmt-ip';
+    const name = 'Management IP Address';
+
+    const cmd = await this.runner.execute('show interfaces terse | match "inet "');
+    if (!cmd.success) {
+      return {
+        result: { id, name, status: 'fail', detail: cmd.error || 'Command failed', raw: cmd.output },
+        mgmtIp: null,
+      };
+    }
+
+    // Internal/non-management interfaces to exclude
+    const internalPrefixes = ['bme', 'pfe', 'pfh', 'jsrv', 'lo0', 'pip', 'tap', 'gre', 'ipip', 'lsi', 'mtun', 'pimd', 'pime'];
+
+    // Non-routable IP ranges used internally by Junos
+    const isRoutableIp = (ip: string): boolean => {
+      const parts = ip.split('.').map(Number);
+      if (parts[0] === 127) return false;             // loopback
+      if (parts[0] === 128 && parts[1] === 0) return false;  // Junos internal (128.0.0.0/16)
+      if (parts[0] === 0) return false;                // 0.0.0.0
+      if (parts[0] === 169 && parts[1] === 254) return false; // link-local
+      return true;
+    };
+
+    // Parse all interface lines with IPs
+    const allLines = cmd.output.split('\n').filter((l) => /\d+\.\d+\.\d+\.\d+/.test(l));
+
+    // Step 1: Look for preferred management interfaces (irb, vme, me0) that are up/up with a routable IP
+    const mgmtPrefixes = ['irb', 'vme', 'me0', 'vlan'];
+    const mgmtLines = allLines.filter((l) => {
+      const trimmed = l.trim();
+      const isMgmt = mgmtPrefixes.some((p) => trimmed.startsWith(p));
+      if (!isMgmt) return false;
+      // Check interface is up/up (admin up AND link up)
+      const parts = trimmed.split(/\s+/);
+      if (parts.length >= 3 && parts[1] === 'up' && parts[2] === 'up') {
+        const ip = trimmed.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1];
+        return ip ? isRoutableIp(ip) : false;
+      }
+      return false;
+    });
+
+    if (mgmtLines.length > 0) {
+      const ip = mgmtLines[0].match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] || null;
+      const ipDisplay = mgmtLines[0].match(/(\d+\.\d+\.\d+\.\d+\/?\d*)/)?.[1] || 'unknown';
+      const iface = mgmtLines[0].trim().split(/\s+/)[0];
+      return {
+        result: { id, name, status: 'pass', detail: `Management IP: ${ipDisplay} (${iface})`, raw: cmd.output },
+        mgmtIp: ip,
+      };
+    }
+
+    // Step 2: Look for any non-internal interface with a routable IP and up/up status
+    const otherLines = allLines.filter((l) => {
+      const trimmed = l.trim();
+      const isInternal = internalPrefixes.some((p) => trimmed.startsWith(p));
+      if (isInternal) return false;
+      const parts = trimmed.split(/\s+/);
+      if (parts.length >= 3 && parts[1] === 'up' && parts[2] === 'up') {
+        const ip = trimmed.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1];
+        return ip ? isRoutableIp(ip) : false;
+      }
+      return false;
+    });
+
+    if (otherLines.length > 0) {
+      const ip = otherLines[0].match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] || null;
+      const ipDisplay = otherLines[0].match(/(\d+\.\d+\.\d+\.\d+\/?\d*)/)?.[1] || 'unknown';
+      const iface = otherLines[0].trim().split(/\s+/)[0];
+      return {
+        result: { id, name, status: 'warn', detail: `IP ${ipDisplay} found on ${iface} (not a standard management interface)`, raw: cmd.output },
+        mgmtIp: ip,
+      };
+    }
+
+    // Step 3: Check if management interfaces exist but are down or have no IP
+    const mgmtDown = allLines.filter((l) => {
+      const trimmed = l.trim();
+      return mgmtPrefixes.some((p) => trimmed.startsWith(p));
+    });
+
+    // Also check for mgmt interfaces that are up/down (L2 up, L3 down — no IP assigned)
+    const rawLines = cmd.output.split('\n');
+    const mgmtUpDown = rawLines.filter((l) => {
+      const trimmed = l.trim();
+      return mgmtPrefixes.some((p) => trimmed.startsWith(p)) && /up\s+down/.test(trimmed);
+    });
+
+    let failDetail = 'No routable IP address found on any management interface';
+    if (mgmtUpDown.length > 0) {
+      const ifaces = mgmtUpDown.map((l) => l.trim().split(/\s+/)[0]).join(', ');
+      failDetail = `Management interface(s) ${ifaces} are up but have no IP — check DHCP or static config`;
+    }
+
+    return {
+      result: { id, name, status: 'fail', detail: failDetail, raw: cmd.output },
+      mgmtIp: null,
+    };
+  }
+
+  private async checkDhcpLease(): Promise<CheckResult> {
+    const id = 'dhcp-lease';
+    const name = 'DHCP Lease Details';
+
+    // Try 'show dhcp client binding' first (EX Series standard)
+    let cmd = await this.runner.execute('show dhcp client binding');
+
+    // Some Junos versions use 'show system services dhcp client binding'
+    if (!cmd.success || cmd.output.includes('unknown command') || cmd.output.includes('syntax error')) {
+      cmd = await this.runner.execute('show system services dhcp client binding');
+    }
+
+    if (!cmd.success) {
+      return { id, name, status: 'skip', detail: 'DHCP client info not available', raw: cmd.output };
+    }
+
+    // Check if there's actually a DHCP binding with a real IP
+    const hasBinding = /\d+\.\d+\.\d+\.\d+/.test(cmd.output) &&
+      !cmd.output.includes('no entries') &&
+      !cmd.output.includes('0 bindings');
+
+    if (!hasBinding) {
+      return { id, name, status: 'info' as CheckStatus, detail: 'No DHCP lease — IP is likely static', raw: cmd.output };
+    }
+
+    // Check if the only IP found is 0.0.0.0 (no active lease)
+    const allIps = cmd.output.match(/\b(\d+\.\d+\.\d+\.\d+)\b/g) || [];
+    const realIps = allIps.filter((ip) => ip !== '0.0.0.0');
+    if (realIps.length === 0) {
+      return { id, name, status: 'info' as CheckStatus, detail: 'DHCP client bound to 0.0.0.0 — management IP appears to be statically assigned', raw: cmd.output };
+    }
+
+    // Parse DHCP lease details
+    const ipMatch = cmd.output.match(/(?:IP address|Address)\s*[:=]?\s*(\d+\.\d+\.\d+\.\d+)/i) ||
+                    cmd.output.match(/(\d+\.\d+\.\d+\.\d+\/\d+)/);
+    const maskMatch = cmd.output.match(/(?:Subnet mask|mask)\s*[:=]?\s*(\d+\.\d+\.\d+\.\d+)/i);
+    const gwMatch = cmd.output.match(/(?:Router|Gateway|Default gateway)\s*[:=]?\s*(\d+\.\d+\.\d+\.\d+)/i);
+    const dnsMatch = cmd.output.match(/(?:DNS|Name server|Domain name server)\s*[:=]?\s*([\d.\s,]+)/i);
+
+    // Also try 'show dhcp client binding detail' for more info
+    const detailCmd = await this.runner.execute('show dhcp client binding detail');
+    const allOutput = cmd.output + '\n' + (detailCmd.success ? detailCmd.output : '');
+
+    // Re-parse from combined output
+    const ipAddr = ipMatch?.[1] ||
+      allOutput.match(/(?:IP address|Address)\s*[:=]?\s*(\d+\.\d+\.\d+\.\d+)/i)?.[1] ||
+      allOutput.match(/(\d+\.\d+\.\d+\.\d+\/\d+)/)?.[1] ||
+      'unknown';
+
+    const subnet = maskMatch?.[1] ||
+      allOutput.match(/(?:Subnet mask|mask)\s*[:=]?\s*(\d+\.\d+\.\d+\.\d+)/i)?.[1] ||
+      'not found';
+
+    const gateway = gwMatch?.[1] ||
+      allOutput.match(/(?:Router|Gateway|Default gateway|router)\s*[:=]?\s*(\d+\.\d+\.\d+\.\d+)/i)?.[1] ||
+      'not found';
+
+    const dnsRaw = dnsMatch?.[1] ||
+      allOutput.match(/(?:DNS|Name server|Domain name server|name-server)\s*[:=]?\s*([\d.\s,]+)/i)?.[1] ||
+      '';
+    const dnsServers = dnsRaw.match(/\d+\.\d+\.\d+\.\d+/g);
+    const dns = dnsServers ? dnsServers.join(', ') : 'not found';
+
+    const lines = [
+      `IP: ${ipAddr}`,
+      `Mask: ${subnet}`,
+      `Gateway: ${gateway}`,
+      `DNS: ${dns}`,
+    ];
+
+    return {
+      id,
+      name,
+      status: 'pass',
+      detail: lines.join(' | '),
+      raw: allOutput,
+    };
+  }
+
+  private async checkArp(): Promise<CheckResult> {
+    const id = 'arp';
+    const name = 'ARP Table';
+
+    const cmd = await this.runner.execute('show arp no-resolve', 30000, 3000);
+    if (!cmd.success) {
+      return { id, name, status: 'fail', detail: cmd.error || 'Command failed', raw: cmd.output };
+    }
+
+    const arpLines = cmd.output.split('\n').filter((l) => /\d+\.\d+\.\d+\.\d+/.test(l));
+
+    if (arpLines.length === 0) {
+      return { id, name, status: 'fail', detail: 'ARP table is empty', raw: cmd.output };
+    }
+
+    return { id, name, status: 'pass', detail: `${arpLines.length} ARP entry/entries`, raw: cmd.output };
+  }
+
+  private async checkDefaultRoute(): Promise<CheckResult> {
+    const id = 'default-route';
+    const name = 'Default Gateway';
+
+    const cmd = await this.runner.execute('show route 0.0.0.0/0', 20000, 3000);
+    if (!cmd.success) {
+      return { id, name, status: 'fail', detail: cmd.error || 'Command failed', raw: cmd.output };
+    }
+
+    const hasDefault = cmd.output.includes('0.0.0.0/0') || cmd.output.includes('default');
+    if (!hasDefault) {
+      return { id, name, status: 'fail', detail: 'No default route found', raw: cmd.output };
+    }
+
+    // Extract next-hop
+    const nhMatch = cmd.output.match(/to\s+(\d+\.\d+\.\d+\.\d+)/i) ||
+                    cmd.output.match(/via\s+(\d+\.\d+\.\d+\.\d+)/i) ||
+                    cmd.output.match(/>\s+(\d+\.\d+\.\d+\.\d+)/);
+    const nextHop = nhMatch ? nhMatch[1] : 'unknown';
+
+    return { id, name, status: 'pass', detail: `Default route via ${nextHop}`, raw: cmd.output };
+  }
+
+  private async checkDnsConfig(): Promise<CheckResult> {
+    const id = 'dns-config';
+    const name = 'DNS Configuration';
+    const allOutputs: string[] = [];
+    let servers: string[] = [];
+
+    // 1. Direct system name-server config
+    const cmd1 = await this.runner.execute('show configuration system name-server');
+    if (cmd1.success) {
+      allOutputs.push(cmd1.output);
+      const found = cmd1.output.match(/(\d+\.\d+\.\d+\.\d+)/g);
+      if (found) servers.push(...found);
+    }
+
+    // 2. Check inside configuration groups (Mist pushes config via groups)
+    if (servers.length === 0) {
+      const cmd2 = await this.runner.execute('show configuration groups | display set | match name-server');
+      if (cmd2.success) {
+        allOutputs.push(cmd2.output);
+        const found = cmd2.output.match(/(\d+\.\d+\.\d+\.\d+)/g);
+        if (found) servers.push(...found);
+      }
+    }
+
+    // 3. Show the effective/inherited config (resolves groups)
+    if (servers.length === 0) {
+      const cmd3 = await this.runner.execute('show configuration system name-server | display inheritance');
+      if (cmd3.success) {
+        allOutputs.push(cmd3.output);
+        const found = cmd3.output.match(/(\d+\.\d+\.\d+\.\d+)/g);
+        if (found) servers.push(...found);
+      }
+    }
+
+    // 4. Operational command — show what the system is actually using
+    if (servers.length === 0) {
+      const cmd4 = await this.runner.execute('show system name-server');
+      if (cmd4.success) {
+        allOutputs.push(cmd4.output);
+        const found = cmd4.output.match(/(\d+\.\d+\.\d+\.\d+)/g);
+        if (found) servers.push(...found);
+      }
+    }
+
+    // 5. Last resort — check resolve.conf from shell
+    if (servers.length === 0) {
+      const cmd5 = await this.runner.execute('file show /etc/resolv.conf');
+      if (cmd5.success) {
+        allOutputs.push(cmd5.output);
+        const nameserverLines = cmd5.output.split('\n').filter((l) => l.trim().startsWith('nameserver'));
+        const found = nameserverLines.map((l) => l.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1]).filter(Boolean) as string[];
+        if (found.length > 0) servers.push(...found);
+      }
+    }
+
+    // Deduplicate
+    servers = [...new Set(servers)];
+    const raw = allOutputs.join('\n---\n');
+
+    if (servers.length === 0) {
+      return { id, name, status: 'fail', detail: 'No DNS servers found in config or resolve.conf', raw };
+    }
+
+    return { id, name, status: 'pass', detail: `DNS servers: ${servers.join(', ')}`, raw };
+  }
+
+  private async checkDnsResolution(cloud: MistCloud): Promise<CheckResult> {
+    const id = 'dns-resolution';
+    const name = 'DNS Resolution & Reachability';
+
+    // Pick the oc-term host as the test target
+    const ocTerm = cloud.switchEndpoints.find((e) => e.description.includes('oc-term'));
+    const testHost = ocTerm?.host || cloud.switchEndpoints[0]?.host || 'redirect.juniper.net';
+
+    // Use 'ping inet' to force IPv4 — avoids IPv6 AAAA resolution with no route
+    const cmd = await this.runner.execute(`ping inet ${testHost} count 3 rapid`, 15000);
+    if (!cmd.success) {
+      // Check if it's a DNS failure vs routing failure
+      if (cmd.output.includes('unknown host') || cmd.output.includes('not known') ||
+          cmd.output.includes('Name or service not known')) {
+        return { id, name, status: 'fail', detail: `Cannot resolve ${testHost} — DNS failure`, raw: cmd.output };
+      }
+      return { id, name, status: 'fail', detail: `Ping failed: ${cmd.error}`, raw: cmd.output };
+    }
+
+    // Check for DNS failure in output
+    if (cmd.output.includes('unknown host') || cmd.output.includes('not known')) {
+      return { id, name, status: 'fail', detail: `Cannot resolve ${testHost} — DNS failure`, raw: cmd.output };
+    }
+
+    // Check for no route
+    if (cmd.output.includes('No route to host') || cmd.output.includes('Network is unreachable')) {
+      return { id, name, status: 'warn', detail: `Resolved ${testHost} but no route to host`, raw: cmd.output };
+    }
+
+    // Check for ping success — look for "X packets received" or "!!" (rapid ping success)
+    const receivedMatch = cmd.output.match(/(\d+) packets received/);
+    const received = receivedMatch ? parseInt(receivedMatch[1], 10) : 0;
+    const hasRapidSuccess = cmd.output.includes('!!') || cmd.output.includes('!');
+
+    if (received > 0 || hasRapidSuccess) {
+      // Extract resolved IP from ping output
+      const ipMatch = cmd.output.match(/PING\s+\S+\s+\((\d+\.\d+\.\d+\.\d+)\)/);
+      const resolvedIp = ipMatch ? ` → ${ipMatch[1]}` : '';
+      return { id, name, status: 'pass', detail: `${testHost}${resolvedIp} — reachable`, raw: cmd.output };
+    }
+
+    // Ping sent but 0 received — host resolved but unreachable
+    if (cmd.output.includes('0 packets received') || cmd.output.includes('100% packet loss')) {
+      const ipMatch = cmd.output.match(/PING\s+\S+\s+\((\d+\.\d+\.\d+\.\d+)\)/);
+      const resolvedIp = ipMatch ? ` (${ipMatch[1]})` : '';
+      return { id, name, status: 'warn', detail: `Resolved ${testHost}${resolvedIp} but 0 replies — ICMP may be blocked`, raw: cmd.output };
+    }
+
+    return { id, name, status: 'warn', detail: `Uncertain result for ${testHost}`, raw: cmd.output };
+  }
+
+  private async checkRouteToMistEndpoints(cloud: MistCloud): Promise<CheckResult> {
+    const id = 'route-to-mist';
+    const name = 'Route to Mist Endpoints';
+
+    // Resolve the oc-term host to an IP and check the routing table
+    const ocTerm = cloud.switchEndpoints.find((e) => e.description.includes('oc-term'));
+    const testHost = ocTerm?.host || cloud.switchEndpoints[0]?.host;
+
+    if (!testHost) {
+      return { id, name, status: 'skip', detail: 'No endpoint to check' };
+    }
+
+    // Resolve FQDN to IP first
+    const hostCmd = await this.runner.execute(`show host ${testHost}`, 15000, 2000);
+    let testIp: string | null = null;
+    if (hostCmd.success) {
+      const addrMatch = hostCmd.output.match(/has address\s+(\d+\.\d+\.\d+\.\d+)/);
+      if (addrMatch) testIp = addrMatch[1];
+    }
+
+    if (!testIp) {
+      return { id, name, status: 'warn', detail: `Could not resolve ${testHost} to check route`, raw: hostCmd.output };
+    }
+
+    // Check routing table for the resolved IP
+    const routeCmd = await this.runner.execute(`show route ${testIp}`, 15000);
+    if (!routeCmd.success) {
+      return { id, name, status: 'fail', detail: `Could not check route to ${testIp}`, raw: routeCmd.output };
+    }
+
+    // Check for a route
+    const hasRoute = routeCmd.output.includes(testIp) || routeCmd.output.includes('0.0.0.0/0');
+    if (!hasRoute && routeCmd.output.includes('not found')) {
+      return { id, name, status: 'fail', detail: `No route to ${testIp} (${testHost})`, raw: routeCmd.output };
+    }
+
+    // Extract next-hop
+    const nhMatch = routeCmd.output.match(/>\s*to\s+(\d+\.\d+\.\d+\.\d+)/i) ||
+                    routeCmd.output.match(/via\s+(\S+)/i);
+    const nextHop = nhMatch ? nhMatch[1] : '';
+    const nhDetail = nextHop ? ` via ${nextHop}` : '';
+
+    return { id, name, status: 'pass', detail: `Route to ${testIp} (${testHost})${nhDetail}`, raw: routeCmd.output };
+  }
+
+  private async checkTraceroute(endpoint: MistEndpoint): Promise<CheckResult> {
+    const id = `trace-${endpoint.host.replace(/\./g, '-')}`;
+    const name = `Traceroute ${endpoint.host}`;
+
+    // Run traceroute with inet (IPv4), limited hops and wait time
+    const cmd = await this.runner.execute(
+      `traceroute inet ${endpoint.host} wait 2 as-number-lookup no-resolve`,
+      30000,
+      3000,
+    );
+
+    if (!cmd.success) {
+      return { id, name, status: 'info' as CheckStatus, detail: `Traceroute failed: ${cmd.error}`, raw: cmd.output };
+    }
+
+    // Parse traceroute output to find the last responding hop
+    const hopLines = cmd.output.split('\n').filter((l) => /^\s*\d+\s/.test(l));
+    const respondingHops = hopLines.filter((l) => !l.includes('* * *'));
+    const deadHops = hopLines.filter((l) => l.includes('* * *'));
+
+    if (respondingHops.length === 0) {
+      return { id, name, status: 'info' as CheckStatus, detail: 'No hops responded — traffic may be blocked at first hop', raw: cmd.output };
+    }
+
+    // Get the last responding hop
+    const lastHop = respondingHops[respondingHops.length - 1];
+    const lastHopIp = lastHop.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] || 'unknown';
+    const totalHops = hopLines.length;
+    const deadCount = deadHops.length;
+
+    let detail = `${respondingHops.length} hop(s) responded, last: ${lastHopIp}`;
+    if (deadCount > 0) {
+      detail += ` (${deadCount} hop(s) no response — possible firewall)`;
+    }
+
+    return { id, name, status: 'info' as CheckStatus, detail, raw: cmd.output };
+  }
+
+  private async checkSslCertificate(endpoint: MistEndpoint): Promise<CheckResult> {
+    const id = `cert-${endpoint.host.replace(/\./g, '-')}`;
+    const name = `SSL Cert: ${endpoint.host}`;
+
+    // Enter shell mode (Junos drops to csh)
+    await this.runner.send('start shell\n');
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // csh doesn't support 2>&1 or > redirect properly
+    // Wrap in /bin/sh -c to get proper shell redirects
+    // curl -v outputs cert info to stderr, so we redirect stderr to a file
+    await this.runner.execute(
+      `/bin/sh -c 'curl -4 -vk --connect-timeout 30 https://${endpoint.host}/ -o /dev/null 2>/tmp/certcheck.txt'`,
+      45000,
+      3000,
+    );
+
+    const catCmd = await this.runner.execute('cat /tmp/certcheck.txt', 10000, 2000);
+    const output = (catCmd.success && catCmd.output.trim().length > 0) ? catCmd.output : '';
+
+    // Clean up
+    await this.runner.execute('rm -f /tmp/certcheck.txt', 5000, 1000);
+
+    // Exit shell back to Junos CLI
+    await this.runner.send('exit\n');
+    await new Promise((r) => setTimeout(r, 1000));
+    await this.runner.send('cli\n');
+    await new Promise((r) => setTimeout(r, 1500));
+
+    if (!output || output.includes('command not found') || output.includes('No such file')) {
+      return { id, name, status: 'warn', detail: 'curl not available on this switch', raw: output };
+    }
+
+    if (output.includes('Connection refused')) {
+      return { id, name, status: 'skip', detail: 'Connection refused — host not accepting HTTPS', raw: output };
+    }
+
+    // Check if we got cert info before any timeout
+    // curl may timeout on SSL handshake but still show partial TLS info
+    const hasIssuer = /issuer\s*[=:]/i.test(output);
+    if (hasIssuer) {
+      return this.parseSslCertOutput(id, name, endpoint.host, output);
+    }
+
+    // SSL connection timeout — connected but TLS handshake didn't complete
+    if (output.includes('SSL connection timeout') || output.includes('SSL handshake timeout')) {
+      return { id, name, status: 'warn', detail: 'Connected but TLS handshake timed out — unable to inspect certificate', raw: output };
+    }
+
+    // General connect timeout — couldn't reach the host at all
+    if (output.includes('timed out') || output.includes('connect timeout')) {
+      return { id, name, status: 'skip', detail: 'Connection timed out — host unreachable on port 443', raw: output };
+    }
+
+    return this.parseSslCertOutput(id, name, endpoint.host, output);
+  }
+
+  private parseSslCertOutput(id: string, name: string, host: string, output: string): CheckResult {
+    const lines = output.split('\n');
+
+    // curl -v format from Junos:
+    //   "*  issuer: C=US; ST=CA; L=Sunnyvale; O=Juniper Networks; OU=Juniper CA; CN=RedirectServiceRSACA"
+    //   "*  issuer: C=US; O=Amazon; CN=Amazon RSA 2048 M03"
+    // openssl format:
+    //   "issuer=C = US, O = Amazon, CN = Amazon RSA 2048 M03"
+    const issuerLine = lines.find((l) => /issuer\s*[=:]/i.test(l)) || '';
+    const subjectLine = lines.find((l) => /subject\s*[=:]/i.test(l) && !/issuer/i.test(l)) || '';
+
+    if (!issuerLine && !subjectLine) {
+      // Check if we got any SSL/TLS/cert output at all
+      const hasSSL = /ssl|tls|certificate|verify|handshake/i.test(output);
+      if (hasSSL) {
+        return { id, name, status: 'warn', detail: 'SSL connection made but could not parse certificate issuer — check terminal output', raw: output };
+      }
+      return { id, name, status: 'warn', detail: 'Could not determine SSL certificate details', raw: output };
+    }
+
+    // Parse issuer fields — handle both ; and , separators
+    const textToParse = issuerLine || subjectLine;
+    const cnMatch = textToParse.match(/CN\s*[=:]\s*([^;,\n]+)/i);
+    const oMatch = textToParse.match(/O\s*[=:]\s*([^;,\n]+)/i);
+
+    const issuerCn = cnMatch?.[1]?.trim() || '';
+    const issuerO = oMatch?.[1]?.trim() || '';
+    const issuerDisplay = issuerCn || issuerO || textToParse.replace(/^[\s*]+(?:issuer|subject)\s*:\s*/i, '').trim();
+
+    if (!issuerDisplay) {
+      return { id, name, status: 'warn', detail: 'SSL certificate found but issuer field is empty', raw: output };
+    }
+
+    // Expected issuers for Mist cloud endpoints (verified from real switch output):
+    // - Juniper Networks (redirect.juniper.net — self-signed Juniper CA)
+    // - Mist Systems Inc. (jma-terminator, ztp — Mist internal CA)
+    // - DigiCert (cdn.juniper.net — public CA)
+    // - Amazon / Starfield (some AWS-hosted endpoints)
+    // - Google Trust Services / GTS (GCP-hosted clouds)
+    const expectedPatterns = [
+      /juniper/i,
+      /mist\s*systems/i,
+      /mistsys/i,
+      /digicert/i,
+      /amazon/i,
+      /starfield/i,
+      /google\s*trust/i,
+      /\bGTS\b/,
+    ];
+
+    const isExpected = expectedPatterns.some((p) => p.test(issuerLine + ' ' + subjectLine));
+
+    if (isExpected) {
+      return { id, name, status: 'pass', detail: `Certificate OK — issued by ${issuerDisplay}`, raw: output };
+    }
+
+    // Not an expected issuer — likely SSL inspection
+    return {
+      id,
+      name,
+      status: 'fail',
+      detail: `POSSIBLE SSL INSPECTION — Certificate issued by "${issuerDisplay}". Expected Juniper, Mist, DigiCert, Amazon, or Google. SSL decryption must be disabled for Mist endpoints.`,
+      raw: output,
+    };
+  }
+
+  private async checkEndpointReachability(endpoint: MistEndpoint): Promise<CheckResult> {
+    const id = `reach-${endpoint.host.replace(/\./g, '-')}`;
+    const name = `${endpoint.host}:${endpoint.port}`;
+
+    // Step 1: Quick ping inet to test DNS resolution + basic reachability
+    const pingCmd = await this.runner.execute(
+      `ping inet ${endpoint.host} count 1 rapid`,
+      10000,
+    );
+
+    const pingOutput = pingCmd.output;
+
+    // DNS failure
+    if (pingOutput.includes('unknown host') || pingOutput.includes('not known')) {
+      return { id, name, status: 'fail', detail: `Cannot resolve ${endpoint.host}`, raw: pingOutput };
+    }
+
+    // No route
+    if (pingOutput.includes('No route to host') || pingOutput.includes('Network is unreachable')) {
+      return { id, name, status: 'fail', detail: 'No route to host', raw: pingOutput };
+    }
+
+    // Step 2: Test TCP port with telnet inet (force IPv4)
+    const cmd = await this.runner.execute(
+      `telnet inet ${endpoint.host} port ${endpoint.port}`,
+      10000,
+      3000,
+    );
+
+    const output = cmd.output;
+
+    // Successful connection
+    if (output.includes('Connected to') || output.includes('Escape character is') ||
+        output.includes('Connection established')) {
+      // Clean up telnet session
+      await this.runner.send('\x1d');
+      await new Promise((r) => setTimeout(r, 500));
+      await this.runner.send('quit\n');
+      await new Promise((r) => setTimeout(r, 500));
+
+      return { id, name, status: 'pass', detail: `Reachable (TCP ${endpoint.port})`, raw: output };
+    }
+
+    // Connection refused — host reachable but port closed/filtered
+    if (output.includes('Connection refused')) {
+      return { id, name, status: 'warn', detail: `Connection refused (TCP ${endpoint.port}) — host reachable but port may be filtered`, raw: output };
+    }
+
+    // No route (from telnet)
+    if (output.includes('No route to host') || output.includes('Network is unreachable')) {
+      return { id, name, status: 'fail', detail: 'No route to host', raw: output };
+    }
+
+    // DNS failure (from telnet)
+    if (output.includes('Name or service not known') || output.includes('could not resolve') ||
+        output.includes('unknown host')) {
+      return { id, name, status: 'fail', detail: 'DNS resolution failed', raw: output };
+    }
+
+    // Timeout
+    if (output.includes('timed out') || output.includes('Connection timed out') || !cmd.success) {
+      // Ping worked but TCP timed out — likely a firewall blocking the port
+      const pingWorked = pingOutput.includes('!') || /\d+ packets received/.test(pingOutput);
+      if (pingWorked) {
+        return { id, name, status: 'fail', detail: `Host reachable (ICMP) but TCP ${endpoint.port} timed out — likely firewall blocked`, raw: output };
+      }
+      return { id, name, status: 'fail', detail: `Connection timed out (TCP ${endpoint.port})`, raw: output };
+    }
+
+    // Clean up any hanging telnet
+    await this.runner.send('\x03');
+    await new Promise((r) => setTimeout(r, 500));
+
+    return { id, name, status: 'fail', detail: `Unable to connect (TCP ${endpoint.port})`, raw: output };
+  }
+
+  // ---- Mist Cloud Status checks ----
+
+  private async checkMistAgentVersion(): Promise<CheckResult> {
+    const id = 'mist-agent';
+    const name = 'Mist Agent Version';
+
+    const cmd = await this.runner.execute('show version | match mist', 15000);
+    if (!cmd.success) {
+      return { id, name, status: 'warn', detail: 'Could not determine Mist agent version', raw: cmd.output };
+    }
+
+    // Look for "JUNOS Mist Agent [vX.X.X]" or similar
+    const versionMatch = cmd.output.match(/Mist\s+Agent\s*\[?(v?[\d.]+[\w-]*)\]?/i);
+    if (versionMatch) {
+      return { id, name, status: 'pass', detail: `Mist Agent ${versionMatch[1]}`, raw: cmd.output };
+    }
+
+    // No Mist agent found
+    if (cmd.output.trim().length === 0 || !cmd.output.toLowerCase().includes('mist')) {
+      return { id, name, status: 'fail', detail: 'Mist Agent not installed', raw: cmd.output };
+    }
+
+    return { id, name, status: 'pass', detail: cmd.output.trim(), raw: cmd.output };
+  }
+
+  private async checkMistAgentProcesses(): Promise<CheckResult> {
+    const id = 'mist-processes';
+    const name = 'Mist Agent Processes';
+
+    // Check for mcd (Mist Cloud Daemon) and jmd (Junos Mist Daemon)
+    // Use interactive shell to avoid pipe/redirect issues with 'start shell command'
+    await this.runner.send('start shell\n');
+    await new Promise((r) => setTimeout(r, 2000));
+
+    const cmd = await this.runner.execute('/bin/sh -c \'ps aux | grep -E "mcd|jmd" | grep -v grep\'', 15000, 2000);
+
+    // Exit shell back to Junos CLI
+    await this.runner.send('exit\n');
+    await new Promise((r) => setTimeout(r, 1000));
+    await this.runner.send('cli\n');
+    await new Promise((r) => setTimeout(r, 1500));
+
+    if (!cmd.success) {
+      return { id, name, status: 'warn', detail: 'Could not check processes — shell access may be restricted', raw: cmd.output };
+    }
+
+    return this.parseMistProcesses(cmd.output);
+  }
+
+  private parseMistProcesses(output: string): CheckResult {
+    const id = 'mist-processes';
+    const name = 'Mist Agent Processes';
+
+    const lines = output.split('\n').filter((l) => l.trim().length > 0);
+
+    const hasMcd = lines.some((l) => /\/mcd\b/.test(l) || /\bmcd\s/.test(l));
+    const hasJmd = lines.some((l) => /\/jmd\b/.test(l) || /\bjmd\s/.test(l));
+
+    if (hasMcd && hasJmd) {
+      return { id, name, status: 'pass', detail: 'mcd and jmd running', raw: output };
+    }
+
+    if (hasMcd && !hasJmd) {
+      return { id, name, status: 'warn', detail: 'mcd running, jmd not found', raw: output };
+    }
+
+    if (!hasMcd && hasJmd) {
+      return { id, name, status: 'warn', detail: 'jmd running, mcd not found', raw: output };
+    }
+
+    // Neither running
+    return { id, name, status: 'fail', detail: 'Neither mcd nor jmd processes found — Mist agent may not be running', raw: output };
+  }
+
+  private async checkOutboundSshConfig(): Promise<{ result: CheckResult; port: string | null }> {
+    const id = 'outbound-ssh-config';
+    const name = 'Outbound SSH Config';
+
+    const cmd = await this.runner.execute('show configuration system services outbound-ssh', 15000);
+    if (!cmd.success) {
+      return {
+        result: { id, name, status: 'fail', detail: 'Could not read outbound-ssh config', raw: cmd.output },
+        port: null,
+      };
+    }
+
+    // Check for client mist block
+    if (!cmd.output.includes('client mist') && !cmd.output.includes('client "mist"')) {
+      if (cmd.output.includes('inactive')) {
+        return {
+          result: { id, name, status: 'fail', detail: 'Outbound SSH client "mist" is deactivated', raw: cmd.output },
+          port: null,
+        };
+      }
+      return {
+        result: { id, name, status: 'fail', detail: 'Outbound SSH client "mist" not configured', raw: cmd.output },
+        port: null,
+      };
+    }
+
+    // Extract port from config (e.g. "port 2200;" or "port 443;")
+    const portMatch = cmd.output.match(/port\s+(\d+)/);
+    const port = portMatch ? portMatch[1] : null;
+
+    // Extract oc-term host
+    const hostMatch = cmd.output.match(/(oc-term[\w.-]+)/);
+    const host = hostMatch ? hostMatch[1] : null;
+
+    // Check for device-id
+    const deviceIdMatch = cmd.output.match(/device-id\s+(\S+)/);
+    const deviceId = deviceIdMatch ? deviceIdMatch[1] : null;
+
+    // Check for secret
+    const hasSecret = cmd.output.includes('secret');
+
+    // Check for services (should list netconf)
+    const hasServices = cmd.output.includes('services') && cmd.output.includes('netconf');
+
+    const details: string[] = ['Configured'];
+    if (host && port) {
+      details.push(`${host}:${port}`);
+    } else if (port) {
+      details.push(`Port ${port}`);
+    }
+    if (deviceId) {
+      const shortId = deviceId.length > 36 ? deviceId.substring(0, 32) + '…' : deviceId;
+      details.push(`ID: ${shortId}`);
+    }
+    if (!hasSecret) details.push('⚠ No secret');
+    if (!hasServices) details.push('⚠ Missing netconf service');
+
+    const status = (hasSecret && deviceId) ? 'pass' : 'warn';
+    return {
+      result: { id, name, status, detail: details.join(' | '), raw: cmd.output },
+      port,
+    };
+  }
+
+  private async checkActiveCloudConnections(mgmtIp: string | null, cloud?: MistCloud | null): Promise<CheckResult> {
+    const id = 'cloud-connections';
+    const name = 'Active Cloud Connections';
+
+    if (!mgmtIp) {
+      return { id, name, status: 'skip', detail: 'No management IP detected — cannot check connections' };
+    }
+
+    const cmd = await this.runner.execute(`show system connections | grep ${mgmtIp}`, 30000, 3000);
+    if (!cmd.success) {
+      return { id, name, status: 'fail', detail: 'Could not check system connections', raw: cmd.output };
+    }
+
+    const lines = cmd.output.split('\n').filter((l) => l.trim().length > 0 && l.includes(mgmtIp));
+
+    if (lines.length === 0) {
+      return {
+        id,
+        name,
+        status: 'fail',
+        detail: `No outbound connections from ${mgmtIp}`,
+        raw: cmd.output,
+      };
+    }
+
+    // Parse all ESTABLISHED connections
+    const established = lines.filter((l) => /ESTABLISHED/i.test(l));
+    const other = lines.filter((l) => !(/ESTABLISHED/i.test(l)));
+
+    // Extract remote IP:port pairs from ESTABLISHED connections
+    const remoteEndpoints: { ip: string; port: string }[] = [];
+    for (const line of established) {
+      const parts = line.trim().split(/\s+/);
+      for (const part of parts) {
+        const match = part.match(/^(\d+\.\d+\.\d+\.\d+)\.(\d+)$/);
+        if (match && match[1] !== mgmtIp) {
+          remoteEndpoints.push({ ip: match[1], port: match[2] });
+        }
+      }
+    }
+
+    if (established.length === 0) {
+      // No ESTABLISHED but some connections in other states
+      const states = other.map((l) => {
+        const stateMatch = l.match(/(SYN_SENT|CLOSE_WAIT|FIN_WAIT\S*|TIME_WAIT|LAST_ACK|LISTEN)/i);
+        return stateMatch ? stateMatch[1] : 'unknown';
+      });
+      const uniqueStates = [...new Set(states)];
+      return {
+        id,
+        name,
+        status: 'warn',
+        detail: `${other.length} connection(s) from ${mgmtIp} but none ESTABLISHED (states: ${uniqueStates.join(', ')})`,
+        raw: cmd.output,
+      };
+    }
+
+    // Resolve cloud endpoint FQDNs to IPs using 'show host' for validation
+    // Output format varies:
+    //   "jma-terminator.mistsys.net is an alias for <cname>.elb.amazonaws.com."
+    //   "<cname>.elb.amazonaws.com has address 184.72.6.51"
+    // Or sometimes just: "jma-terminator.mistsys.net has address 184.72.6.51"
+    const resolvedMistIps: Map<string, string> = new Map(); // IP -> FQDN
+    if (cloud) {
+      for (const endpoint of cloud.switchEndpoints) {
+        const hostCmd = await this.runner.execute(`show host ${endpoint.host}`, 15000, 2000);
+        if (hostCmd.success && hostCmd.output.trim().length > 0) {
+          const hostLines = hostCmd.output.split('\n');
+          for (const hostLine of hostLines) {
+            // Match "has address X.X.X.X"
+            const addrMatch = hostLine.match(/has address\s+(\d+\.\d+\.\d+\.\d+)/);
+            if (addrMatch) {
+              resolvedMistIps.set(addrMatch[1], endpoint.host);
+            }
+          }
+          // Fallback: extract any IP from the output if "has address" didn't match
+          if (![...resolvedMistIps.values()].includes(endpoint.host)) {
+            const allIps = hostCmd.output.match(/\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/g);
+            if (allIps) {
+              for (const ip of allIps) {
+                // Skip common non-result IPs (loopback, DNS server)
+                if (!ip.startsWith('127.') && !ip.startsWith('0.')) {
+                  resolvedMistIps.set(ip, endpoint.host);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Cross-reference established connections against resolved Mist IPs
+    const matched: string[] = [];
+    const unmatched: string[] = [];
+
+    for (const ep of remoteEndpoints) {
+      const fqdn = resolvedMistIps.get(ep.ip);
+      if (fqdn) {
+        matched.push(`${ep.ip}:${ep.port} (${fqdn})`);
+      } else {
+        unmatched.push(`${ep.ip}:${ep.port}`);
+      }
+    }
+
+    // Deduplicate
+    const uniqueMatched = [...new Set(matched)];
+    const uniqueUnmatched = [...new Set(unmatched)];
+
+    let detail = `${established.length} active connection(s)`;
+    if (uniqueMatched.length > 0) {
+      detail += ` | Mist: ${uniqueMatched.join(', ')}`;
+    }
+    if (uniqueUnmatched.length > 0) {
+      detail += ` | Other: ${uniqueUnmatched.join(', ')}`;
+    }
+    if (other.length > 0) {
+      detail += ` (+${other.length} non-established)`;
+    }
+
+    // Status: pass if at least one connection matches a Mist endpoint
+    // If we resolved endpoints but none matched, warn
+    // If we couldn't resolve any endpoints (no cloud config), pass on connection count alone
+    const status = uniqueMatched.length > 0 ? 'pass'
+      : (resolvedMistIps.size > 0 ? 'warn' : 'pass');
+
+    const warnDetail = uniqueMatched.length === 0 && resolvedMistIps.size > 0
+      ? ' — none matched known Mist endpoints'
+      : '';
+
+    // Build raw output including resolved IPs for debugging
+    const resolvedDebug = [...resolvedMistIps.entries()]
+      .map(([ip, fqdn]) => `  ${fqdn} -> ${ip}`)
+      .join('\n');
+    const rawOutput = cmd.output
+      + '\n--- Resolved Mist IPs ---\n'
+      + (resolvedDebug || '  (none resolved)')
+      + '\n--- Remote endpoints found ---\n'
+      + remoteEndpoints.map((e) => `  ${e.ip}:${e.port}`).join('\n');
+
+    return {
+      id,
+      name,
+      status,
+      detail: detail + warnDetail,
+      raw: rawOutput,
+    };
+  }
+
+  // ---- Offline Timeline ----
+
+  /**
+   * Check when the switch went offline in Mist and correlate with switch logs.
+   */
+  async checkOfflineTimeline(siteId?: string, deviceId?: string): Promise<CheckResult[]> {
+    const results: CheckResult[] = [];
+
+    // Step 1: Get last disconnect time from Mist API
+    let mistDisconnectTime: Date | null = null;
+    let mistEvents: MistDeviceEvent[] = [];
+
+    if (this.mistApi?.isConfigured && siteId && deviceId) {
+      // Get device stats for last_seen
+      const stats = await this.mistApi.getDeviceStats(siteId, deviceId);
+      if (stats?.last_seen) {
+        mistDisconnectTime = new Date(stats.last_seen * 1000);
+        const ago = this.timeAgo(mistDisconnectTime);
+        const statusText = stats.status === 'connected' ? 'currently connected' : `last seen ${ago}`;
+
+        results.push({
+          id: 'mist-last-seen',
+          name: 'Mist Last Seen',
+          status: stats.status === 'connected' ? 'pass' : 'warn',
+          detail: `${statusText} (${mistDisconnectTime.toISOString().replace('T', ' ').substring(0, 19)} UTC)`,
+          raw: JSON.stringify(stats, null, 2),
+        });
+      }
+
+      // Get device events
+      try {
+        mistEvents = await this.mistApi.getDeviceEvents(siteId, deviceId, 20);
+        if (mistEvents.length > 0) {
+          // Find disconnect events
+          const disconnectEvents = mistEvents.filter((e) =>
+            e.type?.includes('DISCONNECTED') ||
+            e.type?.includes('disconnect') ||
+            e.text?.includes('disconnected')
+          );
+
+          const lastDisconnect = disconnectEvents[0];
+          if (lastDisconnect?.timestamp) {
+            mistDisconnectTime = new Date(lastDisconnect.timestamp * 1000);
+          }
+
+          // Summarise recent events
+          const eventSummary = mistEvents.slice(0, 5).map((e) => {
+            const time = e.timestamp ? new Date(e.timestamp * 1000).toISOString().substring(11, 19) : '?';
+            return `${time} ${e.type || ''}: ${e.text || e.reason || ''}`;
+          }).join('\n');
+
+          results.push({
+            id: 'mist-events',
+            name: 'Recent Mist Events',
+            status: 'info' as CheckStatus,
+            detail: `${mistEvents.length} event(s) found. Last: ${mistEvents[0]?.type || 'unknown'}`,
+            raw: eventSummary,
+          });
+        } else {
+          results.push({
+            id: 'mist-events',
+            name: 'Recent Mist Events',
+            status: 'info' as CheckStatus,
+            detail: 'No recent events found',
+          });
+        }
+      } catch {
+        results.push({
+          id: 'mist-events',
+          name: 'Recent Mist Events',
+          status: 'warn',
+          detail: 'Could not fetch events from Mist API',
+        });
+      }
+    } else {
+      results.push({
+        id: 'mist-last-seen',
+        name: 'Mist Last Seen',
+        status: 'skip',
+        detail: 'Mist API not configured or device not identified — cannot check offline time',
+      });
+    }
+
+    // Step 2: Get switch uptime
+    const uptimeCmd = await this.runner.execute('show system uptime', 10000);
+    if (uptimeCmd.success) {
+      const bootMatch = uptimeCmd.output.match(/System booted:\s*(.+?)(?:\s*\(|$)/m);
+      const lastConfigMatch = uptimeCmd.output.match(/Last configured:\s*(.+?)(?:\s*\(|$)/m);
+      const lastConfigBy = uptimeCmd.output.match(/Last configured:.*by\s+(\S+)/m);
+
+      let detail = '';
+      if (bootMatch) detail += `Booted: ${bootMatch[1].trim()}`;
+      if (lastConfigMatch) detail += ` | Last config: ${lastConfigMatch[1].trim()}`;
+      if (lastConfigBy) detail += ` by ${lastConfigBy[1]}`;
+
+      results.push({
+        id: 'switch-uptime',
+        name: 'Switch Uptime',
+        status: 'info' as CheckStatus,
+        detail: detail || 'Could not parse uptime',
+        raw: uptimeCmd.output,
+      });
+    }
+
+    // Step 3: Check Mist audit logs for config changes around the disconnect time
+    if (this.mistApi?.isConfigured && mistDisconnectTime) {
+      const auditResult = await this.checkAuditLogs(mistDisconnectTime, siteId);
+      results.push(auditResult);
+    }
+
+    // Step 4: Pull switch logs around the disconnect time
+    const logResults = await this.getRelevantLogs(mistDisconnectTime);
+    results.push(...logResults);
+
+    return results;
+  }
+
+  /**
+   * Check Mist audit logs for configuration changes around the disconnect time.
+   * Looks for changes within ±30 minutes of the disconnect event.
+   */
+  private async checkAuditLogs(disconnectTime: Date, siteId?: string): Promise<CheckResult> {
+    const id = 'mist-audit-logs';
+    const name = 'Mist Audit Logs (config changes)';
+
+    try {
+      // Search ±30 minutes around the disconnect time
+      const windowMs = 30 * 60 * 1000;
+      const startTime = Math.floor((disconnectTime.getTime() - windowMs) / 1000);
+      const endTime = Math.floor((disconnectTime.getTime() + windowMs) / 1000);
+
+      const logs = await this.mistApi!.getAuditLogs(startTime, endTime, 50);
+
+      if (logs.length === 0) {
+        return {
+          id,
+          name,
+          status: 'pass',
+          detail: 'No configuration changes in Mist within ±30 min of disconnect',
+        };
+      }
+
+      // Filter for config-change-related audit entries
+      const configKeywords = [
+        /update/i, /modify/i, /delete/i, /create/i, /add/i,
+        /template/i, /wlan/i, /switch/i, /network/i, /port/i,
+        /vlan/i, /setting/i, /config/i, /policy/i, /assign/i,
+        /unassign/i, /firmware/i, /upgrade/i, /reboot/i,
+      ];
+
+      const configChanges = logs.filter((log) => {
+        const msg = (log.message || '').toLowerCase();
+        return configKeywords.some((kw) => kw.test(msg));
+      });
+
+      // Also filter for changes to this specific site if we have a site ID
+      const siteChanges = siteId
+        ? logs.filter((log) => log.site_id === siteId)
+        : [];
+
+      const relevantLogs = [...new Map(
+        [...configChanges, ...siteChanges].map((l) => [l.timestamp, l])
+      ).values()];
+
+      if (relevantLogs.length === 0) {
+        return {
+          id,
+          name,
+          status: 'pass',
+          detail: `${logs.length} audit log(s) found but none are config changes`,
+          raw: logs.map((l) => {
+            const time = l.timestamp ? new Date(l.timestamp * 1000).toISOString().substring(11, 19) : '?';
+            return `${time} [${l.admin_name || '?'}] ${l.message || ''}`;
+          }).join('\n'),
+        };
+      }
+
+      // Format the relevant entries
+      const summary = relevantLogs.map((l) => {
+        const time = l.timestamp ? new Date(l.timestamp * 1000).toISOString().substring(11, 19) : '?';
+        return `${time} [${l.admin_name || '?'}] ${l.message || ''}`;
+      }).join('\n');
+
+      return {
+        id,
+        name,
+        status: 'warn',
+        detail: `${relevantLogs.length} config change(s) found near disconnect time — may be related`,
+        raw: summary,
+      };
+    } catch {
+      return {
+        id,
+        name,
+        status: 'warn',
+        detail: 'Could not fetch audit logs from Mist API',
+      };
+    }
+  }
+
+  /**
+   * Pull switch logs and find entries around the Mist disconnect time.
+   * Shows ~25 lines before and ~25 lines after the disconnect for context.
+   */
+  private async getRelevantLogs(disconnectTime: Date | null): Promise<CheckResult[]> {
+    const results: CheckResult[] = [];
+
+    // Pull a large window of both log files
+    const mistLogCmd = await this.runner.execute('show log mist_agent.log | last 200', 30000, 5000);
+    const sysLogCmd = await this.runner.execute('show log messages | last 200', 30000, 5000);
+
+    const mistLogLines = mistLogCmd.success ? mistLogCmd.output.split('\n').filter((l) => l.trim().length > 0) : [];
+    const sysLogLines = sysLogCmd.success ? sysLogCmd.output.split('\n').filter((l) => l.trim().length > 0) : [];
+
+    if (mistLogLines.length === 0 && sysLogLines.length === 0) {
+      results.push({ id: 'switch-logs', name: 'Switch Logs', status: 'warn', detail: 'Could not retrieve logs', raw: '' });
+      return results;
+    }
+
+    // Keywords that indicate problems
+    const problemKeywords = [
+      { pattern: /outbound-ssh/i, category: 'Outbound SSH' },
+      { pattern: /mist/i, category: 'Mist Agent' },
+      { pattern: /connection\s*(reset|refused|timed|closed|failed)/i, category: 'Connection' },
+      { pattern: /link\s*(down|up)/i, category: 'Link State' },
+      { pattern: /interface.*down/i, category: 'Interface' },
+      { pattern: /commit/i, category: 'Config Change' },
+      { pattern: /error|fail|warning|critical/i, category: 'Error' },
+      { pattern: /reboot|shutdown|halt/i, category: 'Reboot' },
+      { pattern: /dhcp/i, category: 'DHCP' },
+      { pattern: /dns|name-server|resolve/i, category: 'DNS' },
+      { pattern: /stp|spanning-tree|bpdu/i, category: 'STP' },
+      { pattern: /license/i, category: 'License' },
+    ];
+
+    // Helper to parse a Junos log timestamp and return minutes-of-day
+    const parseLogMinutes = (line: string): number | null => {
+      const match = line.match(/(\w{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})/);
+      if (!match) return null;
+      return parseInt(match[3], 10) * 60 + parseInt(match[4], 10);
+    };
+
+    // Helper to categorise a log line
+    const categoriseLine = (line: string): string[] => {
+      return problemKeywords
+        .filter((kw) => kw.pattern.test(line))
+        .map((kw) => kw.category);
+    };
+
+    // Helper to extract logs around the disconnect time
+    const extractAroundDisconnect = (
+      lines: string[],
+      logName: string,
+    ): { before: string[]; after: string[]; nearestIndex: number } => {
+      if (!disconnectTime) {
+        // No disconnect time — just return the last 50 lines
+        return { before: lines.slice(-50), after: [], nearestIndex: -1 };
+      }
+
+      const discMinutes = disconnectTime.getUTCHours() * 60 + disconnectTime.getUTCMinutes();
+
+      // Find the log line closest to the disconnect time
+      let nearestIndex = -1;
+      let nearestDelta = Infinity;
+
+      for (let i = 0; i < lines.length; i++) {
+        const logMin = parseLogMinutes(lines[i]);
+        if (logMin === null) continue;
+        const delta = Math.abs(logMin - discMinutes);
+        // Also handle midnight wrap-around
+        const wrappedDelta = Math.min(delta, 1440 - delta);
+        if (wrappedDelta < nearestDelta) {
+          nearestDelta = wrappedDelta;
+          nearestIndex = i;
+        }
+      }
+
+      if (nearestIndex === -1) {
+        // Could not find timestamped lines — return last 50
+        return { before: lines.slice(-50), after: [], nearestIndex: -1 };
+      }
+
+      // Take ~25 lines before and ~25 lines after the nearest point
+      const startIdx = Math.max(0, nearestIndex - 25);
+      const endIdx = Math.min(lines.length, nearestIndex + 25);
+
+      return {
+        before: lines.slice(startIdx, nearestIndex),
+        after: lines.slice(nearestIndex, endIdx),
+        nearestIndex,
+      };
+    };
+
+    // Process system messages log
+    if (sysLogLines.length > 0) {
+      const { before, after, nearestIndex } = extractAroundDisconnect(sysLogLines, 'messages');
+
+      const allContextLines = [...before, ...after];
+      const interestingBefore = before.filter((l) => categoriseLine(l).length > 0);
+      const interestingAfter = after.filter((l) => categoriseLine(l).length > 0);
+      const allInteresting = [...interestingBefore, ...interestingAfter];
+      const allCategories = [...new Set(allInteresting.flatMap((l) => categoriseLine(l)))];
+
+      let detail: string;
+      let raw: string;
+
+      if (disconnectTime && nearestIndex >= 0) {
+        const discTimeStr = disconnectTime.toISOString().substring(11, 19);
+        detail = `${allInteresting.length} relevant entries near disconnect (${discTimeStr} UTC). ${before.length} before, ${after.length} after.`;
+        raw = `--- ${before.length} lines BEFORE disconnect (${discTimeStr} UTC) ---\n` +
+          before.map((l) => {
+            const cats = categoriseLine(l);
+            return cats.length > 0 ? `>>> [${cats.join(',')}] ${l}` : `    ${l}`;
+          }).join('\n') +
+          `\n\n--- DISCONNECT POINT (~${discTimeStr} UTC) ---\n\n` +
+          `--- ${after.length} lines AFTER disconnect ---\n` +
+          after.map((l) => {
+            const cats = categoriseLine(l);
+            return cats.length > 0 ? `>>> [${cats.join(',')}] ${l}` : `    ${l}`;
+          }).join('\n');
+      } else {
+        detail = `${allInteresting.length} relevant entries in last ${allContextLines.length} log lines.`;
+        raw = allContextLines.map((l) => {
+          const cats = categoriseLine(l);
+          return cats.length > 0 ? `>>> [${cats.join(',')}] ${l}` : `    ${l}`;
+        }).join('\n');
+      }
+
+      if (allCategories.length > 0) {
+        detail += ` Categories: ${allCategories.join(', ')}`;
+      }
+
+      results.push({
+        id: 'switch-logs-messages',
+        name: 'System Messages (around disconnect)',
+        status: allInteresting.length > 0 ? 'warn' : ('info' as CheckStatus),
+        detail,
+        raw,
+      });
+    }
+
+    // Process Mist agent log
+    if (mistLogLines.length > 0) {
+      const { before, after, nearestIndex } = extractAroundDisconnect(mistLogLines, 'mist_agent');
+
+      const allContextLines = [...before, ...after];
+      const interestingBefore = before.filter((l) => categoriseLine(l).length > 0);
+      const interestingAfter = after.filter((l) => categoriseLine(l).length > 0);
+      const allInteresting = [...interestingBefore, ...interestingAfter];
+
+      let detail: string;
+      let raw: string;
+
+      if (disconnectTime && nearestIndex >= 0) {
+        const discTimeStr = disconnectTime.toISOString().substring(11, 19);
+        detail = `${allInteresting.length} relevant entries near disconnect. ${before.length} before, ${after.length} after.`;
+        raw = `--- ${before.length} lines BEFORE disconnect (${discTimeStr} UTC) ---\n` +
+          before.join('\n') +
+          `\n\n--- DISCONNECT POINT (~${discTimeStr} UTC) ---\n\n` +
+          `--- ${after.length} lines AFTER disconnect ---\n` +
+          after.join('\n');
+      } else {
+        detail = `${mistLogLines.length} Mist agent log lines retrieved.`;
+        raw = allContextLines.join('\n');
+      }
+
+      results.push({
+        id: 'switch-logs-mist-agent',
+        name: 'Mist Agent Log (around disconnect)',
+        status: allInteresting.length > 0 ? 'warn' : ('info' as CheckStatus),
+        detail,
+        raw,
+      });
+    }
+
+    return results;
+  }
+
+  /**
+   * Format a date as a human-readable "time ago" string.
+   */
+  private timeAgo(date: Date): string {
+    const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ${hours % 24}h ago`;
+  }
+
+  /**
+   * Generate context-aware remediation guidance and executable commands.
+   */
+  getRemediation(result: CheckResult, allResults?: CheckResult[]): { text?: string; commands?: string[] } {
+    if (result.status === 'pass' || result.status === 'skip') return {};
+
+    const r = (id: string): CheckResult | undefined => allResults?.find((x) => x.id === id);
+    const failed = (id: string) => r(id)?.status === 'fail';
+    const detail = (id: string) => r(id)?.detail || '';
+
+    switch (result.id) {
+      case 'lldp':
+        return {
+          text: '1. Verify the uplink cable is securely connected.\n2. Check upstream device has LLDP enabled.\n3. Try a different cable or SFP.\n4. Manually specify the uplink port if LLDP is disabled upstream.',
+          commands: ['set protocols lldp interface all'],
+        };
+
+      case 'port-status': {
+        const portMatch = result.detail.match(/((?:ge|xe|et|mge)-\S+)/);
+        if (result.raw?.includes('Administratively down') || result.detail.includes('admin')) {
+          return {
+            text: 'The port is administratively disabled.',
+            commands: portMatch ? [`delete interfaces ${portMatch[1]} disable`] : undefined,
+          };
+        }
+        return { text: 'Port has no link. Check cable, SFP, and upstream port.' };
+      }
+
+      case 'interface-errors':
+        return { text: 'Non-zero error counters detected. Replace cable or SFP. Clear counters to monitor for new errors.' };
+
+      case 'vlan-config': {
+        let text = 'Ensure the uplink is configured as trunk with the management VLAN.';
+        if (failed('lldp')) text += '\nNote: LLDP also failed — uplink may not be connected.';
+        return { text };
+      }
+
+      case 'mgmt-ip': {
+        const dhcpDtl = detail('dhcp-lease').toLowerCase();
+        const isDhcp = dhcpDtl.includes('dhcp') || dhcpDtl.includes('0.0.0.0');
+        const isStatic = dhcpDtl.includes('static');
+        const steps: string[] = [];
+        const cmds: string[] = [];
+
+        if (result.detail.includes('up but have no IP')) {
+          steps.push('Management interface is up but has no IP.');
+        }
+        if (failed('port-status')) {
+          steps.push('→ Uplink port is down — fix physical connection first.');
+        } else if (failed('vlan-config')) {
+          steps.push('→ VLAN config failed — DHCP server may be unreachable.');
+        }
+        if (isDhcp || (!isStatic && !isDhcp)) {
+          steps.push('Ensure DHCP client is configured on the management interface.');
+          cmds.push('set interfaces irb unit 0 family inet dhcp');
+        } else if (isStatic) {
+          steps.push('Static IP not configured.');
+          cmds.push('set interfaces irb unit 0 family inet address <ip>/<prefix>');
+        }
+        return { text: steps.join('\n'), commands: cmds.length > 0 ? cmds : undefined };
+      }
+
+      case 'dhcp-lease':
+        return {
+          text: 'DHCP client may not be configured, or server is unreachable.\nEnsure management VLAN is correct and DHCP server has available addresses.',
+          commands: ['set interfaces irb unit 0 family inet dhcp'],
+        };
+
+      case 'arp': {
+        if (failed('port-status')) return { text: 'Uplink port is down — fix physical connection first.' };
+        if (failed('vlan-config')) return { text: 'VLAN config failed — gateway may be on a different VLAN.' };
+        return { text: 'ARP table is empty. Check STP blocking and Layer 2 connectivity.' };
+      }
+
+      case 'default-route': {
+        const dhcpDtl = detail('dhcp-lease').toLowerCase();
+        const hasDhcp = dhcpDtl.includes('ip:') && !dhcpDtl.includes('static');
+        if (failed('mgmt-ip')) return { text: 'Management IP failed — fix that first.' };
+        if (hasDhcp) return { text: 'IP via DHCP but no gateway. Update DHCP scope with Option 3 (Router/Gateway).' };
+        return {
+          text: 'No default route configured.',
+          commands: ['set routing-options static route 0.0.0.0/0 next-hop <gateway-ip>'],
+        };
+      }
+
+      case 'dns-config': {
+        const dhcpDtl = detail('dhcp-lease').toLowerCase();
+        const hasDhcp = dhcpDtl.includes('ip:') && !dhcpDtl.includes('static');
+        let text = 'No DNS servers configured.';
+        if (hasDhcp) text += '\nIP via DHCP — update DHCP scope to include DNS (Option 6).';
+        return {
+          text,
+          commands: ['set system name-server 8.8.8.8', 'set system name-server 8.8.4.4'],
+        };
+      }
+
+      case 'dns-resolve': {
+        if (failed('dns-config')) return { text: 'DNS servers not configured — fix DNS Config first.' };
+        if (result.detail.includes('DNS failure') || result.detail.includes('unknown host'))
+          return { text: 'DNS configured but resolution failing. Check DNS server reachability and firewall (UDP 53).' };
+        if (result.detail.includes('0 replies'))
+          return { text: 'ICMP blocked — may be OK. Run Firewall Policy Check to verify TCP.' };
+        return {};
+      }
+
+      case 'route-to-mist':
+        if (failed('default-route')) return { text: 'No default route — fix Default Gateway first.' };
+        return { text: 'Default route exists but no path to Mist IP. Check policy routing or ACLs.' };
+
+      case 'mist-agent-version':
+        return { text: 'Mist Agent not installed. Use the "Adopt Switch" button.' };
+
+      case 'mist-processes': {
+        if (failed('mist-agent-version')) return { text: 'Mist Agent not installed — adopt the switch first.' };
+        return { text: 'Mist agent processes not running. Restarting.', commands: ['restart mcd'] };
+      }
+
+      case 'outbound-ssh-config': {
+        if (result.detail.includes('not configured') || result.detail.includes('not found'))
+          return { text: 'Outbound SSH not configured — use the Adopt Switch button.' };
+        if (result.detail.includes('deactivated'))
+          return { text: 'Outbound SSH deactivated.', commands: ['activate system services outbound-ssh client mist'] };
+        return {
+          text: 'Outbound SSH may be stuck. Deactivating and reactivating.',
+          commands: ['deactivate system services outbound-ssh client mist', 'activate system services outbound-ssh client mist'],
+        };
+      }
+
+      case 'active-connections': {
+        if (failed('mist-processes')) return { text: 'Mist agent not running — fix that first.' };
+        if (failed('outbound-ssh-config')) return { text: 'Outbound SSH not configured — adopt the switch.' };
+        if (result.detail.includes('SYN_SENT'))
+          return { text: 'Connections stuck in SYN_SENT — firewall blocking. Run Firewall Policy Check.' };
+        if (result.detail.includes('FIN_WAIT') || result.detail.includes('CLOSE_WAIT'))
+          return { text: 'Stale connections detected.', commands: ['restart mcd'] };
+        return {
+          text: 'No connections. Trying deactivate/reactivate outbound SSH.',
+          commands: ['deactivate system services outbound-ssh client mist', 'activate system services outbound-ssh client mist'],
+        };
+      }
+
+      default:
+        return {};
+    }
+  }
+}

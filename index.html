@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Junos Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div id="app">
+
+    <!-- Header -->
+    <header id="header">
+      <div class="header-left">
+        <h1>Junos Console</h1>
+        <span class="header-subtitle">Web Serial Terminal</span>
+      </div>
+      <div class="header-right">
+        <span id="connection-badge" class="badge badge-disconnected">Disconnected</span>
+      </div>
+    </header>
+
+    <!-- Main layout -->
+    <div id="main">
+
+      <!-- Sidebar: Accordion navigation -->
+      <aside id="sidebar">
+
+        <!-- Connection section -->
+        <div class="accordion-section" data-section="connection">
+          <button class="accordion-trigger active" data-target="connection">
+            <svg class="accordion-chevron" viewBox="0 0 16 16" width="14" height="14"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Connection
+          </button>
+          <div class="accordion-content open" id="accordion-connection">
+            <label for="baud-rate">Baud Rate</label>
+            <select id="baud-rate">
+              <option value="9600" selected>9600</option>
+              <option value="19200">19200</option>
+              <option value="38400">38400</option>
+              <option value="57600">57600</option>
+              <option value="115200">115200</option>
+            </select>
+
+            <label for="data-bits">Data Bits</label>
+            <select id="data-bits">
+              <option value="7">7</option>
+              <option value="8" selected>8</option>
+            </select>
+
+            <label for="parity">Parity</label>
+            <select id="parity">
+              <option value="none" selected>None</option>
+              <option value="even">Even</option>
+              <option value="odd">Odd</option>
+            </select>
+
+            <label for="stop-bits">Stop Bits</label>
+            <select id="stop-bits">
+              <option value="1" selected>1</option>
+              <option value="2">2</option>
+            </select>
+
+            <label for="flow-control">Flow Control</label>
+            <select id="flow-control">
+              <option value="none" selected>None</option>
+              <option value="hardware">Hardware (RTS/CTS)</option>
+            </select>
+
+            <div class="sidebar-actions">
+              <button id="btn-connect" class="btn btn-primary">Connect</button>
+              <button id="btn-disconnect" class="btn btn-danger" disabled>Disconnect</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Mist API section -->
+        <div class="accordion-section" data-section="mist-api">
+          <button class="accordion-trigger" data-target="mist-api">
+            <svg class="accordion-chevron" viewBox="0 0 16 16" width="14" height="14"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Mist API
+          </button>
+          <div class="accordion-content" id="accordion-mist-api">
+            <label for="mist-cloud">Cloud Region</label>
+            <select id="mist-cloud"></select>
+
+            <label for="mist-api-token">API Token</label>
+            <input type="password" id="mist-api-token" placeholder="Your Mist API token" autocomplete="off">
+
+            <label for="mist-org-id">Org ID</label>
+            <input type="text" id="mist-org-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
+
+            <label for="mist-site">Site</label>
+            <div class="input-row">
+              <select id="mist-site" disabled>
+                <option value="">— Load sites first —</option>
+              </select>
+              <button id="btn-load-sites" class="btn btn-secondary btn-sm">Load</button>
+            </div>
+
+            <div id="mist-api-status" class="status-text"></div>
+          </div>
+        </div>
+
+        <!-- Terminal section -->
+        <div class="accordion-section" data-section="terminal">
+          <button class="accordion-trigger" data-target="terminal">
+            <svg class="accordion-chevron" viewBox="0 0 16 16" width="14" height="14"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Terminal
+          </button>
+          <div class="accordion-content" id="accordion-terminal">
+            <button id="btn-clear" class="btn btn-secondary">Clear Output</button>
+          </div>
+        </div>
+
+        <!-- Device Identity & Config section -->
+        <div class="accordion-section" data-section="device">
+          <button class="accordion-trigger" data-target="device">
+            <svg class="accordion-chevron" viewBox="0 0 16 16" width="14" height="14"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Device &amp; Config
+          </button>
+          <div class="accordion-content" id="accordion-device">
+
+            <div class="sidebar-actions">
+              <button id="btn-login" class="btn btn-primary" disabled>Login to Switch</button>
+            </div>
+
+            <div id="login-result"></div>
+
+            <div class="sidebar-actions" style="margin-top:8px;">
+              <button id="btn-identify" class="btn btn-secondary" disabled>Identify Switch</button>
+            </div>
+
+            <div id="device-identity" class="device-info-panel"></div>
+
+            <div class="sidebar-actions" style="margin-top:8px;">
+              <button id="btn-root-password" class="btn btn-secondary" disabled>Get Root Password</button>
+            </div>
+
+            <div id="root-password-result"></div>
+
+            <div class="sidebar-actions" style="margin-top:8px;">
+              <button id="btn-config-drift" class="btn btn-secondary" disabled>Check Config Drift</button>
+            </div>
+
+            <div id="config-drift-results"></div>
+
+            <div class="sidebar-actions" style="margin-top:8px;">
+              <button id="btn-offline-timeline" class="btn btn-secondary" disabled>Offline Timeline</button>
+            </div>
+
+            <div id="timeline-results"></div>
+
+            <div class="sidebar-actions" style="margin-top:8px;">
+              <button id="btn-adopt" class="btn btn-secondary" disabled>Adopt Switch</button>
+            </div>
+
+            <label for="adopt-root-pw" style="margin-top:8px;">Root Password (for adoption)</label>
+            <input type="password" id="adopt-root-pw" placeholder="Will use Mist site password if blank" autocomplete="off">
+
+            <div id="adopt-results"></div>
+          </div>
+        </div>
+
+        <!-- Troubleshooting section -->
+        <div class="accordion-section" data-section="troubleshooting">
+          <button class="accordion-trigger" data-target="troubleshooting">
+            <svg class="accordion-chevron" viewBox="0 0 16 16" width="14" height="14"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Troubleshooting
+          </button>
+          <div class="accordion-content" id="accordion-troubleshooting">
+            <label for="ts-uplink-port">Uplink Port (auto-detect if blank)</label>
+            <input type="text" id="ts-uplink-port" placeholder="e.g. ge-0/0/0" autocomplete="off">
+
+            <div class="sidebar-actions" style="margin-top:10px;">
+              <button id="btn-run-troubleshoot" class="btn btn-primary" disabled>Run Cloud Check</button>
+            </div>
+            <div class="sidebar-actions" style="margin-top:6px;">
+              <button id="btn-mist-status" class="btn btn-secondary" disabled>Mist Status</button>
+            </div>
+            <div class="sidebar-actions" style="margin-top:6px;">
+              <button id="btn-ssl-check" class="btn btn-secondary" disabled>Firewall Policy Check</button>
+            </div>
+
+            <div id="ts-results"></div>
+          </div>
+        </div>
+
+        <!-- Footer info -->
+        <div class="sidebar-footer">
+          <p>Requires <strong>Chrome</strong> or <strong>Edge</strong> (Web Serial API)</p>
+        </div>
+
+      </aside>
+
+      <!-- Terminal area -->
+      <div id="terminal-container"></div>
+
+    </div>
+
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
