@@ -23,7 +23,10 @@ export const DEFAULT_SERIAL_OPTIONS: SerialOptions = {
 };
 
 type SerialEventMap = {
+  /** Raw bytes from the device (RX). */
   data: Uint8Array;
+  /** Raw bytes sent to the device (TX), for session mirroring / audit. */
+  tx: Uint8Array;
   connect: void;
   disconnect: void;
   error: Error;
@@ -87,19 +90,28 @@ export class SerialService {
   }
 
   /**
-   * Open a serial connection.
-   * Prompts the user to select a port via the browser's native picker.
+   * Prompt for a port, then open it. Prefer calling `navigator.serial.requestPort()` yourself
+   * first (e.g. from a click handler) so it is the first `await` after the user gesture.
    */
   async connect(options: Partial<SerialOptions> = {}): Promise<void> {
     if (!SerialService.isSupported()) {
       throw new Error('Web Serial API not supported. Use Chrome or Edge.');
     }
+    const port = await navigator.serial.requestPort();
+    await this.openPort(port, options);
+  }
+
+  /**
+   * Open a user-chosen `SerialPort` (already returned from `requestPort()`).
+   */
+  async openPort(port: SerialPort, options: Partial<SerialOptions> = {}): Promise<void> {
+    if (this.port !== null) {
+      throw new Error('Already connected. Disconnect first.');
+    }
 
     const opts: SerialOptions = { ...DEFAULT_SERIAL_OPTIONS, ...options };
 
-    // Prompt user to select a serial port
-    this.port = await navigator.serial.requestPort();
-
+    this.port = port;
     await this.port.open({
       baudRate: opts.baudRate,
       dataBits: opts.dataBits,
@@ -108,11 +120,9 @@ export class SerialService {
       flowControl: opts.flowControl,
     });
 
-    // Set up writer (raw bytes)
     if (!this.port.writable) throw new Error('Port is not writable.');
     this.writer = this.port.writable.getWriter();
 
-    // Set up reader (raw bytes)
     if (!this.port.readable) throw new Error('Port is not readable.');
     this.reader = this.port.readable.getReader();
 
@@ -144,17 +154,21 @@ export class SerialService {
   /**
    * Send raw bytes over the serial connection.
    */
-  async writeBytes(data: Uint8Array): Promise<void> {
+  /**
+   * @param emitTx — When false, skips the `tx` event (e.g. bytes injected from a remote support session).
+   */
+  async writeBytes(data: Uint8Array, emitTx = true): Promise<void> {
     if (!this.writer) throw new Error('Not connected.');
     await this.writer.write(data);
+    if (emitTx) this.emit('tx', new Uint8Array(data));
   }
 
   /**
    * Send a string over the serial connection (encoded as UTF-8).
    */
-  async writeString(data: string): Promise<void> {
+  async writeString(data: string, emitTx = true): Promise<void> {
     const encoder = new TextEncoder();
-    await this.writeBytes(encoder.encode(data));
+    await this.writeBytes(encoder.encode(data), emitTx);
   }
 
   /**

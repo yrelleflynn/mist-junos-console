@@ -74,6 +74,16 @@ html, body {
   gap: 12px;
 }
 
+.support-page .header-subtitle a {
+  color: var(--text-secondary);
+  text-decoration: none;
+}
+
+.support-page .header-subtitle a:hover {
+  color: var(--accent-blue);
+  text-decoration: underline;
+}
+
 .header-left h1 {
   font-family: var(--font-mono);
   font-size: 16px;
@@ -803,6 +813,36 @@ html, body {
   color: var(--text-secondary);
 }
 
+.mist-status-pill {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  margin: 6px 0 2px;
+}
+
+.mist-status-pill.mist-status-connected {
+  color: #41d87b;
+  background: rgba(35, 134, 54, 0.15);
+  border-color: rgba(35, 134, 54, 0.35);
+}
+
+.mist-status-pill.mist-status-disconnected {
+  color: var(--text-error);
+  background: rgba(218, 54, 51, 0.12);
+  border-color: rgba(218, 54, 51, 0.35);
+}
+
+.mist-status-pill.mist-status-unknown {
+  color: var(--text-secondary);
+  background: rgba(139, 148, 158, 0.12);
+  border-color: rgba(139, 148, 158, 0.3);
+}
+
 /* ---- Config Drift Results ---- */
 #config-drift-results {
   margin-top: 10px;
@@ -890,4 +930,116 @@ html, body {
   padding: 1px 5px;
   border-radius: 3px;
   color: var(--text-primary);
+}
+
+/* ---- Remote console session (operator sidebar) ---- */
+.remote-session-block {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-color);
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1.35;
+  color: var(--text-primary);
+}
+
+.checkbox-label input {
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+
+.remote-session-help {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.remote-session-help code {
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.remote-session-help a {
+  color: var(--accent-blue);
+}
+
+.remote-session-panel {
+  margin-top: 10px;
+}
+
+.remote-session-panel.is-hidden {
+  display: none;
+}
+
+.remote-session-panel label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+/* ---- Support console page ---- */
+body.support-page #support-app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.support-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.support-toolbar input[type="text"] {
+  flex: 1;
+  min-width: 200px;
+  padding: 6px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-color);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.support-toolbar .support-status {
+  font-size: 12px;
+  color: var(--text-secondary);
+  width: 100%;
+  flex-basis: 100%;
+}
+
+#support-terminal-wrap {
+  flex: 1;
+  min-height: 0;
+  padding: 8px;
+}
+
+#support-terminal-wrap .xterm {
+  height: 100%;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }

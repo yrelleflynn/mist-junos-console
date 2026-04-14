@@ -9,6 +9,11 @@
 import { CommandRunnerService, CommandResult } from './command-runner.service';
 import { MistApiService, MistDeviceEvent, MistAuditLog } from './mist-api.service';
 import { MistCloud, MistEndpoint } from '../config/mist-clouds.config';
+import {
+  formatOffsetEastLabel,
+  getJunosLogLineUtcMs,
+  parseCurrentTimeFromUptime,
+} from '../utils/junos-log-time';
 
 export type CheckStatus = 'pending' | 'running' | 'pass' | 'fail' | 'warn' | 'skip' | 'info';
 
@@ -60,6 +65,31 @@ export interface TroubleshootOptions {
   onProgress: CheckProgressCallback;
 }
 
+/** Mutable context for the modular troubleshoot step queue (Juniper EX). */
+export interface TroubleshootContext {
+  cloud: MistCloud;
+  uplinkPort: string;
+  uplinkNeighbor: LldpNeighbor | null;
+  upstreamConfig: UpstreamPortConfig | null;
+  siteId?: string;
+  deviceId?: string;
+  /** Set by the uplink port status step when the interface is operationally up. */
+  uplinkPortOperational?: boolean;
+}
+
+export interface TroubleshootStepRun {
+  result: CheckResult;
+  /** Splice these steps immediately after the current step (dynamic expansion). */
+  extraSteps?: TroubleshootStep[];
+}
+
+export interface TroubleshootStep {
+  id: string;
+  name: string;
+  skipWhen?: (ctx: TroubleshootContext) => boolean;
+  run: (ctx: TroubleshootContext) => Promise<TroubleshootStepRun>;
+}
+
 export class TroubleshootService {
   private runner: CommandRunnerService;
   private mistApi: MistApiService | null;
@@ -67,6 +97,74 @@ export class TroubleshootService {
   constructor(runner: CommandRunnerService, mistApi?: MistApiService) {
     this.runner = runner;
     this.mistApi = mistApi || null;
+  }
+
+  /**
+   * Run an ordered queue of steps; supports `extraSteps` injection after any step.
+   */
+  private async runTroubleshootSteps(
+    initialSteps: TroubleshootStep[],
+    ctx: TroubleshootContext,
+    report: (result: CheckResult) => void,
+  ): Promise<void> {
+    const queue = [...initialSteps];
+    for (let i = 0; i < queue.length; i++) {
+      const step = queue[i];
+      if (step.skipWhen?.(ctx)) continue;
+      const { result, extraSteps } = await step.run(ctx);
+      report(result);
+      if (extraSteps?.length) {
+        queue.splice(i + 1, 0, ...extraSteps);
+      }
+    }
+  }
+
+  /**
+   * First segment of `runAll`: LLDP → Mist upstream lookup → port status → interface errors.
+   * Additional phases can be migrated here over time.
+   */
+  private buildInitialJuniperSteps(): TroubleshootStep[] {
+    return [
+      {
+        id: 'lldp',
+        name: 'LLDP Neighbors',
+        run: async (ctx) => {
+          const lldpResult = await this.checkLldp(ctx.uplinkPort);
+          if (!ctx.uplinkPort && lldpResult.detectedPort) {
+            ctx.uplinkPort = lldpResult.detectedPort;
+          }
+          ctx.uplinkNeighbor = lldpResult.uplinkNeighbor;
+          return { result: lldpResult.result };
+        },
+      },
+      {
+        id: 'upstream-port-config',
+        name: 'Upstream Switch Port Config',
+        skipWhen: (ctx) => !ctx.uplinkNeighbor,
+        run: async (ctx) => {
+          const upstreamResult = await this.lookupUpstreamPortConfig(ctx.uplinkNeighbor!);
+          ctx.upstreamConfig = upstreamResult.config;
+          return { result: upstreamResult.result };
+        },
+      },
+      {
+        id: 'port-status',
+        name: 'Uplink Port Status',
+        run: async (ctx) => {
+          const portResult = await this.checkPortStatus(ctx.uplinkPort);
+          ctx.uplinkPortOperational = portResult.status === 'pass';
+          return { result: portResult };
+        },
+      },
+      {
+        id: 'interface-errors',
+        name: 'Uplink Interface Errors',
+        skipWhen: (ctx) => !ctx.uplinkPort || !ctx.uplinkPortOperational,
+        run: async (ctx) => ({
+          result: await this.checkInterfaceErrors(ctx.uplinkPort),
+        }),
+      },
+    ];
   }
 
   /**
@@ -93,32 +191,18 @@ export class TroubleshootService {
     // Disable pagination first
     await this.runner.ensureOperationalMode();
 
-    // 1. LLDP — detect uplink
-    let uplinkPort = options.uplinkPort || '';
-    const lldpResult = await this.checkLldp(uplinkPort);
-    report(lldpResult.result);
+    const ctx: TroubleshootContext = {
+      cloud,
+      uplinkPort: options.uplinkPort || '',
+      uplinkNeighbor: null,
+      upstreamConfig: null,
+      siteId: options.siteId,
+      deviceId: options.deviceId,
+    };
 
-    if (!uplinkPort && lldpResult.detectedPort) {
-      uplinkPort = lldpResult.detectedPort;
-    }
+    await this.runTroubleshootSteps(this.buildInitialJuniperSteps(), ctx, report);
 
-    // 1b. Look up upstream switch port config in Mist
-    let upstreamConfig: UpstreamPortConfig | null = null;
-    if (lldpResult.uplinkNeighbor) {
-      const upstreamResult = await this.lookupUpstreamPortConfig(lldpResult.uplinkNeighbor);
-      report(upstreamResult.result);
-      upstreamConfig = upstreamResult.config;
-    }
-
-    // 2. Port Status
-    const portResult = await this.checkPortStatus(uplinkPort);
-    report(portResult);
-
-    // 2b. Interface Error Counters (only if port is up)
-    if (uplinkPort && portResult.status === 'pass') {
-      const errorResult = await this.checkInterfaceErrors(uplinkPort);
-      report(errorResult);
-    }
+    const { uplinkPort, upstreamConfig } = ctx;
 
     // 3. VLAN Config
     const vlanResult = await this.checkVlanConfig(uplinkPort);
@@ -2032,17 +2116,23 @@ export class TroubleshootService {
         });
       }
     } else {
+      const safeSite = siteId ? `${String(siteId).slice(0, 8)}…` : '(empty)';
+      const safeDevice = deviceId ? `${String(deviceId).slice(0, 8)}…` : '(empty)';
       results.push({
         id: 'mist-last-seen',
         name: 'Mist Last Seen',
         status: 'skip',
-        detail: 'Mist API not configured or device not identified — cannot check offline time',
+        detail:
+          `Mist Last Seen skipped (needs Mist API + site + device id). ` +
+          `mistApiConfigured=${this.mistApi?.isConfigured ? 'yes' : 'no'} siteId=${safeSite} deviceId=${safeDevice}`,
       });
     }
 
     // Step 2: Get switch uptime
+    let uptimeRaw = '';
     const uptimeCmd = await this.runner.execute('show system uptime', 10000);
     if (uptimeCmd.success) {
+      uptimeRaw = uptimeCmd.output;
       const bootMatch = uptimeCmd.output.match(/System booted:\s*(.+?)(?:\s*\(|$)/m);
       const lastConfigMatch = uptimeCmd.output.match(/Last configured:\s*(.+?)(?:\s*\(|$)/m);
       const lastConfigBy = uptimeCmd.output.match(/Last configured:.*by\s+(\S+)/m);
@@ -2068,7 +2158,7 @@ export class TroubleshootService {
     }
 
     // Step 4: Pull switch logs around the disconnect time
-    const logResults = await this.getRelevantLogs(mistDisconnectTime);
+    const logResults = await this.getRelevantLogs(mistDisconnectTime, uptimeRaw);
     results.push(...logResults);
 
     return results;
@@ -2158,21 +2248,76 @@ export class TroubleshootService {
   }
 
   /**
+   * Choose Mist agent log file: JMA uses jmd.log; legacy pyagent stacks often use mist.log.
+   */
+  private async resolveMistAgentLogFile(): Promise<{ file: string; reason: string }> {
+    const cmd = await this.runner.execute('show version | match mist', 15000);
+    const text = (cmd.success ? cmd.output : '').toLowerCase();
+    if (text.includes('pyagent') || text.includes('python mist')) {
+      return { file: 'mist.log', reason: 'pyagent / legacy (mist.log)' };
+    }
+    if (text.trim().length > 0) {
+      return { file: 'jmd.log', reason: 'JMA / jmd (jmd.log)' };
+    }
+    return { file: 'jmd.log', reason: 'default jmd.log (no mist lines in show version | match mist)' };
+  }
+
+  /**
    * Pull switch logs and find entries around the Mist disconnect time.
    * Shows ~25 lines before and ~25 lines after the disconnect for context.
    */
-  private async getRelevantLogs(disconnectTime: Date | null): Promise<CheckResult[]> {
+  private async getRelevantLogs(
+    disconnectTime: Date | null,
+    uptimeOutput?: string,
+  ): Promise<CheckResult[]> {
     const results: CheckResult[] = [];
 
-    // Pull a large window of both log files
-    const mistLogCmd = await this.runner.execute('show log mist_agent.log | last 200', 30000, 5000);
+    let uptimeText = (uptimeOutput ?? '').trim();
+    if (!uptimeText) {
+      const up = await this.runner.execute('show system uptime', 10000);
+      if (up.success) uptimeText = up.output;
+    }
+    const tzRef = parseCurrentTimeFromUptime(uptimeText);
+    const offsetEastMin = tzRef?.offsetEastMin ?? 0;
+    const offsetKnown = tzRef?.offsetKnown ?? false;
+    const uptimeCalendar = tzRef
+      ? { year: tzRef.year, month: tzRef.month, day: tzRef.day }
+      : null;
+    let tzNote: string;
+    if (tzRef && offsetKnown) {
+      tzNote = `${tzRef.abbrev} (UTC${formatOffsetEastLabel(offsetEastMin)})`;
+    } else if (tzRef && !offsetKnown) {
+      tzNote = `${tzRef.abbrev} — unknown TZ label; using UTC+0:00 for syslog timestamps`;
+    } else {
+      tzNote = 'no Current time parsed from uptime; using UTC+0:00 for syslog timestamps';
+    }
+
+    const { file: mistLogFile, reason: mistLogReason } = await this.resolveMistAgentLogFile();
+
+    // Pull a large window: Mist agent log (jmd.log or mist.log) + system messages
+    const mistLogCmd = await this.runner.execute(`show log ${mistLogFile} | last 200`, 30000, 5000);
     const sysLogCmd = await this.runner.execute('show log messages | last 200', 30000, 5000);
 
-    const mistLogLines = mistLogCmd.success ? mistLogCmd.output.split('\n').filter((l) => l.trim().length > 0) : [];
-    const sysLogLines = sysLogCmd.success ? sysLogCmd.output.split('\n').filter((l) => l.trim().length > 0) : [];
+    // Important: even if `execute()` marks the command as unsuccessful (timeout / prompt detection),
+    // the serial stream often already contains the log text we need.
+    // So we parse `output` regardless of `success`.
+    const mistLogLines = (mistLogCmd.output || '')
+      .split('\n')
+      .filter((l) => l.trim().length > 0);
+    const sysLogLines = (sysLogCmd.output || '')
+      .split('\n')
+      .filter((l) => l.trim().length > 0);
 
     if (mistLogLines.length === 0 && sysLogLines.length === 0) {
-      results.push({ id: 'switch-logs', name: 'Switch Logs', status: 'warn', detail: 'Could not retrieve logs', raw: '' });
+      results.push({
+        id: 'switch-logs',
+        name: 'Switch Logs',
+        status: 'warn',
+        detail:
+          `Could not retrieve logs (tried ${mistLogFile} — ${mistLogReason}). ` +
+          `Mist log ok=${mistLogCmd.success} syslog ok=${sysLogCmd.success}`,
+        raw: '',
+      });
       return results;
     }
 
@@ -2192,13 +2337,6 @@ export class TroubleshootService {
       { pattern: /license/i, category: 'License' },
     ];
 
-    // Helper to parse a Junos log timestamp and return minutes-of-day
-    const parseLogMinutes = (line: string): number | null => {
-      const match = line.match(/(\w{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})/);
-      if (!match) return null;
-      return parseInt(match[3], 10) * 60 + parseInt(match[4], 10);
-    };
-
     // Helper to categorise a log line
     const categoriseLine = (line: string): string[] => {
       return problemKeywords
@@ -2209,37 +2347,29 @@ export class TroubleshootService {
     // Helper to extract logs around the disconnect time
     const extractAroundDisconnect = (
       lines: string[],
-      logName: string,
     ): { before: string[]; after: string[]; nearestIndex: number } => {
       if (!disconnectTime) {
-        // No disconnect time — just return the last 50 lines
         return { before: lines.slice(-50), after: [], nearestIndex: -1 };
       }
 
-      const discMinutes = disconnectTime.getUTCHours() * 60 + disconnectTime.getUTCMinutes();
-
-      // Find the log line closest to the disconnect time
+      const discMs = disconnectTime.getTime();
       let nearestIndex = -1;
       let nearestDelta = Infinity;
 
       for (let i = 0; i < lines.length; i++) {
-        const logMin = parseLogMinutes(lines[i]);
-        if (logMin === null) continue;
-        const delta = Math.abs(logMin - discMinutes);
-        // Also handle midnight wrap-around
-        const wrappedDelta = Math.min(delta, 1440 - delta);
-        if (wrappedDelta < nearestDelta) {
-          nearestDelta = wrappedDelta;
+        const logUtc = getJunosLogLineUtcMs(lines[i], discMs, offsetEastMin, uptimeCalendar);
+        if (logUtc === null) continue;
+        const delta = Math.abs(logUtc - discMs);
+        if (delta < nearestDelta) {
+          nearestDelta = delta;
           nearestIndex = i;
         }
       }
 
       if (nearestIndex === -1) {
-        // Could not find timestamped lines — return last 50
         return { before: lines.slice(-50), after: [], nearestIndex: -1 };
       }
 
-      // Take ~25 lines before and ~25 lines after the nearest point
       const startIdx = Math.max(0, nearestIndex - 25);
       const endIdx = Math.min(lines.length, nearestIndex + 25);
 
@@ -2252,7 +2382,7 @@ export class TroubleshootService {
 
     // Process system messages log
     if (sysLogLines.length > 0) {
-      const { before, after, nearestIndex } = extractAroundDisconnect(sysLogLines, 'messages');
+      const { before, after, nearestIndex } = extractAroundDisconnect(sysLogLines);
 
       const allContextLines = [...before, ...after];
       const interestingBefore = before.filter((l) => categoriseLine(l).length > 0);
@@ -2264,15 +2394,18 @@ export class TroubleshootService {
       let raw: string;
 
       if (disconnectTime && nearestIndex >= 0) {
-        const discTimeStr = disconnectTime.toISOString().substring(11, 19);
-        detail = `${allInteresting.length} relevant entries near disconnect (${discTimeStr} UTC). ${before.length} before, ${after.length} after.`;
-        raw = `--- ${before.length} lines BEFORE disconnect (${discTimeStr} UTC) ---\n` +
+        const discIso = disconnectTime.toISOString();
+        detail =
+          `${allInteresting.length} relevant entries near Mist last_seen (${discIso}, UTC). ` +
+          `Switch log times → UTC using ${tzNote}. ${before.length} lines before anchor, ${after.length} after.`;
+        raw =
+          `--- ${before.length} lines BEFORE Mist disconnect reference (${discIso} UTC) ---\n` +
           before.map((l) => {
             const cats = categoriseLine(l);
             return cats.length > 0 ? `>>> [${cats.join(',')}] ${l}` : `    ${l}`;
           }).join('\n') +
-          `\n\n--- DISCONNECT POINT (~${discTimeStr} UTC) ---\n\n` +
-          `--- ${after.length} lines AFTER disconnect ---\n` +
+          `\n\n--- NEAREST LOG ANCHOR (~${discIso} UTC) ---\n\n` +
+          `--- ${after.length} lines AFTER anchor ---\n` +
           after.map((l) => {
             const cats = categoriseLine(l);
             return cats.length > 0 ? `>>> [${cats.join(',')}] ${l}` : `    ${l}`;
@@ -2299,8 +2432,18 @@ export class TroubleshootService {
     }
 
     // Process Mist agent log
+    if (mistLogLines.length === 0 && sysLogLines.length > 0 && !mistLogCmd.success) {
+      results.push({
+        id: 'switch-logs-mist-agent-missing',
+        name: `Mist agent log (${mistLogFile})`,
+        status: 'info',
+        detail: `Could not read ${mistLogFile} (${mistLogReason}) — using system messages only`,
+        raw: mistLogCmd.output || mistLogCmd.error || '',
+      });
+    }
+
     if (mistLogLines.length > 0) {
-      const { before, after, nearestIndex } = extractAroundDisconnect(mistLogLines, 'mist_agent');
+      const { before, after, nearestIndex } = extractAroundDisconnect(mistLogLines);
 
       const allContextLines = [...before, ...after];
       const interestingBefore = before.filter((l) => categoriseLine(l).length > 0);
@@ -2311,12 +2454,15 @@ export class TroubleshootService {
       let raw: string;
 
       if (disconnectTime && nearestIndex >= 0) {
-        const discTimeStr = disconnectTime.toISOString().substring(11, 19);
-        detail = `${allInteresting.length} relevant entries near disconnect. ${before.length} before, ${after.length} after.`;
-        raw = `--- ${before.length} lines BEFORE disconnect (${discTimeStr} UTC) ---\n` +
+        const discIso = disconnectTime.toISOString();
+        detail =
+          `${allInteresting.length} relevant entries near Mist last_seen (${discIso}, UTC). ` +
+          `Switch log times → UTC using ${tzNote}. ${before.length} before, ${after.length} after.`;
+        raw =
+          `--- ${before.length} lines BEFORE Mist disconnect reference (${discIso} UTC) ---\n` +
           before.join('\n') +
-          `\n\n--- DISCONNECT POINT (~${discTimeStr} UTC) ---\n\n` +
-          `--- ${after.length} lines AFTER disconnect ---\n` +
+          `\n\n--- NEAREST LOG ANCHOR (~${discIso} UTC) ---\n\n` +
+          `--- ${after.length} lines AFTER anchor ---\n` +
           after.join('\n');
       } else {
         detail = `${mistLogLines.length} Mist agent log lines retrieved.`;
@@ -2325,9 +2471,9 @@ export class TroubleshootService {
 
       results.push({
         id: 'switch-logs-mist-agent',
-        name: 'Mist Agent Log (around disconnect)',
+        name: `Mist agent log (${mistLogFile}, around disconnect)`,
         status: allInteresting.length > 0 ? 'warn' : ('info' as CheckStatus),
-        detail,
+        detail: `${detail} — ${mistLogReason}`,
         raw,
       });
     }

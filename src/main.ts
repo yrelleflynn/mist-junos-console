@@ -13,6 +13,7 @@ import { MistApiService } from './services/mist-api.service';
 import { TroubleshootService, CheckResult, CheckStatus } from './services/troubleshoot.service';
 import { SwitchIdentityService, MistMatchResult } from './services/switch-identity.service';
 import { ConfigDriftService, ConfigDiffLine } from './services/config-drift.service';
+import { ConsoleSessionService } from './services/console-session.service';
 import { MIST_CLOUDS, getCloudById } from './config/mist-clouds.config';
 import './styles/main.css';
 
@@ -46,6 +47,10 @@ function init(): void {
     parity: document.getElementById('parity') as HTMLSelectElement,
     stopBits: document.getElementById('stop-bits') as HTMLSelectElement,
     flowControl: document.getElementById('flow-control') as HTMLSelectElement,
+    remoteSessionEnabled: document.getElementById('remote-session-enabled') as HTMLInputElement,
+    remoteSessionPanel: document.getElementById('remote-session-panel') as HTMLElement,
+    remoteSessionId: document.getElementById('remote-session-id') as HTMLInputElement,
+    btnCopySession: document.getElementById('btn-copy-session') as HTMLButtonElement,
 
     // Mist API
     mistCloud: document.getElementById('mist-cloud') as HTMLSelectElement,
@@ -101,6 +106,44 @@ function init(): void {
   // Store the last match result for use in config drift
   let lastMatchResult: MistMatchResult | null = null;
 
+  let consoleSession: ConsoleSessionService | null = null;
+
+  function tearDownRemoteSession(): void {
+    if (consoleSession) {
+      consoleSession.close();
+      consoleSession = null;
+    }
+    ui.remoteSessionPanel.classList.add('is-hidden');
+    ui.remoteSessionId.value = '';
+  }
+
+  function startOperatorRemoteSession(): void {
+    tearDownRemoteSession();
+    const cs = new ConsoleSessionService();
+    consoleSession = cs;
+    cs.onJoined = (sessionId) => {
+      ui.remoteSessionId.value = sessionId;
+      ui.remoteSessionPanel.classList.remove('is-hidden');
+      term.writeSystem('— Remote session active —');
+    };
+    cs.onRemoteSerialTx = (data: Uint8Array) => {
+      if (serial.isConnected) {
+        void serial.writeBytes(data, false);
+      }
+    };
+    cs.onSessionEnded = (reason: string) => {
+      term.writeSystem(`— Remote session ended (${reason}) —`);
+      ui.remoteSessionEnabled.checked = false;
+      tearDownRemoteSession();
+    };
+    cs.onError = (msg: string) => {
+      term.writeError(`Remote session: ${msg}`);
+      ui.remoteSessionEnabled.checked = false;
+      tearDownRemoteSession();
+    };
+    cs.startAsOperator();
+  }
+
   // ---- UI state helpers ----
   function setConnectedState(connected: boolean): void {
     ui.btnConnect.disabled = connected;
@@ -122,6 +165,11 @@ function init(): void {
       ui.btnRootPassword.disabled = true;
       ui.btnOfflineTimeline.disabled = true;
       lastMatchResult = null;
+      ui.remoteSessionEnabled.disabled = true;
+      ui.remoteSessionEnabled.checked = false;
+      tearDownRemoteSession();
+    } else {
+      ui.remoteSessionEnabled.disabled = false;
     }
 
     if (connected) {
@@ -142,6 +190,15 @@ function init(): void {
   // ---- Serial events ----
   serial.on('data', (data: Uint8Array) => {
     term.write(data);
+    if (consoleSession?.isOpen && consoleSession.clientRole === 'operator') {
+      consoleSession.sendSerialRx(data);
+    }
+  });
+
+  serial.on('tx', (data: Uint8Array) => {
+    if (consoleSession?.isOpen && consoleSession.clientRole === 'operator') {
+      consoleSession.sendSerialTx('operator', data);
+    }
   });
 
   serial.on('connect', () => {
@@ -173,14 +230,52 @@ function init(): void {
     }
   };
 
+  ui.remoteSessionEnabled.addEventListener('change', () => {
+    if (!serial.isConnected) return;
+    if (ui.remoteSessionEnabled.checked) {
+      startOperatorRemoteSession();
+    } else {
+      tearDownRemoteSession();
+      term.writeSystem('— Remote session stopped —');
+    }
+  });
+
+  ui.btnCopySession.addEventListener('click', async () => {
+    const id = ui.remoteSessionId.value.trim();
+    if (!id) return;
+    try {
+      await navigator.clipboard.writeText(id);
+      term.writeSystem('— Session ID copied —');
+    } catch {
+      term.writeError('Could not copy to clipboard');
+    }
+  });
+
   // ---- Connect ----
   async function connect(): Promise<void> {
+    if (!SerialService.isSupported()) {
+      term.writeError('Web Serial is not available in this browser shell. Open the app in Chrome or Edge.');
+      return;
+    }
+
+    let port: SerialPort;
+    try {
+      // First await after click must be requestPort() — required for user-gesture / some embedded browsers.
+      port = await navigator.serial.requestPort();
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'NotFoundError') {
+        return;
+      }
+      term.writeError(`Serial picker failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
     ui.connectionBadge.textContent = 'Connecting…';
     ui.connectionBadge.className = 'badge badge-connecting';
     ui.btnConnect.disabled = true;
 
     try {
-      await serial.connect({
+      await serial.openPort(port, {
         baudRate: parseInt(ui.baudRate.value, 10),
         dataBits: parseInt(ui.dataBits.value, 10) as 7 | 8,
         parity: ui.parity.value as ParityType,
@@ -189,11 +284,7 @@ function init(): void {
       });
     } catch (err) {
       setConnectedState(false);
-      if (err instanceof DOMException && err.name === 'NotFoundError') {
-        // User cancelled
-      } else {
-        term.writeError(`Connection failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
+      term.writeError(`Connection failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -1064,6 +1155,44 @@ function init(): void {
         const siteName = mistDevice.site_id ? 'assigned' : 'unassigned';
         html += `<div class="device-mist-match found">Found in Mist (matched by ${matchedBy}) — ${mistDevice.name || mistDevice.id}<br>Site: ${siteName}</div>`;
         term.writeSystem(`  Mist: Found (${matchedBy}) — ${mistDevice.name || mistDevice.id}`);
+
+        const cloudReachable = result.mistCloudReachableHint === true;
+        const cloudDisconnected =
+          !cloudReachable &&
+          (result.mistInventoryConnected === false ||
+            (result.mistStatsStatus != null &&
+              /disconnect|offline|unreachable|down|lost/i.test(result.mistStatsStatus)));
+        const pillClass = cloudReachable
+          ? 'mist-status-pill mist-status-connected'
+          : cloudDisconnected
+            ? 'mist-status-pill mist-status-disconnected'
+            : 'mist-status-pill mist-status-unknown';
+        const pillLabel = cloudReachable ? 'Connected' : cloudDisconnected ? 'Disconnected' : 'Unknown';
+        html += `<div class="${pillClass}">${pillLabel}</div>`;
+        term.writeSystem(`  Mist cloud state: ${pillLabel}`);
+
+        if (result.mistLastSeenUtcIso) {
+          html += `<div class="device-info-row"><span class="device-info-label">Last seen (UTC)</span><span class="device-info-value">${result.mistLastSeenUtcIso}</span></div>`;
+          term.writeSystem(`  Last seen (UTC): ${result.mistLastSeenUtcIso}`);
+        }
+        if (result.mistLastConfigUtcIso) {
+          html += `<div class="device-info-row"><span class="device-info-label">Last config (UTC)</span><span class="device-info-value">${result.mistLastConfigUtcIso}</span></div>`;
+          term.writeSystem(`  Last config (UTC): ${result.mistLastConfigUtcIso}`);
+        }
+
+        if (result.mistCloudStatusLine) {
+          html += `<div class="device-info-row"><span class="device-info-label">Mist cloud</span><span class="device-info-value">${result.mistCloudStatusLine}</span></div>`;
+          term.writeSystem(`  Mist cloud: ${result.mistCloudStatusLine}`);
+        }
+
+        if (result.mistCloudReachableHint) {
+          html +=
+            '<div class="device-mist-match found" style="margin-top:8px;border-color:var(--accent-green);">' +
+            'Mist reports this switch as <strong>reachable</strong> (inventory and/or recent stats). ' +
+            'Console troubleshooting may still be useful for local L2/DNS issues, but cloud connectivity may already be OK.</div>';
+          term.writeSystem('  Note: Mist reports switch as cloud-reachable — full cloud check may be optional.');
+        }
+
         ui.btnConfigDrift.disabled = false;
         ui.btnRootPassword.disabled = !mistDevice.site_id;
         ui.btnOfflineTimeline.disabled = !mistDevice.site_id;

@@ -72,6 +72,21 @@
               <button id="btn-connect" class="btn btn-primary">Connect</button>
               <button id="btn-disconnect" class="btn btn-danger" disabled>Disconnect</button>
             </div>
+
+            <div class="remote-session-block">
+              <label class="checkbox-label">
+                <input type="checkbox" id="remote-session-enabled" disabled>
+                <span>Enable remote session (support can view / type)</span>
+              </label>
+              <p class="remote-session-help">Opens a shareable session ID for the <a href="/support.html" target="_blank" rel="noopener">support console</a>. Requires the backend (<code>npm run dev</code>).</p>
+              <div id="remote-session-panel" class="remote-session-panel is-hidden">
+                <label for="remote-session-id">Session ID</label>
+                <div class="input-row">
+                  <input type="text" id="remote-session-id" readonly placeholder="— connect first —" autocomplete="off">
+                  <button type="button" id="btn-copy-session" class="btn btn-secondary btn-sm">Copy</button>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 

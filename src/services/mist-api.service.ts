@@ -290,6 +290,8 @@ export interface MistDeviceEvent {
 
 export interface MistDeviceStats {
   last_seen?: number;
+  /** Unix epoch seconds when Mist last pushed/applied config (when API provides it). */
+  last_config?: number;
   status?: string;
   uptime?: number;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

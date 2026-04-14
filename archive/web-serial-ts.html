@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cloud-Link Console Bridge</title>
+    <style>
+        :root {
+            --bg-color: #121212;
+            --term-bg: #000000;
+            --term-text: #00ff00;
+            --accent: #007bff;
+            --accent-hover: #0056b3;
+            --border: #333;
+            --text-main: #e0e0e0;
+            --panel-bg: #1e1e1e;
+            --dynamic-text: #00d2ff;
+        }
+
+        body {
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            padding: 20px;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            box-sizing: border-box;
+        }
+
+        h2 { margin-top: 0; color: #fff; display: flex; align-items: center; gap: 10px; }
+        .status-bar { margin-bottom: 15px; color: #888; font-size: 0.9em; display: flex; gap: 20px;}
+        .status-connected { color: #28a745; font-weight: bold; }
+        .status-disconnected { color: #dc3545; font-weight: bold; }
+
+        /* Toolbar */
+        .toolbar {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--border);
+            align-items: center;
+        }
+
+        select {
+            padding: 8px;
+            background: #222;
+            color: #fff;
+            border: 1px solid #444;
+            border-radius: 4px;
+        }
+
+        button {
+            padding: 10px 15px;
+            font-size: 14px;
+            cursor: pointer;
+            border: none;
+            border-radius: 4px;
+            color: white;
+            transition: background 0.2s;
+            font-family: inherit;
+        }
+
+        button:disabled { background: #444 !important; cursor: not-allowed; opacity: 0.6; }
+        
+        .btn-connect { background: #007bff; }
+        .btn-connect:hover { background: #0056b3; }
+        
+        .btn-disconnect { background: #dc3545; }
+        .btn-disconnect:hover { background: #a71d2a; }
+        
+        .btn-action { background: #17a2b8; }
+        .btn-action:hover { background: #117a8b; }
+
+        .btn-export { background: #28a745; }
+        .btn-export:hover { background: #218838; }
+
+        .btn-email { background: #6c757d; }
+        .btn-email:hover { background: #5a6268; }
+
+        /* Main Layout Grid */
+        .main-container {
+            display: flex;
+            gap: 20px;
+            flex-grow: 1;
+            overflow: hidden;
+            margin-bottom: 10px;
+        }
+
+        /* Command List Panel */
+        .command-panel {
+            width: 300px;
+            background: var(--panel-bg);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+
+        .panel-header {
+            padding: 10px;
+            background: #252525;
+            border-bottom: 1px solid var(--border);
+            font-weight: bold;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .command-list {
+            padding: 10px;
+            overflow-y: auto;
+            flex-grow: 1;
+        }
+
+        .command-item {
+            display: flex;
+            align-items: center;
+            padding: 5px 0;
+            border-bottom: 1px solid #333;
+        }
+
+        .command-item:last-child { border-bottom: none; }
+
+        .command-item input[type="checkbox"] {
+            margin-right: 10px;
+            cursor: pointer;
+        }
+
+        .command-label {
+            font-size: 0.9em;
+            color: #ddd;
+            cursor: pointer;
+        }
+
+        .command-raw {
+            display: block;
+            font-size: 0.75em;
+            color: #777;
+            margin-top: 2px;
+        }
+
+        /* Terminal Window */
+        #terminal {
+            flex-grow: 1;
+            background: var(--term-bg);
+            color: var(--term-text);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 10px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            font-size: 14px;
+            line-height: 1.4;
+            box-shadow: inset 0 0 10px rgba(0,0,0,0.5);
+        }
+
+        /* Input Area */
+        .input-area {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+
+        input[type="text"] {
+            flex-grow: 1;
+            padding: 10px;
+            background: #222;
+            border: 1px solid #444;
+            color: #fff;
+            font-family: inherit;
+            border-radius: 4px;
+        }
+
+        /* Export Section */
+        .export-section {
+            background: var(--panel-bg);
+            padding: 15px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+        }
+
+        .export-header { margin-top: 0; font-size: 1.1em; color: #fff; margin-bottom: 10px; }
+        
+        .export-controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        /* Helper for dynamic lines */
+        .log-dynamic { color: var(--dynamic-text); font-style: italic; display: block; margin: 5px 0; }
+    </style>
+</head>
+<body>
+
+    <h2>☁️ Cloud-Link Console Bridge</h2>
+    <div class="status-bar">
+        <span id="connectionStatus" class="status-disconnected">● Disconnected</span>
+        <span id="baudRate">Baud: 9600</span>
+    </div>
+
+    <!-- CONNECTION TOOLBAR -->
+    <div class="toolbar">
+        <button id="connectBtn" class="btn-connect">🔌 Connect Serial</button>
+        <button id="disconnectBtn" class="btn-disconnect" disabled>❌ Disconnect</button>
+        
+        <div style="width: 1px; height: 30px; background: #444; margin: 0 10px;"></div>
+        
+        <select id="profileSelect">
+            <option value="juniper_mist">Profile: Juniper (Mist)</option>
+            <option value="aruba_cx">Profile: Aruba CX</option>
+            <option value="aruba_aos">Profile: Aruba AOS-S</option>
+        </select>
+
+        <select id="regionSelect">
+            <option value="oc-term.mistsys.net">Mist Global 01 (Default)</option>
+            <option value="oc-term.gc1.mist.com">Mist Global 02 (gc1)</option>
+            <option value="oc-term.ac2.mist.com">Mist Global 03 (ac2)</option>
+            <option value="oc-term.gc2.mist.com">Mist Global 04 (gc2)</option>
+            <option value="oc-term.gc4.mist.com">Mist Global 05 (gc4)</option>
+            <option value="oc-term.eu.mist.com">Mist EMEA 01 (eu)</option>
+            <option value="oc-term.gc3.mist.com">Mist EMEA 02 (gc3)</option>
+            <option value="oc-term.ac6.mist.com">Mist EMEA 03 (ac6)</option>
+            <option value="oc-term.gc6.mist.com">Mist EMEA 04 (gc6)</option>
+            <option value="oc-term.ac5.mist.com">Mist APAC 01 (ac5)</option>
+            <option value="oc-term.gc5.mist.com">Mist APAC 02 (gc5)</option>
+            <option value="oc-term.gc7.mist.com">Mist APAC 03 (gc7)</option>
+        </select>
+        
+        <button id="runDiagnosticsBtn" class="btn-action" disabled>🩺 Run Selected Commands</button>
+    </div>
+    
+    <div class="main-container">
+        <!-- COMMAND LIST PANEL -->
+        <div class="command-panel">
+            <div class="panel-header">
+                <span>Diagnostics List</span>
+                <span style="font-size: 0.8em; cursor: pointer; color: #007bff;" id="toggleAllBtn">Toggle All</span>
+            </div>
+            <div class="command-list" id="commandListContainer">
+                <!-- Checkboxes generated by JS -->
+            </div>
+        </div>
+
+        <!-- TERMINAL OUTPUT -->
+        <div id="terminal"></div>
+    </div>
+    
+    <!-- MANUAL INPUT -->
+    <div class="input-area">
+        <input type="text" id="cmdInput" placeholder="Type generic command here..." disabled>
+        <button id="sendBtn" class="btn-connect" disabled>Send</button>
+        <button id="crBtn" class="btn-action" disabled title="Send Carriage Return">↵ CR</button>
+    </div>
+
+    <!-- EXPORT / SUPPORT -->
+    <div class="export-section">
+        <h3 class="export-header">📂 Export & Support</h3>
+        <div class="export-controls">
+            <input type="text" id="ticketId" placeholder="Case Ticket # (Optional)" style="width: 180px;">
+            <button id="downloadBtn" class="btn-export" disabled>⬇️ Download Log File</button>
+            <button id="emailBtn" class="btn-email" disabled>✉️ Draft Email to TAC</button>
+        </div>
+    </div>
+
+<script>
+    // --- VARIABLES ---
+    let port = null;
+    let writer = null;
+    let reader = null;
+    let keepReading = false;
+    let fullLog = "";
+    let currentBuffer = ""; // Used for prompt detection
+
+    // --- DOM ELEMENTS ---
+    const terminal = document.getElementById('terminal');
+    const connectBtn = document.getElementById('connectBtn');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+    const runDiagnosticsBtn = document.getElementById('runDiagnosticsBtn');
+    const cmdInput = document.getElementById('cmdInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const crBtn = document.getElementById('crBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const emailBtn = document.getElementById('emailBtn');
+    const ticketInput = document.getElementById('ticketId');
+    const connectionStatus = document.getElementById('connectionStatus');
+    const profileSelect = document.getElementById('profileSelect');
+    const regionSelect = document.getElementById('regionSelect');
+    const commandListContainer = document.getElementById('commandListContainer');
+    const toggleAllBtn = document.getElementById('toggleAllBtn');
+
+    // --- PARSER FUNCTIONS ---
+    
+    // Extracts Gateway IPs from "show route 0.0.0.0/0"
+    const parseJunosGateway = (output) => {
+        // Look for: > to 10.5.0.1 via irb.5
+        const regex = /to\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s+via/g;
+        const matches = [...output.matchAll(regex)];
+        const ips = [...new Set(matches.map(m => m[1]))]; // Unique IPs
+        
+        return ips.map(ip => ({
+            label: `Ping Gateway ${ip}`,
+            cmd: `ping ${ip} count 3`,
+            wait: 20000,
+            isDynamic: true
+        }));
+    };
+
+    // Extracts DNS IPs from "show config ... match name-server"
+    const parseJunosDNS = (output) => {
+        // Look for: set system name-server 8.8.8.8
+        const regex = /name-server\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/g;
+        const matches = [...output.matchAll(regex)];
+        const ips = [...new Set(matches.map(m => m[1]))];
+        
+        console.log("DNS Parser Found IPs:", ips); 
+
+        return ips.map(ip => ({
+            label: `Ping DNS ${ip}`,
+            cmd: `ping ${ip} count 3`,
+            wait: 20000,
+            isDynamic: true
+        }));
+    };
+
+    // --- COMMAND PROFILES ---
+    // Added {{MIST_ENDPOINT}} placeholder for dynamic region substitution
+    const PROFILES = {
+        juniper_mist: [
+            { label: "Disable Paging (Required)", cmd: "set cli screen-length 0", wait: 10000, selected: true },
+            { label: "Show Interface Status", cmd: "show interfaces terse", wait: 10000, selected: true },
+            { label: "Show System Uptime", cmd: "show system uptime | no-more", wait: 10000, selected: true },
+            { label: "Show Version & Mist Agent", cmd: "show version | match mist", wait: 10000, selected: true },
+            
+            // Dynamic: Check Gateway
+            { 
+                label: "Show Default Route & Ping GW", 
+                cmd: "show route 0.0.0.0/0 | no-more", 
+                wait: 10000, 
+                selected: true,
+                parser: parseJunosGateway
+            },
+            
+            // Dynamic: Check DNS
+            { 
+                label: "Check DNS Config & Ping Servers", 
+                cmd: "show configuration | display set | match name-server | no-more", 
+                wait: 10000, 
+                selected: true,
+                parser: parseJunosDNS
+            },
+            
+            { label: "Check Cloud Ports (2200/443)", cmd: "show system connections | match \"2200|443\" | no-more", wait: 20000, selected: true }, // Keep higher
+            { label: "Check Outbound SSH", cmd: "show configuration system services outbound-ssh | display set | no-more", wait: 10000, selected: true },
+            { label: "Show LLDP Local Info", cmd: "show lldp local-information", wait: 10000, selected: true },
+            { label: "Show JMD Logs (Stats)", cmd: "show log jmd.log | last 15", wait: 10000, selected: true },
+            { label: "Show MCD Logs (Conn)", cmd: "show log mcd.log | last 15", wait: 10000, selected: true },
+            // Replaced hardcoded endpoint with placeholder
+            { label: "Ping Mist Cloud", cmd: "ping {{MIST_ENDPOINT}} count 5", wait: 30000, selected: true }, 
+            { label: "Test MTU (1450 bytes)", cmd: "ping 8.8.8.8 size 1450 count 3", wait: 20000, selected: false }
+        ],
+        aruba_cx: [
+            { label: "Disable Paging (Required)", cmd: "no page", wait: 10000, selected: true },
+            { label: "Show Version", cmd: "show version", wait: 10000, selected: true },
+            { label: "Show IP Route", cmd: "show ip route", wait: 10000, selected: true },
+            { label: "Show Aruba Central Status", cmd: "show aruba-central", wait: 10000, selected: true },
+            { label: "Show DNS Hosts", cmd: "show dns host", wait: 10000, selected: true },
+            { label: "Ping Aruba Cloud", cmd: "ping device.arubanetworks.com rep 4", wait: 30000, selected: true }, // Keep higher
+            { label: "Show Events", cmd: "show events", wait: 10000, selected: false }
+        ],
+        aruba_aos: [
+            { label: "Disable Paging (Required)", cmd: "no page", wait: 10000, selected: true },
+            { label: "Show Version", cmd: "show version", wait: 10000, selected: true },
+            { label: "Show Aruba Central", cmd: "show aruba-central", wait: 10000, selected: true },
+            { label: "Show IP Route", cmd: "show ip route", wait: 10000, selected: true },
+            { label: "Show Logging", cmd: "show logging tail", wait: 10000, selected: false }
+        ]
+    };
+
+    // --- UI GENERATION ---
+    function renderCommandList() {
+        commandListContainer.innerHTML = "";
+        const profileKey = profileSelect.value;
+        const commands = PROFILES[profileKey];
+
+        commands.forEach((item, index) => {
+            const div = document.createElement('div');
+            div.className = "command-item";
+            
+            const checkbox = document.createElement('input');
+            checkbox.type = "checkbox";
+            checkbox.id = `cmd-${index}`;
+            checkbox.checked = item.selected;
+            checkbox.dataset.index = index;
+
+            const labelContainer = document.createElement('div');
+            const label = document.createElement('label');
+            label.htmlFor = `cmd-${index}`;
+            label.className = "command-label";
+            label.textContent = item.label;
+            
+            const raw = document.createElement('span');
+            raw.className = "command-raw";
+            // Show resolved endpoint in UI if possible, otherwise show raw
+            const currentEndpoint = regionSelect.value;
+            const displayCmd = item.cmd.replace('{{MIST_ENDPOINT}}', currentEndpoint);
+            raw.textContent = `> ${displayCmd}`;
+
+            labelContainer.appendChild(label);
+            labelContainer.appendChild(raw);
+            div.appendChild(checkbox);
+            div.appendChild(labelContainer);
+            
+            commandListContainer.appendChild(div);
+        });
+    }
+
+    // Initial Render
+    renderCommandList();
+
+    toggleAllBtn.addEventListener('click', () => {
+        const checkboxes = commandListContainer.querySelectorAll('input[type="checkbox"]');
+        const allChecked = Array.from(checkboxes).every(c => c.checked);
+        checkboxes.forEach(c => c.checked = !allChecked);
+    });
+
+    profileSelect.addEventListener('change', renderCommandList);
+    regionSelect.addEventListener('change', renderCommandList); // Update displayed commands when region changes
+
+
+    // --- SERIAL CONNECTION ---
+    connectBtn.addEventListener('click', async () => {
+        console.log("Connect button clicked");
+        if (!navigator.serial) {
+            alert("Web Serial API not supported in this browser. Please use Chrome, Edge, or Opera.");
+            return;
+        }
+
+        try {
+            port = await navigator.serial.requestPort();
+            await port.open({ baudRate: 9600 });
+            console.log("Port opened");
+
+            connectionStatus.textContent = "● Connected";
+            connectionStatus.className = "status-connected";
+            
+            toggleUI(true);
+            keepReading = true;
+            currentBuffer = ""; 
+            
+            readSerialLoop();
+            
+            logToScreen("[SYSTEM] Serial port opened. 9600-8-N-1\n");
+
+        } catch (err) {
+            console.error("Connection Error:", err);
+            logToScreen(`[SYSTEM] Connection Failed: ${err}\n`);
+            if (port && port.readable) {
+                 await port.close();
+            }
+        }
+    });
+
+    disconnectBtn.addEventListener('click', async () => {
+        keepReading = false;
+        try {
+            if (reader) { await reader.cancel(); reader = null; }
+            if (writer) { await writer.releaseLock(); writer = null; }
+            if (port) { await port.close(); port = null; }
+        } catch (e) {
+            console.error("Disconnect Error:", e);
+        }
+        connectionStatus.textContent = "● Disconnected";
+        connectionStatus.className = "status-disconnected";
+        toggleUI(false);
+        logToScreen("[SYSTEM] Port closed.\n");
+    });
+
+    function toggleUI(connected) {
+        connectBtn.disabled = connected;
+        disconnectBtn.disabled = !connected;
+        runDiagnosticsBtn.disabled = !connected;
+        cmdInput.disabled = !connected;
+        sendBtn.disabled = !connected;
+        crBtn.disabled = !connected;
+        downloadBtn.disabled = !connected;
+        emailBtn.disabled = !connected;
+    }
+
+    // --- READ LOOP ---
+    async function readSerialLoop() {
+        if (!port || !port.readable) return;
+
+        while (port.readable && keepReading) {
+            try {
+                reader = port.readable.getReader();
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    const text = new TextDecoder().decode(value);
+                    logToScreen(text);
+                    currentBuffer += text; 
+                }
+            } catch (error) {
+                console.error("Read Loop Error:", error);
+            } finally {
+                if (reader) reader.releaseLock();
+            }
+        }
+    }
+
+    function logToScreen(text, className) {
+        if (className) {
+            // If class provided, create span
+            const span = document.createElement('span');
+            span.className = className;
+            span.textContent = text;
+            terminal.appendChild(span);
+        } else {
+            // Standard append
+            fullLog += text;
+            terminal.textContent += text;
+        }
+        terminal.scrollTop = terminal.scrollHeight;
+    }
+
+    // --- WRITING HELPERS ---
+    async function writeToSerial(cmd) {
+        if (!port || !port.writable) return;
+        try {
+            const encoder = new TextEncoder();
+            writer = port.writable.getWriter();
+            await writer.write(encoder.encode(cmd + "\r")); 
+        } catch (e) {
+             console.error("Write Error:", e);
+        } finally {
+            if (writer) writer.releaseLock();
+        }
+    }
+
+    function waitForPrompt(maxTimeoutMs) {
+        return new Promise((resolve) => {
+            const start = Date.now();
+            const check = () => {
+                const bufferTail = currentBuffer.trimEnd();
+                const lastChar = bufferTail.slice(-1);
+                if (['>', '#', '%', '$'].includes(lastChar)) {
+                    resolve("Prompt Found");
+                    return;
+                }
+                if (Date.now() - start > maxTimeoutMs) {
+                    resolve("Timeout"); 
+                    return;
+                }
+                setTimeout(check, 50);
+            };
+            check();
+        });
+    }
+
+    // --- HEALTH CHECK ENGINE (DYNAMIC QUEUE) ---
+    runDiagnosticsBtn.addEventListener('click', async () => {
+        const profileKey = profileSelect.value;
+        const allCommands = PROFILES[profileKey];
+        
+        // Get the selected Mist Endpoint from the dropdown
+        const mistEndpoint = regionSelect.value;
+
+        // 1. Build initial execution queue
+        const checkboxes = commandListContainer.querySelectorAll('input[type="checkbox"]');
+        let executionQueue = [];
+        checkboxes.forEach((cb) => {
+            if (cb.checked) {
+                // Clone the object so we don't modify the original constant
+                let commandObj = {...allCommands[cb.dataset.index]};
+                
+                // Perform variable substitution for the Endpoint
+                if (commandObj.cmd.includes('{{MIST_ENDPOINT}}')) {
+                    commandObj.cmd = commandObj.cmd.replace('{{MIST_ENDPOINT}}', mistEndpoint);
+                }
+                
+                executionQueue.push(commandObj);
+            }
+        });
+
+        if (executionQueue.length === 0) {
+            alert("Please select at least one command to run.");
+            return;
+        }
+        
+        logToScreen(`\n\n--- STARTING DIAGNOSTICS (${profileKey.toUpperCase()}) ---\n`);
+        logToScreen(`--- TARGET CLOUD: ${mistEndpoint} ---\n`);
+
+        // 2. Process Queue (Iterative loop to allow dynamic insertion)
+        for (let i = 0; i < executionQueue.length; i++) {
+            const step = executionQueue[i];
+            
+            // Clear buffer to capture ONLY this command's output
+            currentBuffer = ""; 
+            
+            if (step.isDynamic) {
+                logToScreen(`\n[DYNAMIC TASK]: ${step.cmd}`, "log-dynamic");
+            } else {
+                logToScreen(`\n[Auto-sending]: ${step.cmd}`);
+            }
+            
+            await writeToSerial(step.cmd);
+            logToScreen(` ... `); 
+            
+            // Wait
+            const result = await waitForPrompt(step.wait);
+            
+            if (result === "Timeout") {
+                logToScreen(`(Timeout ${step.wait/1000}s - Forced Continue)\n`);
+            } else {
+                logToScreen(`(✓ Prompt Detected)\n`);
+                
+                // 3. Run Parser (If exists)
+                if (step.parser) {
+                    const dynamicCommands = step.parser(currentBuffer);
+                    
+                    if (dynamicCommands && dynamicCommands.length > 0) {
+                        logToScreen(`\n[ANALYSIS] Found IPs. Injecting ${dynamicCommands.length} new tests...\n`, "log-dynamic");
+                        
+                        // Inject into queue immediately after current command
+                        executionQueue.splice(i + 1, 0, ...dynamicCommands);
+                    }
+                }
+            }
+        }
+
+        logToScreen(`\n--- DIAGNOSTICS COMPLETE ---\n`);
+    });
+
+    // --- STANDARD INPUT HANDLERS ---
+    sendBtn.addEventListener('click', async () => {
+        const cmd = cmdInput.value;
+        if(cmd) {
+            await writeToSerial(cmd);
+            cmdInput.value = "";
+        }
+    });
+
+    cmdInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') sendBtn.click();
+    });
+
+    crBtn.addEventListener('click', async () => {
+        await writeToSerial("");
+        cmdInput.focus();
+    });
+
+    // --- EXPORT ---
+    downloadBtn.addEventListener('click', () => {
+        if (!fullLog) {
+            alert("No logs captured yet!");
+            return;
+        }
+        const now = new Date();
+        const timestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const header = `--- GENERATED BY CLOUD-LINK CONSOLE BRIDGE ---\nDate: ${now.toString()}\nProfile: ${profileSelect.value}\n----------------------------------------------\n\n`;
+        const blob = new Blob([header + fullLog], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `console-log-${timestamp}.txt`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(url);
+    });
+
+    emailBtn.addEventListener('click', () => {
+        const ticket = ticketInput.value.trim();
+        const subject = ticket ? `Case ${ticket} - Console Logs` : "New Case - Console Logs";
+        const body = `Hi Support,\n\nI have attached the console logs from the offline device.\n\nDevice Profile: ${profileSelect.value}\n\nRegards,`;
+        window.location.href = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    });
+
+</script>
+</body>
+</html>
