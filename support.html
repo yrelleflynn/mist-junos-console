@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Junos Console — Support</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="support-page">
+  <div id="support-app">
+    <header id="header">
+      <div class="header-left">
+        <h1>Support console</h1>
+        <span class="header-subtitle"><a href="/index.html">← Main app</a></span>
+      </div>
+    </header>
+    <div class="support-toolbar">
+      <label class="sr-only" for="support-session-id">Session ID</label>
+      <input type="text" id="support-session-id" placeholder="Session ID from operator" autocomplete="off">
+      <button type="button" id="btn-support-connect" class="btn btn-primary">Join session</button>
+      <span id="support-status" class="support-status status-text"></span>
+    </div>
+    <div id="support-terminal-wrap"></div>
+  </div>
+  <script type="module" src="/src/support-main.ts"></script>
+</body>
+</html>
