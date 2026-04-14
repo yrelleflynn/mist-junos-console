@@ -1,10 +1,84 @@
 ================================================================================
+JUNOS CONSOLE — INSTALLATION & QUICK START
+================================================================================
+
+REQUIREMENTS
+  • Node.js 18 or later  — https://nodejs.org/en/download/
+  • Google Chrome or Microsoft Edge (Web Serial API — Firefox/Safari not supported)
+  • USB-to-serial or RJ45 console cable
+
+INSTALL STEPS
+  1. Install Node.js from https://nodejs.org/en/download/
+     Windows: run the .msi installer, then open a NEW terminal window.
+     macOS:   use the .pkg installer or: brew install node
+     Linux:   sudo apt install nodejs npm   (Debian/Ubuntu)
+              sudo dnf install nodejs        (Fedora/RHEL)
+
+  2. Clone or download this repository:
+       git clone https://github.com/yrelleflynn/mist-junos-console.git
+       cd mist-junos-console
+
+  3. Install dependencies:
+       npm install
+
+  4. Start the dev server:
+       npm run dev
+
+  5. Open Chrome or Edge and go to: http://localhost:3000
+
+The Mist API proxy starts automatically inside the dev server.
+No additional processes or configuration files are needed.
+
+FIRST-TIME SETUP
+  1. Connect your console cable to the switch.
+  2. In the Connection panel, select the baud rate (9600 for most Juniper EX).
+  3. Click Connect and select the serial port when the browser dialog appears.
+  4. In the Mist API panel:
+       - Select your cloud region (e.g. APAC 01, Global 01).
+       - Paste your Mist API token.
+       - Paste your Org ID.
+       - Click Load to populate the Site dropdown.
+       - Select your site.
+
+TROUBLESHOOTING STARTUP
+  npm: command not found      Install Node.js and open a new terminal.
+  EACCES on npm install       macOS/Linux: fix npm permissions or use sudo.
+  Port 3000 already in use    Vite auto-increments to 3001 — check terminal.
+  Serial port missing         Ensure console cable driver is installed.
+  Web Serial not supported    Use Chrome or Edge — not Firefox or Safari.
+
+================================================================================
 JUNOS CONSOLE — CLOUD CONNECTIVITY CHECK: TEST REFERENCE
 ================================================================================
 
 This document describes each automated test, what it checks, why it
 matters, what pass/fail means, and recommended remediation steps.
 These remediation steps form the basis for future automated fixes.
+
+Each test result is clickable. Clicking a result opens a detail popup
+showing the result status, remediation guidance, executable commands,
+and raw command output. The popup header contains a "Run Test Now"
+button that re-executes just that single test and updates both the popup
+and the sidebar result card — without re-running the full test suite.
+This is useful after applying a fix to verify the issue is resolved.
+
+CLOUD REGION VERIFICATION
+All endpoint tests (Cloud Connectivity Check and Firewall Policy Check)
+are run against the cloud region selected in the Mist API panel. The
+tool tests the endpoints defined for that specific region — see the
+complete endpoint table below this header. Endpoints sourced from:
+https://www.juniper.net/documentation/us/en/software/mist/mist-management/topics/ref/firewall-ports-to-open.html
+
+If Mist API credentials (token + Org ID) are NOT configured when you
+click Run Cloud Check or Firewall Policy Check, a confirmation dialog
+will appear listing the selected cloud region and all endpoints to be
+tested. Confirm the region is correct before proceeding. To skip this
+prompt, configure your API credentials and load sites — the cloud
+region will then be verified automatically against your org.
+
+A "Cloud Region" result card is always shown at the top of every test
+run, indicating which region is being tested and whether it was verified
+via API credentials or selected manually.
 
 ================================================================================
 1. LLDP NEIGHBORS
@@ -32,6 +106,41 @@ Remediation:
   4. Try a different cable or SFP module.
   5. If LLDP is intentionally disabled upstream, manually specify the
      uplink port in the tool's "Uplink Port" field and continue.
+
+================================================================================
+1b. UPSTREAM SWITCH PORT CONFIG
+================================================================================
+
+Source:     Mist API — upstream device inventory + port_usages profile
+Purpose:    Look up the upstream switch in Mist and retrieve the port
+            configuration for the port our switch is connected to (identified
+            via LLDP). Checks port mode, VLANs, speed/duplex, and STP settings.
+Why needed: Confirms the upstream switch's Mist intended config is compatible
+            with what our switch expects, before physical checks get further.
+
+Pass:       Upstream switch found in Mist and matching port config retrieved.
+Warn:       Upstream switch found but its port was not matched in Mist config
+            (may be using a default profile), or switch not assigned to a site.
+Info:       Upstream device is not managed in Mist (third-party switch, router,
+            or firewall). Port config must be verified manually.
+Skip:       Mist API credentials not configured.
+
+Information shown includes:
+  - Upstream switch name and MAC address
+  - Matched interface name (e.g. xe-0/1/0)
+  - Port usage profile name (e.g. Trunk_uplink)
+  - Port mode (trunk / access)
+  - Tagged VLANs, native VLAN, VoIP VLAN
+  - Speed/duplex settings
+  - stp_edge and stp_no_root_port flags
+
+Remediation:
+  1. If the upstream device is not in Mist, verify port config manually:
+     - Ensure the port is configured as a trunk (not access).
+     - Ensure the management VLAN is allowed on the trunk.
+     - Ensure STP is not blocking the port.
+  2. If the port profile does not match expectations, update it in the
+     Mist dashboard under Switches → (upstream switch) → Port Config.
 
 ================================================================================
 2. UPLINK PORT STATUS
@@ -114,6 +223,145 @@ Remediation:
        commit
   4. If the switch is Mist-managed, check the port profile in the Mist
      dashboard — the VLAN assignment may need to be updated there.
+
+================================================================================
+3b. UPLINK CONFIG MATCH
+================================================================================
+
+Commands:   show configuration interfaces <port> | display set
+            show configuration vlans | display set
+Source:     Also uses upstream port_usages profile from test 1b.
+Purpose:    Compare the local uplink port configuration against what the
+            upstream switch expects. Generates exact Junos "set" commands to
+            fix any mismatches.
+Why needed: Even if the port is physically up, VLAN mismatches between the
+            local switch and the upstream port profile will prevent the
+            management IP from being reachable.
+
+Pass:       All checked items (mode, VLANs, native VLAN, speed/duplex) match.
+Fail:       One or more mismatches found. Exact fix commands are shown.
+Skip:       Upstream port config (test 1b) was not retrieved.
+
+Items compared:
+  - Port mode (trunk vs access)
+  - Tagged VLANs (or "all networks")
+  - Native/untagged VLAN
+  - VoIP VLAN
+  - Speed and duplex
+
+If the switch is managed in Mist and its Mist intended config also does not
+match the upstream, a second result card ("Mist Config for Uplink Port") shows
+the Mist-side mismatches and offers a "Run Fix" button to update the device
+config in Mist via the API (PUT /api/v1/sites/{site_id}/devices/{device_id}).
+
+Remediation:
+  1. Use the "Run Fix" button in the check popup to apply the listed
+     set commands directly to the switch.
+  2. For placeholder values (e.g. <vlan-id>), the VLAN ID is shown in
+     the network definitions section of the raw output. Edit the command
+     before running.
+  3. After fixing the local config, commit and re-run the DHCP and IP
+     checks to verify connectivity is restored.
+
+================================================================================
+3c. STP PORT STATE
+================================================================================
+
+Command:    show spanning-tree interface <uplink-port>
+Purpose:    Check the spanning tree state on the uplink port to confirm it is
+            in forwarding state. A blocked or discarding port is a common cause
+            of the switch having physical link but no IP connectivity.
+Why needed: STP blocking is silent at the physical layer — the port shows "up"
+            but no traffic flows. This check catches that condition before
+            moving on to IP-layer checks.
+
+Pass:       Port state is FWD (forwarding).
+Fail:       Port state is BLK (blocked) or DIS (discarding) — traffic cannot
+            flow. Also fails if the port is BPDU error-disabled (see 3c-ii).
+Warn:       Port state is LRN (learning) or LIS (listening) — STP is still
+            converging; wait 30 seconds and re-run the test.
+Skip:       No uplink port identified, or STP is not active on this port.
+
+Port states:
+  FWD — Forwarding. Normal state for an uplink trunk port.
+  BLK — Blocking. Port is receiving BPDUs but not forwarding traffic.
+  DIS — Discarding (RSTP). Equivalent to blocking in rapid STP.
+  LRN — Learning. Transitioning toward forwarding — not yet passing traffic.
+  LIS — Listening. Early convergence stage.
+  BPDU error-disabled — The upstream port has BPDU Guard active and shut
+        down when it received BPDUs from this switch. See test 3c-ii.
+
+Port roles:
+  Root        — Best path to the root bridge. Should be forwarding.
+  Designated  — Forwarding port on a segment.
+  Alternate   — Blocking port providing a backup path.
+  Backup      — Blocking port on a shared segment.
+
+Remediation:
+  1. If BLK or DIS with role Alternate:
+     a. Another path in the network is preferred. If this is unexpected,
+        check that the correct device is the STP root bridge:
+          show spanning-tree bridge
+        Adjust priority if needed:
+          set protocols rstp bridge-priority 4k
+          commit
+     b. Verify no unintended loops are present (extra cables, stack links).
+  2. If BLK or DIS with role Root:
+     a. The port was root but was blocked — indicates a topology change.
+        Re-plug the uplink cable and wait for convergence.
+     b. Check the upstream switch's STP configuration.
+  3. If BPDU error-disabled:
+     a. The upstream port has STP Edge (BPDU Guard) enabled.
+     b. Fix the upstream port profile — see test 3c-ii.
+     c. After fixing, re-enable the upstream port:
+          clear error-disable <upstream-interface>  (on upstream switch)
+  4. If LRN or LIS, wait 30 seconds for STP to converge, then click
+     "Run Test Now" to re-check.
+
+================================================================================
+3c-ii. UPSTREAM STP EDGE CONFIG
+================================================================================
+
+Source:     Mist API — upstream device port_usages profile (stp_edge field)
+Purpose:    Check whether the upstream port usage profile has stp_edge: true.
+            STP Edge (PortFast) is designed for end-device ports only. When
+            enabled on a trunk port connecting to another switch, the upstream
+            switch will immediately error-disable the port the moment it
+            receives a BPDU from our switch.
+Why needed: stp_edge misconfiguration on the upstream trunk port is a common
+            root cause of BPDU error-disable events and unexplained STP
+            blocking, especially when switches are newly adopted into Mist.
+
+Pass:       stp_edge is false (or not set) on the upstream port profile.
+Fail:       stp_edge is true — the upstream port will error-disable when it
+            receives BPDUs from our switch.
+Skip:       Upstream port usage profile was not resolved (test 1b skipped or
+            port not found in Mist config).
+
+Upstream port_usages fields checked:
+  stp_edge          If true, the port is an STP edge port. BPDUs received
+                    on this port trigger an immediate error-disable.
+  stp_no_root_port  If true, root protect is enabled. The port will move to
+                    root-inconsistent state if it receives a superior BPDU
+                    (i.e. one that would make it become the root port).
+                    This is informational and shown in the pass detail.
+
+Automated fix (Run Fix button):
+  If stp_edge is true and the upstream switch is in Mist, a "Run Fix"
+  button is shown in the popup. Clicking it calls:
+    PUT /api/v1/sites/{upstream_site_id}/devices/{upstream_device_id}
+  with a payload that sets stp_edge: false on the upstream port usage
+  profile. The upstream switch will receive the updated config from Mist
+  and re-enable the port automatically.
+
+Remediation (manual):
+  1. In the Mist dashboard, go to the upstream switch.
+  2. Open its port configuration and find the port usage profile connected
+     to our switch (profile name shown in the check result).
+  3. Edit the profile and disable "STP Edge" / "PortFast".
+  4. Save and apply. The upstream switch will push the new config.
+  5. The port will come back up and STP will negotiate normally.
+  6. After fixing, re-run tests 3c and 3c-ii to confirm.
 
 ================================================================================
 4. MANAGEMENT IP ADDRESS  [CRITICAL]
@@ -443,10 +691,18 @@ Pass:       Both mcd and jmd running.
 Warn:       Only one process running.
 Fail:       Neither process running.
 
+Inline adopt prompt:
+  When this check fails or warns, an "Adopt Switch" button is injected
+  directly inside the check result card (below the result text). Clicking it
+  opens the Device & Config panel and triggers the adoption workflow
+  automatically. The Mist API must be configured for the button to appear;
+  otherwise a message is shown to configure credentials first.
+
 Remediation:
-  1. Restart the Mist agent processes:
+  Option 1 — Restart mcd (recommended first step):
+  1. Use the "Run Fix" button in the check popup to run:
        restart mcd
-     Wait 30 seconds, then check again.
+     Wait 30 seconds, then use "Run Test Now" to verify.
   2. If mcd won't start, check the logs:
        show log messages | match mcd
        show log mist_agent.log
@@ -454,14 +710,20 @@ Remediation:
        request extension-service reinstall
      Or for newer Junos versions:
        request extension-service daemonize-restart mcd
-  4. Verify the Mist Agent package is installed:
-       show version | match mist
-     If not present, the switch needs to be adopted (test 11).
-  5. Check disk space — insufficient space can prevent processes from
+  4. Check disk space — insufficient space can prevent processes from
      starting:
        show system storage
      If full, free up space:
        request system storage cleanup
+
+  Option 2 — Adopt Switch (if restart does not resolve or agent was
+              never installed):
+  Use the "Adopt Switch" button in the check popup (or the inline button
+  in the check result card, or the Adopt Switch button in the Device &
+  Config panel). This fetches the adoption "set" commands from Mist and
+  applies them via the console, reconfiguring the agent from scratch.
+
+  After either option, use "Run Test Now" in the popup to verify.
 
 ================================================================================
 13. OUTBOUND SSH CONFIGURATION
@@ -538,6 +800,61 @@ Remediation:
         Delete and re-adopt the switch.
 
 ================================================================================
+IDENTIFY SWITCH
+================================================================================
+
+The "Identify Switch" button reads the switch hostname, serial number, MAC
+address, model, and Junos version from the console, then searches the Mist
+inventory for a matching device.
+
+Outcomes:
+  Found      — Switch is in Mist inventory. Config Drift and Offline Timeline
+               buttons are enabled.
+  Not found  — Switch is not in the Mist inventory. Two options are presented:
+
+    1. Claim code — go to Mist → Organization → Inventory → Add Devices and
+       enter the claim code printed on the switch label (or LCD). This links
+       the switch to the org without console access.
+
+    2. Adopt via console — an inline "Adopt Switch" button appears directly
+       below the not-found message. Clicking it opens the Device & Config
+       panel and triggers the adoption workflow, which fetches the adoption
+       "set" commands from the Mist API and applies them via the console.
+
+  No API     — Mist API credentials are not configured. Configure cloud,
+               token, and org ID in the Mist API panel and load sites first.
+
+After adoption, run "Identify Switch" again to confirm the switch now appears
+in the inventory.
+
+================================================================================
+CLI MODE DETECTION
+================================================================================
+
+On every serial connect the tool automatically detects the current CLI mode
+by sending Enter and inspecting the resulting prompt.
+
+Modes detected:
+  operational  >   Normal Junos CLI — most troubleshooting commands run here.
+  config       #   Configuration mode — type "exit" to return to operational.
+  shell        %   Unix shell — type "cli" to enter Junos.
+  login            Login prompt — enter username/password to continue.
+  unknown          No recognisable prompt — press Enter in the terminal.
+
+A popup appears immediately with:
+  • A colour-coded badge showing the detected mode.
+  • A short note explaining what to do to reach operational mode.
+  • A reference table listing all five modes with prompt examples and
+    navigation instructions.
+
+The modal can be dismissed by clicking the X, pressing Escape, clicking
+outside the modal, or clicking "Got it".
+
+The ? button in the top-right header re-opens this modal at any time.
+If the serial port is not connected the modal shows the reference table
+immediately (no detection attempt is made).
+
+================================================================================
 LOGIN FLOW
 ================================================================================
 
@@ -547,8 +864,19 @@ The Login to Switch button handles these scenarios:
   2. At shell prompt (%) — sends 'cli' to enter Junos.
   3. Factory default (root, no password) — logs in, warns that root
      password must be set before committing config.
-  4. Password required — fetches root password from Mist site settings
-     via API. If unavailable, prompts user.
+  4. Password required — fetches root password from Mist (template then
+     site settings) via API. If unavailable, prompts user.
+
+GET ROOT PASSWORD button:
+  • Enabled as soon as the Mist API is configured and a site is selected.
+    Does NOT require the switch to be identified or even connected.
+  • Lookup order:
+      1. Switch template assigned to the site (networktemplate_id in site
+         settings → /api/v1/orgs/{orgId}/networktemplates/{templateId}).
+      2. Site-level switch_mgmt.root_password in site settings.
+  • All found passwords are displayed with their source label
+    (e.g. "Switch Template: "Corp-Template"" or "Site Settings").
+  • If the site has no template or no password is set, guidance is shown.
 
 Remediation for login failures:
   1. If factory default, set a root password before any config changes:
@@ -564,16 +892,24 @@ Remediation for login failures:
         WARNING: This erases all configuration.
   3. If no Mist API configured:
      a. Set up the Mist API section (cloud, token, org ID, site).
-     b. Ensure the site has a root password configured in
+     b. Ensure the site has a root password configured in:
+        Organization → Switch Templates → (template) → Switch Management
+        — or —
         Organization → Site Configuration → Switch Management.
 
 ================================================================================
 CRITICAL GATE LOGIC
 ================================================================================
 
+  0. Root Password — skips all remaining if no root password is configured.
   4. Management IP Address — skips all remaining if no IP.
   6. Default Gateway — skips DNS and cloud checks if no route.
   8. DNS Resolution — skips endpoint checks if DNS fails.
 
-Skipped checks show "—" with the reason. This avoids wasting time on
+Skipped checks show a dash (—) with the reason. This avoids wasting time on
 checks that cannot possibly succeed.
+
+Note: STP blocking (test 3c) is not a hard gate — the checks continue so that
+the full picture of why there is no IP can be seen. If the port is STP blocked
+the Management IP check will fail, which is expected. Fix the STP issue first
+then re-run the full suite.

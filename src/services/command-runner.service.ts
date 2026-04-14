@@ -15,6 +15,23 @@ export interface CommandResult {
   error?: string;
 }
 
+/**
+ * Asynchronous console messages injected by the Junos syslog/message facility.
+ * These appear mid-output during any CLI session and corrupt command results.
+ * Covers: Auto Image Upgrade, daemon[pid]: syslog entries, and
+ * RFC-3164 timestamp-prefixed lines (e.g. "Apr  2 10:23:45 ...").
+ */
+const CONSOLE_NOISE_LINE =
+  /^(?:Auto Image Upgrade:|[\w][\w.-]*\[\d+\]:\s|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s{1,2}\d{1,2}\s+\d{1,2}:\d{2}:\d{2}\s)/;
+
+/** Strip asynchronous Junos console noise lines from a block of output. */
+function stripConsoleNoise(text: string): string {
+  return text
+    .split('\n')
+    .filter((line) => !CONSOLE_NOISE_LINE.test(line.trimStart()))
+    .join('\n');
+}
+
 /** Common Junos CLI prompt patterns */
 const PROMPT_PATTERNS = [
   /[\w\-@.:]+>\s*$/,       // operational mode: user@switch>
@@ -31,9 +48,15 @@ export class CommandRunnerService {
   private serial: SerialService;
   private outputBuffer = '';
   private dataHandler: ((data: Uint8Array) => void) | null = null;
+  private screenLengthSet = false;
 
   constructor(serial: SerialService) {
     this.serial = serial;
+  }
+
+  /** Reset per-session state — call when the serial connection is closed. */
+  resetSessionState(): void {
+    this.screenLengthSet = false;
   }
 
   /**
@@ -77,6 +100,8 @@ export class CommandRunnerService {
         }
         // Strip leading/trailing whitespace and newlines
         output = output.replace(/^\s*\n/, '').replace(/\n\s*$/, '');
+        // Strip asynchronous Junos console noise (syslog messages, Auto Image Upgrade, etc.)
+        output = stripConsoleNoise(output);
         // Strip the trailing prompt line
         const lines = output.split('\n');
         if (lines.length > 0 && PROMPT_PATTERNS.some((p) => p.test(lines[lines.length - 1]))) {
@@ -106,9 +131,10 @@ export class CommandRunnerService {
       checkInterval = setInterval(() => {
         const elapsed = Date.now() - lastDataTime;
         if (elapsed >= promptWait && this.outputBuffer.length > 0) {
-          // Check if buffer ends with a prompt
-          const trimmed = this.outputBuffer.trimEnd();
-          if (PROMPT_PATTERNS.some((p) => p.test(trimmed))) {
+          // Strip noise lines before checking for prompt — syslog messages
+          // can appear after the prompt and mask it from detection.
+          const cleanedForPrompt = stripConsoleNoise(this.outputBuffer).trimEnd();
+          if (PROMPT_PATTERNS.some((p) => p.test(cleanedForPrompt))) {
             finish(true);
           }
         }
@@ -254,8 +280,11 @@ export class CommandRunnerService {
       await new Promise((r) => setTimeout(r, 1500));
     }
 
-    // Disable pagination
-    await this.execute('set cli screen-length 0', 5000);
+    // Disable pagination (only once per connection)
+    if (!this.screenLengthSet) {
+      await this.execute('set cli screen-length 0', 5000);
+      this.screenLengthSet = true;
+    }
   }
 
   /**

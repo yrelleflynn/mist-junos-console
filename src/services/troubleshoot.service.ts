@@ -9,6 +9,26 @@
 import { CommandRunnerService, CommandResult } from './command-runner.service';
 import { MistApiService, MistDeviceEvent, MistAuditLog } from './mist-api.service';
 import { MistCloud, MistEndpoint } from '../config/mist-clouds.config';
+import { rootPasswordCheck } from '../checks/root-password.check';
+import { junosVersionCheck } from '../checks/junos-version.check';
+import { lldpCheck } from '../checks/lldp.check';
+import type { LldpCheckResult } from '../checks/lldp.check';
+import { portStatusCheck } from '../checks/port-status.check';
+import { interfaceErrorsCheck } from '../checks/interface-errors.check';
+import { vlanConfigCheck } from '../checks/vlan-config.check';
+import { interfaceIpCheck } from '../checks/interface-ip.check';
+import type { InterfaceIpCheckResult } from '../checks/interface-ip.check';
+import { dhcpLeaseCheck } from '../checks/dhcp-lease.check';
+import { arpCheck } from '../checks/arp.check';
+import { defaultRouteCheck } from '../checks/default-route.check';
+import { dnsConfigCheck } from '../checks/dns-config.check';
+import { dnsResolutionCheck } from '../checks/dns-resolution.check';
+import { routeToMistCheck } from '../checks/route-to-mist.check';
+import { mistAgentVersionCheck } from '../checks/mist-agent-version.check';
+import { mistAgentProcessesCheck } from '../checks/mist-agent-processes.check';
+import { outboundSshCheck } from '../checks/outbound-ssh.check';
+import { activeConnectionsCheck } from '../checks/active-connections.check';
+import { runOfflineTimeline } from '../checks/offline-timeline.check';
 
 export type CheckStatus = 'pending' | 'running' | 'pass' | 'fail' | 'warn' | 'skip' | 'info';
 
@@ -20,6 +40,7 @@ export interface CheckResult {
   raw?: string;
   remediation?: string;
   commands?: string[];
+  needsUpstreamSelection?: boolean;
 }
 
 export type CheckProgressCallback = (result: CheckResult) => void;
@@ -47,6 +68,9 @@ export interface UpstreamPortConfig {
   voipNetwork: string | null;
   speed: string | null;
   duplex: string | null;
+  stpEdge: boolean;               // stp_edge on the upstream port usage profile (BPDU Guard — error-disables port)
+  stpNoRootPort: boolean;         // stp_no_root_port (Root Guard) on the upstream port
+  stpBpduBlock: boolean;          // no_bpdu_block / bpdu_filter (Block STP BPDUs) — silently drops BPDUs
   rawPortConfig: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   networkDefinitions: Record<string, any>;
@@ -58,6 +82,16 @@ export interface TroubleshootOptions {
   siteId?: string;
   deviceId?: string;
   onProgress: CheckProgressCallback;
+  onContextUpdate?: (key: 'uplinkPort' | 'mgmtIp', value: string) => void;
+  onLldpNeighbor?: (neighbor: LldpNeighbor | null) => void;
+  onUpstreamPortConfig?: (config: UpstreamPortConfig | null) => void;
+  promptPassword?: (message: string) => Promise<string | null>;
+  /**
+   * Called before each check to ask whether the run should stop early.
+   * Set this from the progress callback when a critical failure is detected
+   * (e.g. mist-processes failing means adoption is needed and further checks are pointless).
+   */
+  shouldAbort?: () => boolean;
 }
 
 export class TroubleshootService {
@@ -76,6 +110,7 @@ export class TroubleshootService {
   async runAll(options: TroubleshootOptions): Promise<CheckResult[]> {
     const results: CheckResult[] = [];
     const { cloud, onProgress } = options;
+    const mistApi = this.mistApi;
 
     /** Helper to push a result and report progress */
     const report = (result: CheckResult) => {
@@ -90,53 +125,126 @@ export class TroubleshootService {
       }
     };
 
-    // Disable pagination first
+    /**
+     * Check if the device is now online in Mist. If so, report a pass result
+     * and signal callers to stop further checks.
+     */
+    const checkDeviceOnline = async (): Promise<boolean> => {
+      if (!mistApi?.isConfigured || !options.siteId || !options.deviceId) return false;
+      try {
+        const stats = await mistApi.getDeviceStats(options.siteId, options.deviceId);
+        if (stats?.status === 'connected') {
+          report({
+            id: 'device-online',
+            name: 'Device Online',
+            status: 'pass',
+            detail: 'Device is now connected to Mist — no further checks needed',
+          });
+          return true;
+        }
+      } catch { /* ignore API errors — continue checking */ }
+      return false;
+    };
+
+    // Mutable context shared across checks (uplinkPort and mgmtIp are updated as we discover them)
+    const ctx = {
+      runner: this.runner,
+      cloud,
+      uplinkPort: options.uplinkPort || '',
+      mgmtIp: null as string | null,
+      mistApi: mistApi || undefined,
+      siteId: options.siteId,
+      deviceId: options.deviceId,
+      promptPassword: options.promptPassword,
+    };
+
+    // Ensure we are in operational mode before running checks
     await this.runner.ensureOperationalMode();
 
-    // 1. LLDP — detect uplink
-    let uplinkPort = options.uplinkPort || '';
-    const lldpResult = await this.checkLldp(uplinkPort);
-    report(lldpResult.result);
-
-    if (!uplinkPort && lldpResult.detectedPort) {
-      uplinkPort = lldpResult.detectedPort;
+    // Pre-flight 0: Root password — must be set before any config can be committed
+    const rootPwResult = await rootPasswordCheck.run(ctx) as CheckResult;
+    report(rootPwResult);
+    if (rootPwResult.status === 'fail') {
+      skipRemaining('root password could not be configured', [
+        'Auto Image Upgrade', 'Junos Version', 'LLDP Neighbors', 'Port Status',
+        'Interface Errors', 'VLAN Config', 'Management IP', 'DHCP Lease', 'ARP Table',
+        'Default Route', 'DNS Config', 'DNS Resolution', 'Route to Mist',
+        'Mist Agent Version', 'Mist Agent Processes', 'Outbound SSH Config',
+        'Active Cloud Connections',
+      ]);
+      return results;
     }
 
-    // 1b. Look up upstream switch port config in Mist
+    // 0. Junos Version — check minimum (18.2R3) and recommended (20.4+)
+    report(await junosVersionCheck.run(ctx) as CheckResult);
+    if (await checkDeviceOnline()) return results;
+
+    // 1. LLDP — detect uplink port and upstream neighbor
+    const lldpRaw = await lldpCheck.run(ctx) as unknown as LldpCheckResult;
+    if (lldpRaw.needsUpstreamSelection) lldpRaw.result.needsUpstreamSelection = true;
+    report(lldpRaw.result);
+    if (!ctx.uplinkPort && lldpRaw.detectedPort) {
+      ctx.uplinkPort = lldpRaw.detectedPort;
+      options.onContextUpdate?.('uplinkPort', lldpRaw.detectedPort);
+    }
+    options.onLldpNeighbor?.(lldpRaw.uplinkNeighbor);
+    if (await checkDeviceOnline()) return results;
+
+    // 1b. Look up upstream switch port config in Mist (uses legacy method — needs mistApi internally)
     let upstreamConfig: UpstreamPortConfig | null = null;
-    if (lldpResult.uplinkNeighbor) {
-      const upstreamResult = await this.lookupUpstreamPortConfig(lldpResult.uplinkNeighbor);
+    if (lldpRaw.uplinkNeighbor) {
+      const upstreamResult = await this.lookupUpstreamPortConfig(lldpRaw.uplinkNeighbor);
       report(upstreamResult.result);
       upstreamConfig = upstreamResult.config;
+      options.onUpstreamPortConfig?.(upstreamConfig);
+      if (await checkDeviceOnline()) return results;
     }
 
     // 2. Port Status
-    const portResult = await this.checkPortStatus(uplinkPort);
+    const portResult = await portStatusCheck.run(ctx) as CheckResult;
     report(portResult);
+    if (await checkDeviceOnline()) return results;
 
     // 2b. Interface Error Counters (only if port is up)
-    if (uplinkPort && portResult.status === 'pass') {
-      const errorResult = await this.checkInterfaceErrors(uplinkPort);
-      report(errorResult);
+    if (ctx.uplinkPort && portResult.status === 'pass') {
+      report(await interfaceErrorsCheck.run(ctx) as CheckResult);
+      if (await checkDeviceOnline()) return results;
     }
 
     // 3. VLAN Config
-    const vlanResult = await this.checkVlanConfig(uplinkPort);
-    report(vlanResult);
+    report(await vlanConfigCheck.run(ctx) as CheckResult);
+    if (await checkDeviceOnline()) return results;
 
     // 3b. Uplink Port Config Comparison (if upstream config is known)
-    if (upstreamConfig && uplinkPort) {
+    if (upstreamConfig && ctx.uplinkPort) {
       const compResults = await this.compareUplinkConfig(
-        uplinkPort, upstreamConfig, options.siteId, options.deviceId,
+        ctx.uplinkPort, upstreamConfig, options.siteId, options.deviceId,
       );
-      for (const r of compResults) report(r);
+      for (const r of compResults) {
+        report(r);
+        if (await checkDeviceOnline()) return results;
+      }
+    }
+
+    // 3c. STP Status — check spanning tree state on the uplink port
+    if (ctx.uplinkPort) {
+      const stpResults = await this.checkStpStatus(ctx.uplinkPort, lldpRaw.uplinkNeighbor);
+      for (const r of stpResults) {
+        report(r);
+        if (await checkDeviceOnline()) return results;
+      }
     }
 
     // 4. Interface IP — CRITICAL: no IP means nothing beyond this will work
-    const ipResult = await this.checkInterfaceIp();
-    report(ipResult.result);
+    const ipRaw = await interfaceIpCheck.run(ctx) as unknown as InterfaceIpCheckResult;
+    report(ipRaw.result);
+    if (ipRaw.mgmtIp) {
+      ctx.mgmtIp = ipRaw.mgmtIp;
+      options.onContextUpdate?.('mgmtIp', ipRaw.mgmtIp);
+    }
+    if (await checkDeviceOnline()) return results;
 
-    if (ipResult.result.status === 'fail') {
+    if (ipRaw.result.status === 'fail') {
       skipRemaining('no management IP address', [
         'DHCP Lease Details', 'ARP Table', 'Default Gateway',
         'DNS Configuration', 'DNS Resolution & Reachability',
@@ -147,16 +255,17 @@ export class TroubleshootService {
     }
 
     // 4b. DHCP Lease Details
-    const dhcpResult = await this.checkDhcpLease();
-    report(dhcpResult);
+    report(await dhcpLeaseCheck.run(ctx) as CheckResult);
+    if (await checkDeviceOnline()) return results;
 
     // 5. ARP
-    const arpResult = await this.checkArp();
-    report(arpResult);
+    report(await arpCheck.run(ctx) as CheckResult);
+    if (await checkDeviceOnline()) return results;
 
     // 6. Default Route — CRITICAL: no route means no cloud connectivity
-    const routeResult = await this.checkDefaultRoute();
+    const routeResult = await defaultRouteCheck.run(ctx) as CheckResult;
     report(routeResult);
+    if (await checkDeviceOnline()) return results;
 
     if (routeResult.status === 'fail') {
       skipRemaining('no default route', [
@@ -168,12 +277,13 @@ export class TroubleshootService {
     }
 
     // 7. DNS Config
-    const dnsConfigResult = await this.checkDnsConfig();
-    report(dnsConfigResult);
+    report(await dnsConfigCheck.run(ctx) as CheckResult);
+    if (await checkDeviceOnline()) return results;
 
     // 8. DNS Resolution — CRITICAL: if DNS doesn't resolve, skip endpoint checks
-    const dnsResolveResult = await this.checkDnsResolution(cloud);
+    const dnsResolveResult = await dnsResolutionCheck.run(ctx) as CheckResult;
     report(dnsResolveResult);
+    if (await checkDeviceOnline()) return results;
 
     if (dnsResolveResult.status === 'fail') {
       skipRemaining('DNS resolution failed', [
@@ -184,13 +294,42 @@ export class TroubleshootService {
     }
 
     // 9. Route Table Check for Mist Endpoints
-    const routeCheckResult = await this.checkRouteToMistEndpoints(cloud);
-    report(routeCheckResult);
+    report(await routeToMistCheck.run(ctx) as CheckResult);
+    if (await checkDeviceOnline()) return results;
 
-    // 10. Mist Cloud Status
-    const mistResults = await this.checkMistCloudStatus(ipResult.mgmtIp, cloud, options.siteId, options.deviceId);
-    for (const r of mistResults) {
+    // 10a. Mist Agent Version
+    report(await mistAgentVersionCheck.run(ctx) as CheckResult);
+    if (await checkDeviceOnline()) return results;
+
+    // 10b. Mist Agent Processes
+    report(await mistAgentProcessesCheck.run(ctx) as CheckResult);
+    if (await checkDeviceOnline()) return results;
+
+    // If the caller signals abort (e.g. mist-processes failed → adoption needed),
+    // skip the remaining agent/connectivity checks with their real IDs so that
+    // pre-populated pending cards in the UI are replaced with skip results.
+    if (options.shouldAbort?.()) {
+      report({ id: 'outbound-ssh-config', name: 'Outbound SSH Config', status: 'skip',
+        detail: 'Skipped — adoption required to reconnect this switch to Mist' });
+      report({ id: 'cloud-connections', name: 'Active Cloud Connections', status: 'skip',
+        detail: 'Skipped — adoption required to reconnect this switch to Mist' });
+      return results;
+    }
+
+    // 10c. Outbound SSH Config
+    const sshRaw = await outboundSshCheck.run(ctx) as unknown as { result: CheckResult; port: string | null };
+    report(sshRaw.result);
+    if (await checkDeviceOnline()) return results;
+
+    // 10d. Active Cloud Connections
+    report(await activeConnectionsCheck.run(ctx) as CheckResult);
+    if (await checkDeviceOnline()) return results;
+
+    // 10e. Offline Timeline (Mist events + switch logs correlation)
+    const timelineResults = await runOfflineTimeline(ctx);
+    for (const r of timelineResults) {
       report(r);
+      if (await checkDeviceOnline()) return results;
     }
 
     return results;
@@ -254,12 +393,19 @@ export class TroubleshootService {
       }
     }
 
-    // Phase 2: SSL cert check for port 443 endpoints (requires shell)
+    // Phase 2: SSL cert checks for port 443 endpoints — requires shell (curl)
+    // Enter shell ONCE for all curl tests, then return to operational mode
     const port443Endpoints = cloud.switchEndpoints.filter((e) => e.port === 443);
 
     if (port443Endpoints.length > 0) {
+      // Ensure we are in operational mode before entering shell
+      await this.runner.ensureOperationalMode();
+
+      await this.runner.send('start shell\n');
+      await new Promise((r) => setTimeout(r, 2000));
+
       for (const endpoint of port443Endpoints) {
-        const certResult = await this.checkSslCertificate(endpoint);
+        const certResult = await this.checkSslCertificateInShell(endpoint);
 
         // Rewrite the result to use firewall inspection language
         const inspId = `fw-inspect-${endpoint.host.replace(/\./g, '-')}`;
@@ -291,6 +437,9 @@ export class TroubleshootService {
           });
         }
       }
+
+      // Return to operational mode after all curl tests
+      await this.runner.ensureOperationalMode();
     }
 
     return results;
@@ -403,6 +552,9 @@ export class TroubleshootService {
     const vlans: string[] = [];
     let speed: string | null = null;
     let duplex: string | null = null;
+    let stpEdge = false;
+    let stpNoRootPort = false;
+    let stpBpduBlock = false;
     let rawPortConfig = '';
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -410,47 +562,62 @@ export class TroubleshootService {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const portConfig: Record<string, any> = upstreamConfig.port_config || {};
 
-    // Try to find the port in port_config by matching:
-    // 1. LLDP port info matches the interface name key (e.g. "xe-0/1/0")
-    // 2. LLDP port info matches the port description
-    // 3. LLDP port info matches the port usage profile name
-    for (const [ifName, pCfg] of Object.entries(portConfig)) {
-      const desc = pCfg?.description || '';
-      const usage = pCfg?.usage || '';
+    /**
+     * Returns true if portName (e.g. "ge-0/0/4") matches a port_config key.
+     * Handles both exact names and Mist range keys (e.g. "ge-0/0/0-47").
+     */
+    const portMatchesKey = (portName: string, key: string): boolean => {
+      if (portName === key) return true;
+      // Range format: same prefix up to last '/', then "<start>-<end>"
+      const lastSlash = key.lastIndexOf('/');
+      if (lastSlash < 0) return false;
+      const base   = key.substring(0, lastSlash + 1); // e.g. "ge-0/0/"
+      const suffix = key.substring(lastSlash + 1);    // e.g. "0-47"
+      const rm = suffix.match(/^(\d+)-(\d+)$/);
+      if (!rm) return false;
+      if (!portName.startsWith(base)) return false;
+      const portNum = parseInt(portName.substring(base.length), 10);
+      if (isNaN(portNum)) return false;
+      return portNum >= parseInt(rm[1], 10) && portNum <= parseInt(rm[2], 10);
+    };
 
-      if (ifName === portInfo ||
-          ifName.includes(portInfo) ||
-          portInfo.includes(ifName) ||
-          (desc && desc === portInfo) ||
+    // Try to find the port in port_config by matching the LLDP port info against:
+    //   1. Exact interface name key  (e.g. "ge-0/0/4")
+    //   2. Mist port range key       (e.g. "ge-0/0/0-47" — very common in Mist)
+    //   3. Port description field
+    //   4. Usage profile name
+    for (const [ifName, pCfg] of Object.entries(portConfig)) {
+      const desc  = pCfg?.description || '';
+      const usage = pCfg?.usage       || '';
+
+      if (portMatchesKey(portInfo, ifName) ||
+          (desc  && desc  === portInfo)    ||
           (usage && usage === portInfo)) {
         remoteInterface = ifName;
-        usageProfile = usage;
-        rawPortConfig = `Interface: ${ifName}\n` + JSON.stringify(pCfg, null, 2);
+        usageProfile    = usage;
+        rawPortConfig   = `Interface: ${ifName}\n` + JSON.stringify(pCfg, null, 2);
         break;
       }
     }
 
-    // If not found by LLDP port info, check all port_config entries
-    // and also try getting LLDP detail for the actual remote interface name
+    // If still not found, run "show lldp neighbors interface X detail" on the local
+    // switch to get the exact Port ID TLV advertised by the upstream switch, then
+    // re-try the range-aware match with that canonical name.
     if (!remoteInterface) {
-      // The LLDP port info might be a Mist port name/description that doesn't
-      // directly match port_config keys. Try to get more detail from LLDP.
       const lldpDetailCmd = await this.runner.execute(
         `show lldp neighbors interface ${neighbor.localInterface} detail`,
         15000,
         3000,
       );
       if (lldpDetailCmd.success) {
-        // Look for "Port ID" which shows the actual interface name
         const portIdMatch = lldpDetailCmd.output.match(/Port ID\s*:\s*(\S+)/i);
         if (portIdMatch) {
           const remotePortId = portIdMatch[1];
-          // Try to match this against port_config keys
           for (const [ifName, pCfg] of Object.entries(portConfig)) {
-            if (ifName === remotePortId || ifName.includes(remotePortId)) {
+            if (portMatchesKey(remotePortId, ifName)) {
               remoteInterface = ifName;
-              usageProfile = pCfg?.usage || '';
-              rawPortConfig = `Interface: ${ifName} (matched via LLDP Port ID: ${remotePortId})\n` + JSON.stringify(pCfg, null, 2);
+              usageProfile    = pCfg?.usage || '';
+              rawPortConfig   = `Interface: ${ifName} (matched via LLDP Port ID: ${remotePortId})\n` + JSON.stringify(pCfg, null, 2);
               break;
             }
           }
@@ -467,6 +634,11 @@ export class TroubleshootService {
       voipNetwork = profile.voip_network || null;
       speed = profile.speed || null;
       duplex = profile.duplex || null;
+      stpEdge = !!profile.stp_edge;
+      stpNoRootPort = !!profile.stp_no_root_port;
+      // "Block STP BPDUs" in the Mist UI — silently drops BPDU frames on the port.
+      // Field name varies across Mist API versions; check known variants.
+      stpBpduBlock = !!profile.no_bpdu_block || !!profile.bpdu_filter || !!profile.no_bpdu;
 
       if (profile.networks && Array.isArray(profile.networks)) {
         vlans.push(...profile.networks);
@@ -502,6 +674,9 @@ export class TroubleshootService {
       voipNetwork,
       speed,
       duplex,
+      stpEdge,
+      stpNoRootPort,
+      stpBpduBlock,
       rawPortConfig: rawPortConfig || 'No specific port config found in Mist',
       networkDefinitions: upstreamConfig.networks || {},
     };
@@ -571,7 +746,7 @@ export class TroubleshootService {
    * Compare the upstream switch port config to the local switch uplink config.
    * Generates the exact 'set' commands needed to make the local port match.
    */
-  private async compareUplinkConfig(
+  async compareUplinkConfig(
     localPort: string,
     upstream: UpstreamPortConfig,
     ourSiteId?: string,
@@ -631,11 +806,16 @@ export class TroubleshootService {
           matches.push('Trunk VLANs: all ✓');
         }
       } else if (upstream.vlans.length > 0) {
-        // Specific tagged VLANs
+        // Specific tagged VLANs.
+        // If the port isn't yet a trunk, always emit ALL vlan-member commands so the
+        // commit doesn't fail with "trunk has no VLAN members".
+        const forceAllVlans = !currentHasTrunk;
         for (const vlan of upstream.vlans) {
-          if (!currentConfig.includes(`vlan members ${vlan}`)) {
-            mismatches.push(`Tagged VLAN: "${vlan}" missing from local port`);
-            // Check if the VLAN exists on the switch
+          if (forceAllVlans || !currentConfig.includes(`vlan members ${vlan}`)) {
+            if (!forceAllVlans) {
+              // Only report as a mismatch when the port is already a trunk
+              mismatches.push(`Tagged VLAN: "${vlan}" missing from local port`);
+            }
             if (!currentVlans.includes(`set vlans ${vlan}`)) {
               commands.push(vlanCreateCmd(vlan));
             }
@@ -644,6 +824,12 @@ export class TroubleshootService {
             matches.push(`Tagged VLAN: ${vlan} ✓`);
           }
         }
+      }
+
+      // Always ensure vlan members all is present when configuring a new trunk port,
+      // so the commit doesn't fail and all VLANs can pass.
+      if (!currentHasTrunk && !commands.some((c) => c.includes('vlan members all'))) {
+        commands.push(`set interfaces ${localPort} unit 0 family ethernet-switching vlan members all`);
       }
 
       // 3. Native VLAN on trunk
@@ -737,21 +923,98 @@ export class TroubleshootService {
     if (mismatches.length === 0) {
       results.push({
         id, name, status: 'pass',
-        detail: `Uplink ${localPort} config matches upstream (${matches.length} items verified)`,
+        detail: `Uplink ${localPort} matches upstream ${upstream.neighborName} (${matches.length} item${matches.length !== 1 ? 's' : ''} verified)`,
         raw,
       });
     } else {
       const hasPlaceholders = commands.some((c) => /<\w+>/.test(c));
+      // Show the first mismatch in the card detail so the user can see the problem at a glance
+      const firstMismatch = mismatches[0];
+      const extraCount = mismatches.length - 1;
+      const detail = extraCount > 0
+        ? `${firstMismatch} (+${extraCount} more) — click to investigate`
+        : `${firstMismatch} — click to investigate`;
       results.push({
         id, name, status: 'fail',
-        detail: `${mismatches.length} mismatch(es) — ${commands.length} commands to fix`,
+        detail,
         raw,
-        remediation: `The local uplink port ${localPort} does not match the upstream switch (${upstream.neighborName}) port config.\n\nMismatches:\n${mismatches.map((m) => `  • ${m}`).join('\n')}\n\n${hasPlaceholders ? 'Note: Some commands contain <vlan-id> placeholders — replace with the actual VLAN ID from the upstream network definition.' : 'The commands below will configure the local port to match the upstream.'}`,
+        remediation: `Local uplink port ${localPort} does not match upstream switch ${upstream.neighborName} port config.\n\nMismatches:\n${mismatches.map((m) => `  • ${m}`).join('\n')}\n\n${hasPlaceholders ? 'Note: Some commands contain <vlan-id> placeholders — replace with the actual VLAN ID from the upstream network definition.' : 'Apply the commands below to configure the local port to match the upstream.'}`,
         commands: hasPlaceholders ? undefined : commands,
       });
     }
 
-    // Step 6: Check if our switch is in Mist and compare Mist intended config
+    // Step 6: Check for empty upstream trunk (no VLANs configured at all)
+    const isEmptyTrunk =
+      upstreamMode === 'trunk' &&
+      !upstream.allNetworks &&
+      upstream.vlans.length === 0 &&
+      upstream.nativeVlan === null;
+
+    if (isEmptyTrunk) {
+      const emtId = 'upstream-empty-trunk';
+      const emtName = 'Upstream Trunk VLAN Config';
+      const profileName = upstream.usageProfile;
+
+      const localCmds: string[] = [
+        `set interfaces ${localPort} unit 0 family ethernet-switching interface-mode trunk`,
+        `set interfaces ${localPort} unit 0 family ethernet-switching vlan members all`,
+      ];
+
+      let remediation = `The upstream switch port (${upstream.neighborName} → ${upstream.remoteInterface || upstream.remotePortInfo}) is configured as a TRUNK but has NO VLANs assigned — no traffic will pass through this link.\n\n`;
+      remediation += `Profile: "${profileName || 'unknown'}"\n\n`;
+      remediation += `Recommended fix: enable "all_networks" on the upstream port profile (allows all VLANs on the trunk).\n`;
+      remediation += `This will also configure the local uplink port to accept all VLANs.`;
+
+      const emtCommands: string[] = [];
+
+      // Build Mist API update for upstream device if we have the details
+      if (
+        this.mistApi?.isConfigured &&
+        upstream.neighborSiteId &&
+        upstream.neighborDeviceId &&
+        profileName
+      ) {
+        try {
+          const upstreamDeviceConfig = await this.mistApi.getDeviceConfig(
+            upstream.neighborSiteId,
+            upstream.neighborDeviceId,
+          );
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const existingPortUsages: Record<string, any> = upstreamDeviceConfig.port_usages || {};
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const existingProfile: Record<string, any> = existingPortUsages[profileName] || {};
+          const updatedPayload = {
+            port_usages: {
+              ...existingPortUsages,
+              [profileName]: {
+                ...existingProfile,
+                all_networks: true,
+              },
+            },
+          };
+          emtCommands.push(
+            `__mist_api_update__${upstream.neighborSiteId}__${upstream.neighborDeviceId}__${JSON.stringify(updatedPayload)}`,
+          );
+        } catch {
+          // Could not fetch upstream device config — skip the Mist API command
+        }
+      }
+
+      // Always include the local CLI fix
+      emtCommands.push(...localCmds);
+
+      results.push({
+        id: emtId,
+        name: emtName,
+        status: 'fail',
+        detail: `Upstream trunk port has no VLANs configured — traffic will not pass`,
+        raw: `Upstream: ${upstream.neighborName} port ${upstream.remoteInterface || upstream.remotePortInfo}\nProfile: ${profileName || 'none'}\nall_networks: false\nnativeVlan: null\nvlans: []\n\nThis is an empty trunk — no tagged or untagged VLANs are permitted.\nFix: set all_networks=true on upstream profile "${profileName}" via Mist API, then configure local port as trunk with vlan members all.`,
+        remediation,
+        commands: emtCommands.length > 0 ? emtCommands : undefined,
+      });
+    }
+
+    // Step 7: Check if our switch is in Mist and compare Mist intended config
     if (this.mistApi?.isConfigured && ourSiteId && ourDeviceId && mismatches.length > 0) {
       const mistCheckResult = await this.checkMistUplinkConfig(localPort, upstream, ourSiteId, ourDeviceId);
       results.push(mistCheckResult);
@@ -870,10 +1133,11 @@ export class TroubleshootService {
     }
   }
 
-  private async checkLldp(userPort: string): Promise<{
+  async checkLldp(userPort: string): Promise<{
     result: CheckResult;
     detectedPort: string | null;
     uplinkNeighbor: LldpNeighbor | null;
+    needsUpstreamSelection?: boolean;
   }> {
     const id = 'lldp';
     const name = 'LLDP Neighbors';
@@ -911,6 +1175,7 @@ export class TroubleshootService {
         result: { id, name, status: 'fail', detail: 'No LLDP neighbors found', raw: cmd.output },
         detectedPort: null,
         uplinkNeighbor: null,
+        needsUpstreamSelection: true,
       };
     }
 
@@ -965,7 +1230,7 @@ export class TroubleshootService {
     };
   }
 
-  private async checkPortStatus(port: string): Promise<CheckResult> {
+  async checkPortStatus(port: string): Promise<CheckResult> {
     const id = 'port-status';
     const name = 'Uplink Port Status';
 
@@ -991,7 +1256,7 @@ export class TroubleshootService {
     return { id, name, status: 'pass', detail: `Port ${port} is up (${speed})`, raw: cmd.output };
   }
 
-  private async checkInterfaceErrors(port: string): Promise<CheckResult> {
+  async checkInterfaceErrors(port: string): Promise<CheckResult> {
     const id = 'interface-errors';
     const name = 'Uplink Interface Errors';
 
@@ -1023,7 +1288,7 @@ export class TroubleshootService {
     return { id, name, status: 'warn', detail: `${port}: ${errorSummary}`, raw: cmd.output };
   }
 
-  private async checkVlanConfig(port: string): Promise<CheckResult> {
+  async checkVlanConfig(port: string): Promise<CheckResult> {
     const id = 'vlan-config';
     const name = 'VLAN Configuration';
 
@@ -1051,7 +1316,207 @@ export class TroubleshootService {
     return { id, name, status: 'pass', detail: `${vlanLines.length} VLAN(s) on ${port}`, raw: cmd.output };
   }
 
-  private async checkInterfaceIp(): Promise<{ result: CheckResult; mgmtIp: string | null }> {
+  /**
+   * Check spanning-tree state on the uplink port.
+   *
+   * Block 1 (local CLI): Parse port state AND role.
+   *   - Role "Root" → pass immediately, no upstream check needed.
+   *   - BPDU error-disabled or non-Root → fall through to Block 2.
+   *
+   * Block 2 (upstream Mist check): Only runs when role is NOT Root.
+   *   Uses the LLDP neighbor to look up the upstream Mist port config and
+   *   check for anything that would filter BPDUs (stp_edge, stp_no_root_port).
+   */
+  async checkStpStatus(
+    uplinkPort: string,
+    neighbor: LldpNeighbor | null,
+  ): Promise<CheckResult[]> {
+    const results: CheckResult[] = [];
+
+    // ---- Block 1: Local STP CLI check ----
+    const localId = 'stp-status';
+    const localName = 'STP Port State';
+
+    const cmd = await this.runner.execute(`show spanning-tree interface ${uplinkPort}`, 15000, 3000);
+
+    if (!cmd.success || cmd.output.trim().length === 0) {
+      results.push({ id: localId, name: localName, status: 'skip', detail: 'STP information not available for this port', raw: cmd.output });
+      return results;
+    }
+
+    const output = cmd.output;
+
+    // Parse port state — normalise long-form keywords to short codes
+    const stateMatch = output.match(/\b(FWD|BLK|DIS|LRN|LIS|DISCARDING|FORWARDING|LEARNING|LISTENING|BLOCKING)\b/i);
+    const rawState = stateMatch ? stateMatch[1].toUpperCase() : null;
+    const normalise = (s: string | null): string | null => {
+      if (!s) return null;
+      if (s === 'FORWARDING') return 'FWD';
+      if (s === 'BLOCKING') return 'BLK';
+      if (s === 'DISCARDING') return 'DIS';
+      if (s === 'LEARNING') return 'LRN';
+      if (s === 'LISTENING') return 'LIS';
+      return s;
+    };
+    const portState = normalise(rawState);
+
+    // Parse port role — handle both verbose ("Port role: Root port") and
+    // tabular abbreviated forms (ROOT, DESG, ALT, BACK) used in Junos EX output.
+    const roleMatch =
+      output.match(/[Rr]ole\s*:?\s*(Root(?:\s+port)?|Designated(?:\s+port)?|Alternate(?:\s+port)?|Backup(?:\s+port)?|ROOT|DESG|ALT|BACK)/i) ||
+      output.match(/\b(ROOT|DESG|ALT|BACK|Root|Designated|Alternate|Backup)\s*(?:port)?\s*$/im);
+    const normaliseRole = (r: string): string => {
+      const u = r.toUpperCase().replace(/\s+PORT$/, '');
+      if (u === 'ROOT') return 'Root';
+      if (u === 'DESG') return 'Designated';
+      if (u === 'ALT')  return 'Alternate';
+      if (u === 'BACK') return 'Backup';
+      // Full-word form — strip trailing " port" suffix if present
+      return r.replace(/\s+[Pp]ort$/, '');
+    };
+    const portRole = roleMatch ? normaliseRole(roleMatch[1]) : null;
+
+    // Detect BPDU error-disable
+    const isBpduError = /bpdu-block|error.?disabl/i.test(output);
+
+    let runUpstreamCheck = false;
+
+    if (!portState && !isBpduError) {
+      // STP not active on this port
+      results.push({ id: localId, name: localName, status: 'skip', detail: `STP not active on ${uplinkPort}`, raw: output });
+      return results;
+    } else if (isBpduError) {
+      results.push({
+        id: localId, name: localName, status: 'fail',
+        detail: `Port ${uplinkPort} is BPDU error-disabled — the upstream port has BPDU Guard enabled and shut down when it received BPDUs from this switch`,
+        raw: output,
+        remediation: 'The upstream switch port has BPDU Guard / STP Edge enabled. It shut down when it received BPDUs from this switch.\n\n1. Check the upstream port profile in Mist — disable stp_edge on the upstream port usage profile.\n2. Clear the error-disabled state on the upstream port.\n3. The port will re-establish and BPDUs will flow normally.',
+      });
+      runUpstreamCheck = true; // confirm the BPDU Guard source via Mist
+    } else if (portRole && portRole.toLowerCase() === 'root') {
+      // Root role — STP has converged correctly, uplink is valid
+      results.push({
+        id: localId, name: localName, status: 'pass',
+        detail: `Port ${uplinkPort} is the Root port — STP has converged correctly`,
+        raw: output,
+      });
+      return results; // no upstream check needed
+    } else if (portState === 'FWD') {
+      // Forwarding but not Root — needs upstream investigation.
+      // Designated (DESG) on an uplink is a strong indicator that the upstream port
+      // is BPDU error-disabled (BPDU Guard / STP Edge): this switch hears no superior
+      // BPDUs so it promotes itself to Designated for that segment.
+      const isDesg = portRole === 'Designated';
+      const detail = isDesg
+        ? `Port ${uplinkPort} is Designated (DESG) — this switch is acting as the STP root for this segment. `
+          + `The upstream port may be BPDU error-disabled because BPDU Guard is enabled on it. `
+          + `Checking upstream Mist config…`
+        : `Port ${uplinkPort} is forwarding with role ${portRole || 'unknown'} — topology is unexpected. Checking upstream config…`;
+      results.push({
+        id: localId, name: localName, status: isDesg ? 'fail' : 'warn',
+        detail,
+        raw: output,
+      });
+      runUpstreamCheck = true;
+    } else if (portState === 'BLK' || portState === 'DIS') {
+      const bridgeMatch = output.match(/[Dd]esignated.*?bridge.*?(\S{2}:\S{2}:\S{2}:\S{2}:\S{2}:\S{2})/);
+      const bridgeInfo = bridgeMatch ? ` Designated bridge: ${bridgeMatch[1]}` : '';
+      results.push({
+        id: localId, name: localName, status: 'fail',
+        detail: `Port ${uplinkPort} is STP ${portState === 'BLK' ? 'blocked' : 'discarding'}${portRole ? ` (role: ${portRole})` : ''}. Traffic will not flow.${bridgeInfo}`,
+        raw: output,
+        remediation: `The uplink port is in STP ${portState === 'BLK' ? 'blocking' : 'discarding'} state — traffic cannot pass until STP converges.\n\nCommon causes:\n  • The upstream port has STP Edge / BPDU Guard enabled\n  • A loop exists in the network topology\n  • This switch is competing for root bridge\n\nCheck the upstream port config in Mist (see Upstream STP Edge Config result).`,
+      });
+      runUpstreamCheck = true;
+    } else if (portState === 'LRN' || portState === 'LIS') {
+      results.push({
+        id: localId, name: localName, status: 'warn',
+        detail: `STP converging on ${uplinkPort} — port is ${portState === 'LRN' ? 'learning' : 'listening'}, not yet forwarding`,
+        raw: output,
+      });
+      runUpstreamCheck = true;
+    } else {
+      results.push({ id: localId, name: localName, status: 'warn', detail: `Port ${uplinkPort} STP state: ${portState}`, raw: output });
+      runUpstreamCheck = true;
+    }
+
+    if (!runUpstreamCheck) return results;
+
+    // ---- Block 2: Upstream Mist port check for BPDU filtering ----
+    // Only runs when role is NOT Root. Uses LLDP neighbor to look up upstream config.
+    const upId = 'stp-upstream-edge';
+    const upName = 'Upstream STP Edge Config';
+
+    if (!neighbor) {
+      results.push({ id: upId, name: upName, status: 'skip', detail: 'Run LLDP check first to identify the upstream neighbor' });
+      return results;
+    }
+
+    // Call lookupUpstreamPortConfig but only use the config — do not report the intermediate result
+    const upstreamResult = await this.lookupUpstreamPortConfig(neighbor);
+    const upstreamConfig = upstreamResult.config;
+
+    if (!upstreamConfig) {
+      results.push({ id: upId, name: upName, status: 'skip', detail: 'Upstream device not found in Mist — cannot check port configuration' });
+      return results;
+    }
+
+    if (!upstreamConfig.usageProfile) {
+      results.push({ id: upId, name: upName, status: 'skip', detail: 'Upstream port usage profile not resolved — cannot check for BPDU filtering' });
+      return results;
+    }
+
+    if (upstreamConfig.stpEdge) {
+      // Build Mist API update payload to set stp_edge: false
+      let commands: string[] | undefined;
+      if (upstreamConfig.neighborSiteId && upstreamConfig.neighborDeviceId) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const existingProfile: Record<string, any> = {};
+        try {
+          const upstreamMistConfig = await this.mistApi!.getDeviceConfig(
+            upstreamConfig.neighborSiteId,
+            upstreamConfig.neighborDeviceId,
+          );
+          Object.assign(existingProfile, upstreamMistConfig.port_usages?.[upstreamConfig.usageProfile] || {});
+        } catch { /* ignore — build payload without existing values */ }
+
+        const updatedProfile = { ...existingProfile, stp_edge: false };
+        const payload = { port_usages: { [upstreamConfig.usageProfile]: updatedProfile } };
+        commands = [`__mist_api_update__${upstreamConfig.neighborSiteId}__${upstreamConfig.neighborDeviceId}__${JSON.stringify(payload)}`];
+      }
+
+      results.push({
+        id: upId, name: upName, status: 'fail',
+        detail: `Upstream profile "${upstreamConfig.usageProfile}" on ${upstreamConfig.neighborName} has STP Edge enabled — port will be error-disabled when this switch sends BPDUs`,
+        raw: `Upstream switch: ${upstreamConfig.neighborName}\nPort usage profile: ${upstreamConfig.usageProfile}\nstp_edge: true${upstreamConfig.stpNoRootPort ? '\nstp_no_root_port: true' : ''}${upstreamConfig.stpBpduBlock ? '\nno_bpdu_block: true' : ''}`,
+        remediation: `The upstream port profile "${upstreamConfig.usageProfile}" on ${upstreamConfig.neighborName} has stp_edge: true.\n\nSTP Edge (PortFast) is for end-device ports only. On a trunk port connecting to another switch, BPDU Guard will error-disable the port the moment it receives BPDUs from this switch.\n\nFix: Set stp_edge: false on the upstream port usage profile in Mist.${commands ? '\n\nClick "Run Fix" to apply this change via the Mist API.' : '\n\nUpdate the profile in Mist manually.'}`,
+        commands,
+      });
+    } else if (upstreamConfig.stpBpduBlock) {
+      results.push({
+        id: upId, name: upName, status: 'warn',
+        detail: `Upstream profile "${upstreamConfig.usageProfile}" on ${upstreamConfig.neighborName} has "Block STP BPDUs" enabled — BPDUs are silently dropped, so STP cannot negotiate between the switches`,
+        raw: `Upstream switch: ${upstreamConfig.neighborName}\nPort usage profile: ${upstreamConfig.usageProfile}\nno_bpdu_block: true\nstp_edge: false\nstp_no_root_port: ${upstreamConfig.stpNoRootPort}`,
+        remediation: `"Block STP BPDUs" is enabled on the upstream port profile "${upstreamConfig.usageProfile}" on ${upstreamConfig.neighborName}.\n\nThis silently discards all BPDU frames — the upstream port neither sends nor processes BPDUs. As a result:\n  • This switch receives no superior BPDUs from upstream\n  • It elects itself as the Designated bridge for this segment (DESG role)\n  • Traffic forwards normally, but STP topology information is lost\n  • Network loops will not be detected or prevented\n\nThis configuration is not recommended on trunk ports connecting to other switches.\n\nRecommendation: disable "Block STP BPDUs" on the upstream port profile in Mist to allow proper STP convergence.`,
+      });
+    } else if (upstreamConfig.stpNoRootPort) {
+      results.push({
+        id: upId, name: upName, status: 'warn',
+        detail: `Upstream profile "${upstreamConfig.usageProfile}" on ${upstreamConfig.neighborName} has Root Guard enabled — may block if this switch sends superior BPDUs`,
+        raw: `Upstream switch: ${upstreamConfig.neighborName}\nPort usage profile: ${upstreamConfig.usageProfile}\nstp_edge: false\nstp_no_root_port: true`,
+        remediation: `Root Guard (stp_no_root_port: true) is enabled on the upstream port profile "${upstreamConfig.usageProfile}".\n\nIf this switch is attempting to become the STP root bridge, the upstream port will enter Root Inconsistent state and block traffic.\n\nThis is only a problem if this switch should be the root, or if it sends BPDUs with a lower bridge priority than the current root. If not, no action is needed.`,
+      });
+    } else {
+      results.push({
+        id: upId, name: upName, status: 'pass',
+        detail: `Upstream profile "${upstreamConfig.usageProfile}" on ${upstreamConfig.neighborName} has no BPDU filtering (STP Edge disabled, no Root Guard)`,
+      });
+    }
+
+    return results;
+  }
+
+  async checkInterfaceIp(): Promise<{ result: CheckResult; mgmtIp: string | null }> {
     const id = 'mgmt-ip';
     const name = 'Management IP Address';
 
@@ -1152,7 +1617,7 @@ export class TroubleshootService {
     };
   }
 
-  private async checkDhcpLease(): Promise<CheckResult> {
+  async checkDhcpLease(): Promise<CheckResult> {
     const id = 'dhcp-lease';
     const name = 'DHCP Lease Details';
 
@@ -1231,7 +1696,7 @@ export class TroubleshootService {
     };
   }
 
-  private async checkArp(): Promise<CheckResult> {
+  async checkArp(): Promise<CheckResult> {
     const id = 'arp';
     const name = 'ARP Table';
 
@@ -1249,7 +1714,7 @@ export class TroubleshootService {
     return { id, name, status: 'pass', detail: `${arpLines.length} ARP entry/entries`, raw: cmd.output };
   }
 
-  private async checkDefaultRoute(): Promise<CheckResult> {
+  async checkDefaultRoute(): Promise<CheckResult> {
     const id = 'default-route';
     const name = 'Default Gateway';
 
@@ -1272,7 +1737,7 @@ export class TroubleshootService {
     return { id, name, status: 'pass', detail: `Default route via ${nextHop}`, raw: cmd.output };
   }
 
-  private async checkDnsConfig(): Promise<CheckResult> {
+  async checkDnsConfig(): Promise<CheckResult> {
     const id = 'dns-config';
     const name = 'DNS Configuration';
     const allOutputs: string[] = [];
@@ -1338,7 +1803,7 @@ export class TroubleshootService {
     return { id, name, status: 'pass', detail: `DNS servers: ${servers.join(', ')}`, raw };
   }
 
-  private async checkDnsResolution(cloud: MistCloud): Promise<CheckResult> {
+  async checkDnsResolution(cloud: MistCloud): Promise<CheckResult> {
     const id = 'dns-resolution';
     const name = 'DNS Resolution & Reachability';
 
@@ -1389,7 +1854,7 @@ export class TroubleshootService {
     return { id, name, status: 'warn', detail: `Uncertain result for ${testHost}`, raw: cmd.output };
   }
 
-  private async checkRouteToMistEndpoints(cloud: MistCloud): Promise<CheckResult> {
+  async checkRouteToMistEndpoints(cloud: MistCloud): Promise<CheckResult> {
     const id = 'route-to-mist';
     const name = 'Route to Mist Endpoints';
 
@@ -1434,7 +1899,7 @@ export class TroubleshootService {
     return { id, name, status: 'pass', detail: `Route to ${testIp} (${testHost})${nhDetail}`, raw: routeCmd.output };
   }
 
-  private async checkTraceroute(endpoint: MistEndpoint): Promise<CheckResult> {
+  async checkTraceroute(endpoint: MistEndpoint): Promise<CheckResult> {
     const id = `trace-${endpoint.host.replace(/\./g, '-')}`;
     const name = `Traceroute ${endpoint.host}`;
 
@@ -1472,13 +1937,13 @@ export class TroubleshootService {
     return { id, name, status: 'info' as CheckStatus, detail, raw: cmd.output };
   }
 
-  private async checkSslCertificate(endpoint: MistEndpoint): Promise<CheckResult> {
+  /**
+   * Run a curl-based SSL certificate check from shell mode.
+   * Caller is responsible for entering and exiting shell.
+   */
+  private async checkSslCertificateInShell(endpoint: MistEndpoint): Promise<CheckResult> {
     const id = `cert-${endpoint.host.replace(/\./g, '-')}`;
     const name = `SSL Cert: ${endpoint.host}`;
-
-    // Enter shell mode (Junos drops to csh)
-    await this.runner.send('start shell\n');
-    await new Promise((r) => setTimeout(r, 2000));
 
     // csh doesn't support 2>&1 or > redirect properly
     // Wrap in /bin/sh -c to get proper shell redirects
@@ -1495,12 +1960,6 @@ export class TroubleshootService {
     // Clean up
     await this.runner.execute('rm -f /tmp/certcheck.txt', 5000, 1000);
 
-    // Exit shell back to Junos CLI
-    await this.runner.send('exit\n');
-    await new Promise((r) => setTimeout(r, 1000));
-    await this.runner.send('cli\n');
-    await new Promise((r) => setTimeout(r, 1500));
-
     if (!output || output.includes('command not found') || output.includes('No such file')) {
       return { id, name, status: 'warn', detail: 'curl not available on this switch', raw: output };
     }
@@ -1509,24 +1968,33 @@ export class TroubleshootService {
       return { id, name, status: 'skip', detail: 'Connection refused — host not accepting HTTPS', raw: output };
     }
 
-    // Check if we got cert info before any timeout
-    // curl may timeout on SSL handshake but still show partial TLS info
     const hasIssuer = /issuer\s*[=:]/i.test(output);
     if (hasIssuer) {
       return this.parseSslCertOutput(id, name, endpoint.host, output);
     }
 
-    // SSL connection timeout — connected but TLS handshake didn't complete
     if (output.includes('SSL connection timeout') || output.includes('SSL handshake timeout')) {
       return { id, name, status: 'warn', detail: 'Connected but TLS handshake timed out — unable to inspect certificate', raw: output };
     }
 
-    // General connect timeout — couldn't reach the host at all
     if (output.includes('timed out') || output.includes('connect timeout')) {
       return { id, name, status: 'skip', detail: 'Connection timed out — host unreachable on port 443', raw: output };
     }
 
     return this.parseSslCertOutput(id, name, endpoint.host, output);
+  }
+
+  async checkSslCertificate(endpoint: MistEndpoint): Promise<CheckResult> {
+    // Enter shell mode for curl
+    await this.runner.send('start shell\n');
+    await new Promise((r) => setTimeout(r, 2000));
+
+    const result = await this.checkSslCertificateInShell(endpoint);
+
+    // Return to operational mode
+    await this.runner.ensureOperationalMode();
+
+    return result;
   }
 
   private parseSslCertOutput(id: string, name: string, host: string, output: string): CheckResult {
@@ -1595,7 +2063,7 @@ export class TroubleshootService {
     };
   }
 
-  private async checkEndpointReachability(endpoint: MistEndpoint): Promise<CheckResult> {
+  async checkEndpointReachability(endpoint: MistEndpoint): Promise<CheckResult> {
     const id = `reach-${endpoint.host.replace(/\./g, '-')}`;
     const name = `${endpoint.host}:${endpoint.port}`;
 
@@ -1673,7 +2141,70 @@ export class TroubleshootService {
 
   // ---- Mist Cloud Status checks ----
 
-  private async checkMistAgentVersion(): Promise<CheckResult> {
+  async checkJunosVersion(): Promise<CheckResult> {
+    const id = 'junos-version';
+    const name = 'Junos Version';
+
+    // Try the targeted match first; fall back to full output if empty
+    let output = '';
+    const targeted = await this.runner.execute('show version | match "Junos:"', 15000);
+    if (targeted.success && targeted.output.trim().length > 0) {
+      output = targeted.output;
+    } else {
+      const full = await this.runner.execute('show version', 15000);
+      if (!full.success) {
+        return { id, name, status: 'warn', detail: 'Could not determine Junos version', raw: full.output };
+      }
+      output = full.output;
+    }
+
+    return this.parseJunosVersionResult(output, id, name);
+  }
+
+  private parseJunosVersionResult(output: string, id: string, name: string): CheckResult {
+    // Junos version format examples: 21.4R3.15, 18.2R3-S1.4, 20.4R3.8
+    const m = output.match(/(\d{2})\.(\d+)[A-Z](\d+)/i);
+    if (!m) {
+      return { id, name, status: 'warn', detail: 'Could not parse Junos version from output', raw: output };
+    }
+
+    const major = parseInt(m[1]);
+    const minor = parseInt(m[2]);
+    const release = parseInt(m[3]);
+
+    // Extract full version string for display (e.g. "21.4R3-S4.3")
+    const fullMatch = output.match(/(\d+\.\d+[A-Z]\d+[\w.-]*)/i);
+    const displayVersion = fullMatch ? fullMatch[1] : `${major}.${minor}R${release}`;
+
+    // Minimum: 18.2R3 (Mist Agent support baseline)
+    const meetsMinimum =
+      major > 18 ||
+      (major === 18 && minor > 2) ||
+      (major === 18 && minor === 2 && release >= 3);
+
+    // Recommended: 20.4+ (full Mist feature support)
+    const meetsRecommended = major > 20 || (major === 20 && minor >= 4);
+
+    if (!meetsMinimum) {
+      return {
+        id, name, status: 'fail',
+        detail: `Junos ${displayVersion} — below minimum supported version (18.2R3). Mist Agent requires Junos 18.2R3 or later.`,
+        raw: output,
+      };
+    }
+
+    if (!meetsRecommended) {
+      return {
+        id, name, status: 'warn',
+        detail: `Junos ${displayVersion} — supported but upgrade to 20.4 or later is recommended for full Mist feature support.`,
+        raw: output,
+      };
+    }
+
+    return { id, name, status: 'pass', detail: `Junos ${displayVersion}`, raw: output };
+  }
+
+  async checkMistAgentVersion(): Promise<CheckResult> {
     const id = 'mist-agent';
     const name = 'Mist Agent Version';
 
@@ -1696,7 +2227,7 @@ export class TroubleshootService {
     return { id, name, status: 'pass', detail: cmd.output.trim(), raw: cmd.output };
   }
 
-  private async checkMistAgentProcesses(): Promise<CheckResult> {
+  async checkMistAgentProcesses(): Promise<CheckResult> {
     const id = 'mist-processes';
     const name = 'Mist Agent Processes';
 
@@ -1745,7 +2276,7 @@ export class TroubleshootService {
     return { id, name, status: 'fail', detail: 'Neither mcd nor jmd processes found — Mist agent may not be running', raw: output };
   }
 
-  private async checkOutboundSshConfig(): Promise<{ result: CheckResult; port: string | null }> {
+  async checkOutboundSshConfig(): Promise<{ result: CheckResult; port: string | null }> {
     const id = 'outbound-ssh-config';
     const name = 'Outbound SSH Config';
 
@@ -1809,7 +2340,7 @@ export class TroubleshootService {
     };
   }
 
-  private async checkActiveCloudConnections(mgmtIp: string | null, cloud?: MistCloud | null): Promise<CheckResult> {
+  async checkActiveCloudConnections(mgmtIp: string | null, cloud?: MistCloud | null): Promise<CheckResult> {
     const id = 'cloud-connections';
     const name = 'Active Cloud Connections';
 
@@ -2165,8 +2696,8 @@ export class TroubleshootService {
     const results: CheckResult[] = [];
 
     // Pull a large window of both log files
-    const mistLogCmd = await this.runner.execute('show log mist_agent.log | last 200', 30000, 5000);
-    const sysLogCmd = await this.runner.execute('show log messages | last 200', 30000, 5000);
+    const mistLogCmd = await this.runner.execute('show log mist_agent.log | last 20', 30000, 5000);
+    const sysLogCmd = await this.runner.execute('show log messages | last 20', 30000, 5000);
 
     const mistLogLines = mistLogCmd.success ? mistLogCmd.output.split('\n').filter((l) => l.trim().length > 0) : [];
     const sysLogLines = sysLogCmd.success ? sysLogCmd.output.split('\n').filter((l) => l.trim().length > 0) : [];
@@ -2386,6 +2917,25 @@ export class TroubleshootService {
         return { text };
       }
 
+      case 'stp-status': {
+        if (result.detail.includes('BPDU error')) {
+          return {
+            text: 'The upstream port error-disabled due to BPDU Guard (STP Edge). Fix the upstream port profile first (see stp-upstream-edge result), then re-enable the upstream port.',
+          };
+        }
+        if (result.status === 'fail') {
+          return {
+            text: 'Port is STP blocked. Check for loops, verify bridge priorities, and confirm the upstream port is not configured as STP Edge.',
+          };
+        }
+        return {};
+      }
+
+      case 'stp-upstream-edge':
+        return {
+          text: 'The upstream port usage profile has stp_edge: true, which will error-disable the port when it receives BPDUs from this switch.\n\nChange the upstream port usage profile in Mist to set stp_edge: false. STP Edge is only for end-device (access) ports, not trunk ports connecting to other switches.',
+        };
+
       case 'mgmt-ip': {
         const dhcpDtl = detail('dhcp-lease').toLowerCase();
         const isDhcp = dhcpDtl.includes('dhcp') || dhcpDtl.includes('0.0.0.0');
@@ -2462,8 +3012,11 @@ export class TroubleshootService {
         return { text: 'Mist Agent not installed. Use the "Adopt Switch" button.' };
 
       case 'mist-processes': {
-        if (failed('mist-agent-version')) return { text: 'Mist Agent not installed — adopt the switch first.' };
-        return { text: 'Mist agent processes not running. Restarting.', commands: ['restart mcd'] };
+        if (failed('mist-agent-version')) return { text: 'Mist Agent not installed.\n\nOption 1 — Adopt via console:\nUse the Adopt Switch button to fetch and apply adoption commands from Mist.\n\nOption 2 — Claim in Mist portal:\nGo to Organization → Inventory → Add Devices and enter the claim code from the switch label.' };
+        return {
+          text: 'Mist agent processes (mcd/jmd) are not running.\n\nOption 1 — Restart mcd:\nAttempts to restart the Mist cloud daemon. This fixes most cases where the agent has stopped unexpectedly.\n\nOption 2 — Re-adopt the switch:\nIf restarting mcd does not resolve the issue, re-applying the adoption commands will reconfigure the agent from scratch.',
+          commands: ['restart mcd'],
+        };
       }
 
       case 'outbound-ssh-config': {
@@ -2488,6 +3041,22 @@ export class TroubleshootService {
           text: 'No connections. Trying deactivate/reactivate outbound SSH.',
           commands: ['deactivate system services outbound-ssh client mist', 'activate system services outbound-ssh client mist'],
         };
+      }
+
+      case 'junos-version': {
+        const isBelow20 = result.status === 'warn';
+        const isBelowMin = result.status === 'fail';
+        if (isBelowMin) {
+          return {
+            text: 'This Junos version is below the minimum required for Mist Agent support (18.2R3).\n\n1. Download a supported Junos image (18.2R3 or later) from support.juniper.net\n2. Copy the image to the switch:\n   request system software add <package-path>\n3. Reboot to complete the upgrade:\n   request system reboot',
+          };
+        }
+        if (isBelow20) {
+          return {
+            text: 'Upgrade to Junos 20.4 or later is recommended for full Mist feature support and current security patches.\n\n1. Download a Junos 20.4+ image from support.juniper.net\n2. Copy the image to the switch:\n   request system software add <package-path>\n3. Reboot to complete the upgrade:\n   request system reboot',
+          };
+        }
+        return {};
       }
 
       default:

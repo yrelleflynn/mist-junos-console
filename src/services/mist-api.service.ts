@@ -15,6 +15,26 @@ export interface MistSiteSettings {
   switch_mgmt?: {
     root_password?: string;
   };
+  networktemplate_id?: string;
+  sitegroup_ids?: string[];
+}
+
+export interface MistSiteGroup {
+  id: string;
+  name?: string;
+  networktemplate_id?: string;
+  site_ids?: string[];
+}
+
+export interface MistNetworkTemplate {
+  id: string;
+  name?: string;
+  root_password?: string;
+  switch_mgmt?: {
+    root_password?: string;
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  [key: string]: any;
 }
 
 export interface MistInventoryDevice {
@@ -122,10 +142,35 @@ export class MistApiService {
   }
 
   /**
-   * Fetch site settings, including switch_mgmt.root_password.
+   * Fetch site settings (local overrides only).
    */
   async getSiteSettings(siteId: string): Promise<MistSiteSettings> {
     return this.get<MistSiteSettings>(`/api/v1/sites/${siteId}/setting`);
+  }
+
+  /**
+   * Fetch derived site settings — the effective merged config including
+   * settings inherited from site groups and org level.
+   * Use this to reliably find networktemplate_id even when assigned via a site group.
+   */
+  async getSiteDerivedSettings(siteId: string): Promise<MistSiteSettings> {
+    return this.get<MistSiteSettings>(`/api/v1/sites/${siteId}/setting/derived`);
+  }
+
+  /**
+   * Fetch a network (switch) template by ID.
+   * Throws on API error so callers can surface the failure reason.
+   */
+  async getNetworkTemplate(templateId: string): Promise<MistNetworkTemplate> {
+    return this.get<MistNetworkTemplate>(`/api/v1/orgs/${this.orgId}/networktemplates/${templateId}`);
+  }
+
+  /**
+   * Fetch all site groups for the org.
+   * Used to find network templates assigned at the site-group level.
+   */
+  async getOrgSiteGroups(): Promise<MistSiteGroup[]> {
+    return this.get<MistSiteGroup[]>(`/api/v1/orgs/${this.orgId}/sitegroups`);
   }
 
   /**
@@ -211,6 +256,18 @@ export class MistApiService {
   }
 
   /**
+   * Assign a device (by MAC) to a site in the org inventory.
+   */
+  async assignDeviceToSite(mac: string, siteId: string): Promise<void> {
+    await this.put(`/api/v1/orgs/${this.orgId}/inventory`, {
+      op: 'assign',
+      site_id: siteId,
+      macs: [mac],
+      managed: true,
+    });
+  }
+
+  /**
    * Fetch the switch adoption CLI commands for this org.
    * Returns the raw 'set' commands string that can be pasted into the switch console.
    */
@@ -261,6 +318,50 @@ export class MistApiService {
   }
 
   /**
+   * Fetch the rendered CLI configuration for a managed switch.
+   * Endpoint: GET /api/v1/sites/{site_id}/devices/{device_id}/config_cmd
+   * Returns the Junos "set" commands Mist would push to the device.
+   */
+  async getDeviceConfigCmd(siteId: string, deviceId: string): Promise<string> {
+    try {
+      const data = await this.get<{ cmd?: string; config?: string } | string>(
+        `/api/v1/sites/${siteId}/devices/${deviceId}/config_cmd`,
+      );
+      if (typeof data === 'string') return data;
+      if (data && typeof data === 'object') {
+        if ('cmd' in data && typeof data.cmd === 'string') return data.cmd;
+        if ('config' in data && typeof data.config === 'string') return data.config;
+        // Last resort — return first string value found
+        for (const val of Object.values(data)) {
+          if (typeof val === 'string' && val.length > 0) return val;
+        }
+      }
+      return '';
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Fetch per-port stats for a switch using the org-level port search endpoint.
+   * Returns an array of port stat objects, each containing port_id and stp_state.
+   * Endpoint: GET /api/v1/orgs/{org_id}/stats/ports/search?site_id={site_id}&mac={switch_mac}
+   */
+  async getPortStats(siteId: string, switchMac: string): Promise<MistPortStat[]> {
+    try {
+      const mac = switchMac.toLowerCase().replace(/[:-]/g, '');
+      const data = await this.get<{ results?: MistPortStat[] } | MistPortStat[]>(
+        `/api/v1/orgs/${this.orgId}/stats/ports/search?site_id=${siteId}&mac=${mac}`,
+      );
+      if (Array.isArray(data)) return data;
+      if (data && 'results' in data && Array.isArray(data.results)) return data.results;
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * Fetch org-level audit logs.
    * Optionally filter by time range (Unix timestamps in seconds).
    */
@@ -292,6 +393,19 @@ export interface MistDeviceStats {
   last_seen?: number;
   status?: string;
   uptime?: number;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  [key: string]: any;
+}
+
+export interface MistPortStat {
+  port_id: string;
+  stp_state?: string;
+  up?: boolean;
+  port_disabled?: boolean;
+  rx_bytes?: number;
+  tx_bytes?: number;
+  mac?: string;
+  site_id?: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   [key: string]: any;
 }
