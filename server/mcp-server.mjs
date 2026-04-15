@@ -1,19 +1,37 @@
 /**
- * mcp-server.mjs — MCP stdio server for Junos console + Mist API
+ * mcp-server.mjs — MCP server for Junos console + Mist API
  *
- * Usage:
+ * Stdio mode (default — for Claude Desktop on the same machine):
  *   MIST_API_HOST=api.mist.com MIST_API_TOKEN=xxx MIST_ORG_ID=xxx \
  *   node server/mcp-server.mjs <session-id>
  *
- * The server connects to the WebSocket hub as a "support" client to
- * read/write the operator's console session, and makes direct HTTPS
- * calls to the Mist API using the provided credentials.
+ * HTTP mode (for Claude Desktop on a different machine on the LAN):
+ *   MIST_API_HOST=api.mist.com MIST_API_TOKEN=xxx MIST_ORG_ID=xxx \
+ *   MCP_TRANSPORT=http MCP_PORT=3334 \
+ *   node server/mcp-server.mjs <session-id>
+ *
+ *   Then in Claude Desktop on the remote machine:
+ *   { "mcpServers": { "junos-console": { "url": "http://10.100.100.x:3334/mcp" } } }
+ *
+ * Environment variables:
+ *   MCP_TRANSPORT    "stdio" (default) or "http"
+ *   MCP_PORT         HTTP listen port (default 3334)
+ *   MCP_HOST         HTTP bind address (default 0.0.0.0)
+ *   MCP_ALLOW_CIDR   Allowed source subnet (default 10.100.100.0/24); localhost always allowed
+ *   WS_URL           WebSocket hub URL (default ws://127.0.0.1:3333/ws)
+ *   MCP_SESSION_ID   Alternative to positional session-id argument
+ *   MIST_API_HOST    e.g. api.mist.com
+ *   MIST_API_TOKEN   Mist API token
+ *   MIST_ORG_ID      Mist organisation ID
  */
 
+import http from 'node:http';
 import https from 'node:https';
+import { randomUUID } from 'node:crypto';
 import { WebSocket } from 'ws';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -21,12 +39,50 @@ import {
 
 // ── Configuration ──────────────────────────────────────────────────────────
 
-const SESSION_ID = process.argv[2] || process.env.MCP_SESSION_ID || '';
+const USE_HTTP = process.env.MCP_TRANSPORT === 'http' || process.argv.includes('--http');
+const MCP_PORT = Number(process.env.MCP_PORT || 3334);
+const MCP_HOST = process.env.MCP_HOST || '0.0.0.0';
+const MCP_ALLOW_CIDR = process.env.MCP_ALLOW_CIDR || '10.100.100.0/24';
+
+// Session ID: skip '--http' if it appears as first positional arg
+const _args = process.argv.slice(2).filter((a) => a !== '--http');
+const SESSION_ID = _args[0] || process.env.MCP_SESSION_ID || '';
 const WS_URL = process.env.WS_URL || 'ws://127.0.0.1:3333/ws';
 
 const MIST_API_HOST = process.env.MIST_API_HOST || '';
 const MIST_API_TOKEN = process.env.MIST_API_TOKEN || '';
 const MIST_ORG_ID = process.env.MIST_ORG_ID || '';
+
+// ── IP allowlist ───────────────────────────────────────────────────────────
+
+/** Convert dotted-decimal IPv4 to a 32-bit unsigned integer. */
+function ipToU32(ip) {
+  return ip.split('.').reduce((acc, octet) => ((acc << 8) | (parseInt(octet, 10) & 0xff)) >>> 0, 0);
+}
+
+/** Return true if `ip` is within the `cidr` subnet (e.g. "10.100.100.0/24"). */
+function inSubnet(ip, cidr) {
+  const [subnetIp, prefixStr] = cidr.split('/');
+  const prefix = parseInt(prefixStr, 10);
+  const mask = prefix === 0 ? 0 : (~0 << (32 - prefix)) >>> 0;
+  return (ipToU32(ip) & mask) === (ipToU32(subnetIp) & mask);
+}
+
+/**
+ * Return true if the remote address should be allowed.
+ * Accepts raw remoteAddress strings which may include IPv6-mapped IPv4
+ * (e.g. "::ffff:10.100.100.5").
+ */
+function isAllowedIp(remoteAddress) {
+  if (!remoteAddress) return false;
+  // Strip IPv6-mapped prefix
+  const raw = remoteAddress.replace(/^::ffff:/, '');
+  // Always allow loopback
+  if (raw === '127.0.0.1' || raw === '::1' || raw === 'localhost') return true;
+  // Validate it looks like an IPv4 address before subnet check
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(raw)) return false;
+  return inSubnet(raw, MCP_ALLOW_CIDR);
+}
 
 // ── ANSI stripping ─────────────────────────────────────────────────────────
 
@@ -45,10 +101,8 @@ let rawTail = ''; // partial last line accumulator
 
 function pushToBuffer(text) {
   const clean = stripAnsi(text);
-  // Merge with any prior partial line
   const combined = rawTail + clean;
   const lines = combined.split('\n');
-  // Last element may be a partial line (no trailing \n yet)
   rawTail = lines.pop() ?? '';
   for (const line of lines) {
     outputBuffer.push(line);
@@ -58,7 +112,6 @@ function pushToBuffer(text) {
 
 // ── Junos prompt detection ─────────────────────────────────────────────────
 
-// Matches: "user@host> ", "user@host# ", "%  " (shell), "login: "
 const PROMPT_RE = /[>%#]\s*$|login:\s*$/m;
 
 function detectMode(text) {
@@ -84,11 +137,7 @@ const WARNED_COMMANDS = [
   /^\s*rollback\b/i,
 ];
 
-/**
- * Returns { blocked: true, reason } or { warned: true, warning } or {}
- */
 function checkCommandSafety(command) {
-  // Special case: allow "request system reboot" only when force flag set
   if (/^\s*request\s+system\s+reboot\b/i.test(command)) {
     return {
       blocked: true,
@@ -114,7 +163,7 @@ let ws = null;
 let wsReady = false;
 let wsError = null;
 
-/** Pending send_command resolver: { resolve, reject, collector, timer } | null */
+/** @type {{ resolve: Function, collector: string[], timer: ReturnType<typeof setTimeout> } | null} */
 let pendingCommand = null;
 
 function connectWs() {
@@ -154,7 +203,6 @@ function connectWs() {
         clearTimeout(timeout);
         wsError = msg.message || 'WebSocket error';
         if (!wsReady) { reject(new Error(wsError)); return; }
-        // Post-join error: log it
         console.error('[mcp] ws error:', wsError);
         return;
       }
@@ -167,7 +215,7 @@ function connectWs() {
           const { resolve: res, collector, timer } = pendingCommand;
           clearTimeout(timer);
           pendingCommand = null;
-          res({ output: collector.join(''), prompt_detected: false });
+          res({ output: stripAnsi(collector.join('')), prompt_detected: false });
         }
         return;
       }
@@ -252,9 +300,8 @@ function mistRequest(method, path, body) {
 // ── Tool implementations ───────────────────────────────────────────────────
 
 async function toolSendCommand({ command, timeout_ms = 15000, force = false }) {
-  // Safety check — allow force-reboot override
   if (/^\s*request\s+system\s+reboot\b/i.test(command) && force) {
-    // fall through
+    // force-reboot: skip safety check, fall through
   } else {
     const safety = checkCommandSafety(command);
     if (safety.blocked) {
@@ -264,7 +311,6 @@ async function toolSendCommand({ command, timeout_ms = 15000, force = false }) {
       return { isError: true, content: [{ type: 'text', text: wsError || 'Not connected to console session.' }] };
     }
     if (safety.warned) {
-      // Proceed but we'll prepend the warning to output
       const result = await runCommand(command, timeout_ms);
       return {
         content: [{
@@ -286,7 +332,6 @@ async function toolSendCommand({ command, timeout_ms = 15000, force = false }) {
 function runCommand(command, timeout_ms) {
   return new Promise((resolve) => {
     if (pendingCommand) {
-      // Shouldn't happen in serial MCP usage, but be safe
       resolve({ output: '', prompt_detected: false, error: 'Another command is already in flight' });
       return;
     }
@@ -309,10 +354,7 @@ function runCommand(command, timeout_ms) {
 }
 
 async function toolReadOutput({ lines = 50 }) {
-  // Flush any partial line into buffer snapshot
-  const snapshot = rawTail
-    ? [...outputBuffer, rawTail]
-    : [...outputBuffer];
+  const snapshot = rawTail ? [...outputBuffer, rawTail] : [...outputBuffer];
   const slice = snapshot.slice(-lines);
   return {
     content: [{
@@ -326,7 +368,6 @@ async function toolGetSessionState() {
   if (!ws || !wsReady) {
     return { isError: true, content: [{ type: 'text', text: wsError || 'Not connected to console session.' }] };
   }
-
   const result = await runCommand('', 5000);
   const mode = detectMode(result.output);
   return { content: [{ type: 'text', text: JSON.stringify({ mode }) }] };
@@ -468,10 +509,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        path: {
-          type: 'string',
-          description: 'API path, e.g. /api/v1/orgs/{org_id}/sites',
-        },
+        path: { type: 'string', description: 'API path, e.g. /api/v1/orgs/{org_id}/sites' },
       },
       required: ['path'],
     },
@@ -543,42 +581,166 @@ const TOOLS = [
   },
 ];
 
-// ── MCP server wiring ──────────────────────────────────────────────────────
+// ── MCP Server factory ─────────────────────────────────────────────────────
 
-const server = new Server(
-  { name: 'junos-console', version: '1.0.0' },
-  { capabilities: { tools: {} } }
-);
+function createMcpServer() {
+  const s = new Server(
+    { name: 'junos-console', version: '1.0.0' },
+    { capabilities: { tools: {} } },
+  );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+  s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  const input = args ?? {};
+  s.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const input = args ?? {};
 
-  switch (name) {
-    case 'send_command':     return toolSendCommand(input);
-    case 'read_output':      return toolReadOutput(input);
-    case 'get_session_state': return toolGetSessionState();
-    case 'mist_api_get':     return toolMistApiGet(input);
-    case 'mist_api_put':     return toolMistApiPut(input);
-    case 'list_sites':       return toolListSites();
-    case 'get_device_config': return toolGetDeviceConfig(input);
-    case 'get_device_stats': return toolGetDeviceStats(input);
-    case 'get_inventory':    return toolGetInventory(input);
-    case 'get_site_setting': return toolGetSiteSetting(input);
-    default:
-      return {
-        isError: true,
-        content: [{ type: 'text', text: `Unknown tool: ${name}` }],
+    switch (name) {
+      case 'send_command':      return toolSendCommand(input);
+      case 'read_output':       return toolReadOutput(input);
+      case 'get_session_state': return toolGetSessionState();
+      case 'mist_api_get':      return toolMistApiGet(input);
+      case 'mist_api_put':      return toolMistApiPut(input);
+      case 'list_sites':        return toolListSites();
+      case 'get_device_config': return toolGetDeviceConfig(input);
+      case 'get_device_stats':  return toolGetDeviceStats(input);
+      case 'get_inventory':     return toolGetInventory(input);
+      case 'get_site_setting':  return toolGetSiteSetting(input);
+      default:
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `Unknown tool: ${name}` }],
+        };
+    }
+  });
+
+  return s;
+}
+
+// ── Body parser helper ─────────────────────────────────────────────────────
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', (chunk) => { raw += chunk.toString(); });
+    req.on('end', () => {
+      if (!raw) { resolve(undefined); return; }
+      try { resolve(JSON.parse(raw)); } catch { resolve(raw); }
+    });
+    req.on('error', reject);
+  });
+}
+
+// ── Transport: stdio ───────────────────────────────────────────────────────
+
+async function startStdio() {
+  const s = createMcpServer();
+  const transport = new StdioServerTransport();
+  await s.connect(transport);
+  console.error('[mcp] MCP server running on stdio');
+}
+
+// ── Transport: HTTP (Streamable HTTP — MCP 2025-03-26 spec) ───────────────
+
+/**
+ * In stateful HTTP mode each MCP client session gets its own transport.
+ * The session ID is negotiated in headers (mcp-session-id).
+ * All sessions share the same WebSocket console connection and tool implementations.
+ *
+ * @type {Map<string, { transport: StreamableHTTPServerTransport, server: Server }>}
+ */
+const httpSessions = new Map();
+
+async function startHttp() {
+  const httpServer = http.createServer(async (req, res) => {
+    // ── IP allowlist ──
+    const remoteIp = req.socket.remoteAddress || '';
+    if (!isAllowedIp(remoteIp)) {
+      console.error(`[mcp] Rejected connection from ${remoteIp}`);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Forbidden: source IP not in allowed range.' }));
+      return;
+    }
+
+    // ── Health check ──
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        transport: 'http',
+        wsReady,
+        sessionId: SESSION_ID || null,
+        activeMcpSessions: httpSessions.size,
+      }));
+      return;
+    }
+
+    // ── MCP endpoint ──
+    if (req.url !== '/mcp') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not found. Use POST/GET /mcp.' }));
+      return;
+    }
+
+    // Route to existing session or create new one
+    const sessionId = req.headers['mcp-session-id'];
+    let entry = typeof sessionId === 'string' ? httpSessions.get(sessionId) : undefined;
+
+    if (!entry) {
+      // New MCP client session
+      let assignedId;
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => {
+          assignedId = randomUUID();
+          return assignedId;
+        },
+      });
+      const s = createMcpServer();
+      await s.connect(transport);
+
+      transport.onclose = () => {
+        if (assignedId) {
+          httpSessions.delete(assignedId);
+          console.error(`[mcp] HTTP session closed: ${assignedId} (${httpSessions.size} remaining)`);
+        }
       };
-  }
-});
+
+      // Register before handleRequest so the onclose above can find it
+      // assignedId is set synchronously inside sessionIdGenerator during handleRequest
+      entry = { transport, server: s };
+    }
+
+    try {
+      const body = await readBody(req);
+      await entry.transport.handleRequest(req, res, body);
+
+      // After the first handleRequest the transport has a sessionId — store it
+      const tid = entry.transport.sessionId;
+      if (tid && !httpSessions.has(tid)) {
+        httpSessions.set(tid, entry);
+        console.error(`[mcp] New HTTP session: ${tid} from ${remoteIp} (${httpSessions.size} total)`);
+      }
+    } catch (err) {
+      console.error('[mcp] HTTP request error:', err.message);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }
+  });
+
+  httpServer.listen(MCP_PORT, MCP_HOST, () => {
+    console.error(`[mcp] HTTP MCP server listening on ${MCP_HOST}:${MCP_PORT}`);
+    console.error(`[mcp]   Endpoint : http://<host>:${MCP_PORT}/mcp`);
+    console.error(`[mcp]   Health   : http://<host>:${MCP_PORT}/health`);
+    console.error(`[mcp]   Allowed  : 127.0.0.1 + ${MCP_ALLOW_CIDR}`);
+  });
+}
 
 // ── Startup ────────────────────────────────────────────────────────────────
 
 async function main() {
-  // Connect to console session (non-fatal if no session ID — API-only usage)
+  // Connect to console session (non-fatal — API-only usage still works)
   if (SESSION_ID) {
     try {
       await connectWs();
@@ -588,13 +750,15 @@ async function main() {
       wsError = err.message;
     }
   } else {
-    wsError = 'No session ID provided — console tools disabled. Pass session ID as first argument.';
+    wsError = 'No session ID provided — console tools disabled. Pass session ID as first argument or set MCP_SESSION_ID.';
     console.error('[mcp]', wsError);
   }
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error('[mcp] MCP server running on stdio');
+  if (USE_HTTP) {
+    await startHttp();
+  } else {
+    await startStdio();
+  }
 }
 
 main().catch((err) => {
