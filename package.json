@@ -12,7 +12,7 @@
     "preview": "vite preview",
     "start:server": "node server/index.mjs",
     "mcp": "node server/mcp-server.mjs",
-    "mcp:http": "MCP_TRANSPORT=http node server/mcp-server.mjs"
+    "mcp:http": "node server/mcp-server.mjs --http"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
