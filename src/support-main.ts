@@ -50,9 +50,9 @@ btnConnect.addEventListener('click', () => {
   session.onRemoteSerialRx = (data: Uint8Array) => {
     term.write(data);
   };
-  session.onRemoteOperatorTx = (data: Uint8Array) => {
-    term.write(data);
-  };
+  // onRemoteOperatorTx is intentionally not written to the terminal here.
+  // The Junos console echoes all typed characters back as RX data, so
+  // mirroring TX as well would cause every character to appear twice.
   session.onSessionEnded = (reason: string) => {
     setStatus(`Session ended: ${reason}`, 'info');
   };
