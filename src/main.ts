@@ -171,17 +171,17 @@ function init(): void {
       // Network/proxy error — leave isConnected null
     }
 
-    // Always update both the pill and the header badge
+    // Always update both the status element and the header badge
     if (isConnected === true) {
-      pillEl.className = 'mist-status-pill mist-status-connected';
-      pillEl.textContent = 'Connected';
+      pillEl.className = 'identify-value identify-yes';
+      pillEl.textContent = 'Yes';
       setMistCloudBadge('online');
     } else if (isConnected === false) {
-      pillEl.className = 'mist-status-pill mist-status-disconnected';
-      pillEl.textContent = 'Disconnected';
+      pillEl.className = 'identify-value identify-no';
+      pillEl.textContent = 'No';
       setMistCloudBadge('offline');
     } else {
-      // Could not determine status (API unreachable) — don't flip to online, stay offline
+      // Could not determine status (API unreachable) — don't flip to online
       setMistCloudBadge('offline');
     }
 
@@ -1388,10 +1388,9 @@ function init(): void {
       const result = await switchIdentity.identifyAndMatch();
       lastMatchResult = result;
 
-      // Render identity info
       const { identity, mistDevice, matchedBy } = result;
-      let html = '';
 
+      // Log full detail to terminal
       const rows: [string, string | null][] = [
         ['Hostname', identity.hostname],
         ['Serial', identity.serial],
@@ -1399,70 +1398,64 @@ function init(): void {
         ['Model', identity.model],
         ['Junos', identity.junosVersion],
       ];
-
       for (const [label, value] of rows) {
-        if (value) {
-          html += `<div class="device-info-row"><span class="device-info-label">${label}</span><span class="device-info-value">${value}</span></div>`;
-          term.writeSystem(`  ${label}: ${value}`);
-        }
+        if (value) term.writeSystem(`  ${label}: ${value}`);
       }
 
-      // Mist match result
+      // Derive the three simplified status values
+      const inInventory = !!mistDevice;
+
+      let siteName: string | null = null;
+      if (mistDevice?.site_id) {
+        // Use the site name if it's available in the Mist API service, otherwise fall back to ID
+        siteName = (mistApi as any).getSiteName?.(mistDevice.site_id) ?? mistDevice.site_id;
+      }
+
+      const cloudReachable = result.mistCloudReachableHint === true;
+      const cloudDisconnected =
+        !cloudReachable &&
+        (result.mistInventoryConnected === false ||
+          (result.mistStatsStatus != null &&
+            /disconnect|offline|unreachable|down|lost/i.test(result.mistStatsStatus)));
+      const onlineLabel = cloudReachable ? 'Yes' : cloudDisconnected ? 'No' : 'Unknown';
+      const onlineClass = cloudReachable ? 'identify-yes' : cloudDisconnected ? 'identify-no' : 'identify-unknown';
+
+      const pillClass = cloudReachable
+        ? 'mist-status-pill mist-status-connected'
+        : cloudDisconnected
+          ? 'mist-status-pill mist-status-disconnected'
+          : 'mist-status-pill mist-status-unknown';
+
+      term.writeSystem(`  Mist: ${inInventory ? `Found (${matchedBy}) — ${mistDevice!.name || mistDevice!.id}` : !mistApi.isConfigured ? 'API not configured' : 'Not found in inventory'}`);
+      term.writeSystem(`  Site: ${siteName ?? (inInventory ? 'Unassigned' : '—')}`);
+      term.writeSystem(`  Online: ${onlineLabel}`);
+
+      // Simplified three-row output panel
+      let html = `
+        <div class="identify-row">
+          <span class="identify-label">In Inventory?</span>
+          <span class="identify-value ${inInventory ? 'identify-yes' : 'identify-no'}">${inInventory ? 'Yes' : 'No'}</span>
+        </div>
+        <div class="identify-row">
+          <span class="identify-label">Assigned to Site:</span>
+          <span class="identify-value ${siteName ? '' : 'identify-no'}">${siteName ?? 'No'}</span>
+        </div>
+        <div class="identify-row">
+          <span class="identify-label">Device Online:</span>
+          <span id="mist-status-pill" class="identify-value ${onlineClass} ${pillClass}">${onlineLabel}</span>
+        </div>
+        <div id="mist-poll-status" class="mist-poll-status" style="display:none;"></div>
+      `;
+
+      setMistCloudBadge(cloudReachable ? 'online' : cloudDisconnected ? 'offline' : 'offline');
+
       if (mistDevice) {
-        const siteName = mistDevice.site_id ? 'assigned' : 'unassigned';
-        html += `<div class="device-mist-match found">Found in Mist (matched by ${matchedBy}) — ${mistDevice.name || mistDevice.id}<br>Site: ${siteName}</div>`;
-        term.writeSystem(`  Mist: Found (${matchedBy}) — ${mistDevice.name || mistDevice.id}`);
-
-        const cloudReachable = result.mistCloudReachableHint === true;
-        const cloudDisconnected =
-          !cloudReachable &&
-          (result.mistInventoryConnected === false ||
-            (result.mistStatsStatus != null &&
-              /disconnect|offline|unreachable|down|lost/i.test(result.mistStatsStatus)));
-        const pillClass = cloudReachable
-          ? 'mist-status-pill mist-status-connected'
-          : cloudDisconnected
-            ? 'mist-status-pill mist-status-disconnected'
-            : 'mist-status-pill mist-status-unknown';
-        const pillLabel = cloudReachable ? 'Connected' : cloudDisconnected ? 'Disconnected' : 'Unknown';
-        html += `<div id="mist-status-pill" class="${pillClass}">${pillLabel}</div>`;
-        term.writeSystem(`  Mist cloud state: ${pillLabel}`);
-        setMistCloudBadge(cloudReachable ? 'online' : cloudDisconnected ? 'offline' : 'offline');
-
-        if (result.mistLastSeenUtcIso) {
-          html += `<div class="device-info-row"><span class="device-info-label">Last seen (UTC)</span><span id="mist-last-seen-value" class="device-info-value">${result.mistLastSeenUtcIso}</span></div>`;
-          term.writeSystem(`  Last seen (UTC): ${result.mistLastSeenUtcIso}`);
-        }
-        if (result.mistLastConfigUtcIso) {
-          html += `<div class="device-info-row"><span class="device-info-label">Last config (UTC)</span><span class="device-info-value">${result.mistLastConfigUtcIso}</span></div>`;
-          term.writeSystem(`  Last config (UTC): ${result.mistLastConfigUtcIso}`);
-        }
-
-        if (result.mistCloudStatusLine) {
-          html += `<div class="device-info-row"><span class="device-info-label">Mist cloud</span><span class="device-info-value">${result.mistCloudStatusLine}</span></div>`;
-          term.writeSystem(`  Mist cloud: ${result.mistCloudStatusLine}`);
-        }
-
-        html += `<div id="mist-poll-status" class="mist-poll-status">Polling Mist every 30s…</div>`;
-
-        if (result.mistCloudReachableHint) {
-          html +=
-            '<div class="device-mist-match found" style="margin-top:8px;border-color:var(--accent-green);">' +
-            'Mist reports this switch as <strong>reachable</strong> (inventory and/or recent stats). ' +
-            'Console troubleshooting may still be useful for local L2/DNS issues, but cloud connectivity may already be OK.</div>';
-          term.writeSystem('  Note: Mist reports switch as cloud-reachable — full cloud check may be optional.');
-        }
-
         ui.btnConfigDrift.disabled = false;
         ui.btnRootPassword.disabled = !mistDevice.site_id;
         ui.btnOfflineTimeline.disabled = !mistDevice.site_id;
       } else if (!mistApi.isConfigured) {
-        html += '<div class="device-mist-match no-api">Mist API not configured — cannot search inventory</div>';
-        term.writeSystem('  Mist: API not configured');
         setMistCloudBadge('offline');
       } else {
-        html += '<div class="device-mist-match not-found">Not found in Mist inventory</div>';
-        term.writeSystem('  Mist: Not found in inventory');
         setMistCloudBadge('offline');
       }
 

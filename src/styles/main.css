@@ -951,6 +951,49 @@ html, body {
 .ts-log-line.info { color: var(--accent-blue); }
 .ts-log-line.skip { color: var(--text-muted); }
 
+/* ---- Identify Switch Panel (always-visible, outside accordion) ---- */
+.identify-panel {
+  border-bottom: 1px solid var(--border-color);
+  padding: 10px 14px 12px;
+  background: var(--bg-secondary);
+}
+
+.identify-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.identify-result {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.identify-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  padding: 2px 0;
+}
+
+.identify-label {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.identify-value {
+  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.identify-yes  { color: #41d87b; }
+.identify-no   { color: var(--text-error); }
+.identify-unknown { color: var(--text-muted); }
+
 /* ---- Device Identity Panel ---- */
 .device-info-panel {
   margin-top: 10px;

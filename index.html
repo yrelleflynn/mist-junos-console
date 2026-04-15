@@ -17,6 +17,7 @@
         <span class="header-subtitle">Web Serial Terminal</span>
       </div>
       <div class="header-right">
+        <div id="mist-cloud-badge" class="mist-cloud-badge mist-cloud-badge-offline">Not connected to Mist</div>
         <span id="connection-badge" class="badge badge-disconnected">Disconnected</span>
       </div>
     </header>
@@ -118,6 +119,14 @@
           </div>
         </div>
 
+        <!-- Identify Switch — always visible, outside any accordion -->
+        <div class="identify-panel">
+          <div class="identify-panel-header">
+            <button id="btn-identify" class="btn btn-secondary btn-sm" disabled>Identify Switch</button>
+          </div>
+          <div id="device-identity" class="identify-result"></div>
+        </div>
+
         <!-- Terminal section -->
         <div class="accordion-section" data-section="terminal">
           <button class="accordion-trigger" data-target="terminal">
@@ -142,12 +151,6 @@
             </div>
 
             <div id="login-result"></div>
-
-            <div class="sidebar-actions" style="margin-top:8px;">
-              <button id="btn-identify" class="btn btn-secondary" disabled>Identify Switch</button>
-            </div>
-
-            <div id="device-identity" class="device-info-panel"></div>
 
             <div class="sidebar-actions" style="margin-top:8px;">
               <button id="btn-root-password" class="btn btn-secondary" disabled>Get Root Password</button>
