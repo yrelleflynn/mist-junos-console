@@ -994,6 +994,23 @@ html, body {
 .identify-no   { color: var(--text-error); }
 .identify-unknown { color: var(--text-muted); }
 
+.identify-adopt-link {
+  background: none;
+  border: none;
+  padding: 0 0 0 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent-blue);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.identify-adopt-link:hover {
+  color: var(--text-primary);
+}
+
 /* ---- Device Identity Panel ---- */
 .device-info-panel {
   margin-top: 10px;

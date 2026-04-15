@@ -1434,7 +1434,9 @@ function init(): void {
       let html = `
         <div class="identify-row">
           <span class="identify-label">In Inventory?</span>
-          <span class="identify-value ${inInventory ? 'identify-yes' : 'identify-no'}">${inInventory ? 'Yes' : 'No'}</span>
+          <span class="identify-value ${inInventory ? 'identify-yes' : 'identify-no'}">
+            ${inInventory ? 'Yes' : 'No'}${!inInventory ? ' <button class="identify-adopt-link">→ Adopt</button>' : ''}
+          </span>
         </div>
         <div class="identify-row">
           <span class="identify-label">Assigned to Site:</span>
@@ -1460,6 +1462,22 @@ function init(): void {
       }
 
       ui.deviceIdentity.innerHTML = html;
+
+      // If not in inventory, wire up the adopt shortcut link
+      const adoptLink = ui.deviceIdentity.querySelector<HTMLButtonElement>('.identify-adopt-link');
+      if (adoptLink) {
+        adoptLink.addEventListener('click', () => {
+          const trigger = document.querySelector<HTMLElement>('.accordion-trigger[data-target="device"]');
+          const content = document.getElementById('accordion-device');
+          if (trigger && content && !trigger.classList.contains('active')) {
+            trigger.classList.add('active');
+            content.classList.add('open');
+            setTimeout(() => term.fit(), 300);
+          }
+          ui.btnAdopt.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          setTimeout(() => ui.btnAdopt.focus(), 350);
+        });
+      }
 
       // Start polling Mist online status every 30s.
       // site_id can be null — inventory fallback is used for unassigned devices.
