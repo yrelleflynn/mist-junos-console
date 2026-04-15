@@ -39,9 +39,12 @@ function init(): void {
     // Connection
     btnConnect: document.getElementById('btn-connect') as HTMLButtonElement,
     btnDisconnect: document.getElementById('btn-disconnect') as HTMLButtonElement,
+    btnClearConnection: document.getElementById('btn-clear-connection') as HTMLButtonElement,
     btnClear: document.getElementById('btn-clear') as HTMLButtonElement,
     terminalContainer: document.getElementById('terminal-container') as HTMLElement,
     connectionBadge: document.getElementById('connection-badge') as HTMLElement,
+    connectionStatePill: document.getElementById('connection-state-pill') as HTMLElement,
+    selectedPort: document.getElementById('selected-port') as HTMLElement,
     baudRate: document.getElementById('baud-rate') as HTMLSelectElement,
     dataBits: document.getElementById('data-bits') as HTMLSelectElement,
     parity: document.getElementById('parity') as HTMLSelectElement,
@@ -58,6 +61,11 @@ function init(): void {
     mistOrgId: document.getElementById('mist-org-id') as HTMLInputElement,
     mistSite: document.getElementById('mist-site') as HTMLSelectElement,
     btnLoadSites: document.getElementById('btn-load-sites') as HTMLButtonElement,
+    btnOpenMistModal: document.getElementById('btn-open-mist-modal') as HTMLButtonElement,
+    btnCloseMistModal: document.getElementById('btn-close-mist-modal') as HTMLButtonElement,
+    btnCancelMistModal: document.getElementById('btn-cancel-mist-modal') as HTMLButtonElement,
+    btnSaveMistModal: document.getElementById('btn-save-mist-modal') as HTMLButtonElement,
+    mistModalOverlay: document.getElementById('mist-modal-overlay') as HTMLElement,
     mistApiStatus: document.getElementById('mist-api-status') as HTMLElement,
 
     // Troubleshooting
@@ -145,9 +153,22 @@ function init(): void {
   }
 
   // ---- UI state helpers ----
+  function formatPortLabel(port: SerialPort): string {
+    const info = port.getInfo?.();
+    const vid = typeof info?.usbVendorId === 'number'
+      ? info.usbVendorId.toString(16).padStart(4, '0')
+      : null;
+    const pid = typeof info?.usbProductId === 'number'
+      ? info.usbProductId.toString(16).padStart(4, '0')
+      : null;
+    if (vid && pid) return `USB ${vid}:${pid}`;
+    return 'Browser-selected serial port';
+  }
+
   function setConnectedState(connected: boolean): void {
     ui.btnConnect.disabled = connected;
     ui.btnDisconnect.disabled = !connected;
+    ui.btnClearConnection.disabled = !connected;
     ui.baudRate.disabled = connected;
     ui.dataBits.disabled = connected;
     ui.parity.disabled = connected;
@@ -173,18 +194,48 @@ function init(): void {
     }
 
     if (connected) {
+      ui.btnConnect.textContent = 'Reconnect';
       ui.connectionBadge.textContent = 'Connected';
       ui.connectionBadge.className = 'badge badge-connected';
+      setConnectionStatePill('connected');
       term.focus();
     } else {
+      ui.btnConnect.textContent = 'Choose Serial Port';
       ui.connectionBadge.textContent = 'Disconnected';
       ui.connectionBadge.className = 'badge badge-disconnected';
+      setConnectionStatePill('disconnected');
+      ui.selectedPort.textContent = 'Selected Port: None selected';
     }
   }
 
   function setMistStatus(text: string, type: 'success' | 'error' | 'info' = 'info'): void {
     ui.mistApiStatus.textContent = text;
     ui.mistApiStatus.className = `status-text ${type}`;
+  }
+
+  function setConnectionStatePill(state: 'connected' | 'connecting' | 'disconnected'): void {
+    if (state === 'connected') {
+      ui.connectionStatePill.textContent = 'Connected';
+      ui.connectionStatePill.className = 'connection-state-pill state-connected';
+      return;
+    }
+    if (state === 'connecting') {
+      ui.connectionStatePill.textContent = 'Connecting';
+      ui.connectionStatePill.className = 'connection-state-pill state-connecting';
+      return;
+    }
+    ui.connectionStatePill.textContent = 'Disconnected';
+    ui.connectionStatePill.className = 'connection-state-pill state-disconnected';
+  }
+
+  function openMistModal(): void {
+    ui.mistModalOverlay.classList.remove('is-hidden');
+    ui.mistModalOverlay.setAttribute('aria-hidden', 'false');
+  }
+
+  function closeMistModal(): void {
+    ui.mistModalOverlay.classList.add('is-hidden');
+    ui.mistModalOverlay.setAttribute('aria-hidden', 'true');
   }
 
   // ---- Serial events ----
@@ -254,7 +305,7 @@ function init(): void {
   // ---- Connect ----
   async function connect(): Promise<void> {
     if (!SerialService.isSupported()) {
-      term.writeError('Web Serial is not available in this browser shell. Open the app in Chrome or Edge.');
+      term.writeError('Web Serial API is not available in this browser shell. Open the app in Chrome or Edge.');
       return;
     }
 
@@ -269,9 +320,11 @@ function init(): void {
       term.writeError(`Serial picker failed: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
+    ui.selectedPort.textContent = `Selected Port: ${formatPortLabel(port)}`;
 
     ui.connectionBadge.textContent = 'Connecting…';
     ui.connectionBadge.className = 'badge badge-connecting';
+    setConnectionStatePill('connecting');
     ui.btnConnect.disabled = true;
 
     try {
@@ -1534,7 +1587,31 @@ function init(): void {
   // ---- Event listeners ----
   ui.btnConnect.addEventListener('click', connect);
   ui.btnDisconnect.addEventListener('click', disconnect);
+  ui.btnClearConnection.addEventListener('click', () => term.clear());
   ui.btnClear.addEventListener('click', () => term.clear());
+  ui.btnOpenMistModal.addEventListener('click', openMistModal);
+  ui.btnCloseMistModal.addEventListener('click', closeMistModal);
+  ui.btnCancelMistModal.addEventListener('click', closeMistModal);
+  ui.btnSaveMistModal.addEventListener('click', () => {
+    const token = ui.mistApiToken.value.trim();
+    const orgId = ui.mistOrgId.value.trim();
+    const cloud = getCloudById(ui.mistCloud.value);
+    if (!token || !orgId || !cloud) {
+      setMistStatus('Fill Mist Cloud / Region, API token, and Org ID.', 'error');
+      return;
+    }
+    mistApi.configure(token, cloud.apiHost, orgId);
+    setMistStatus('Mist API configuration saved. Use "Load Sites" to populate site list.', 'success');
+    closeMistModal();
+  });
+  ui.mistModalOverlay.addEventListener('click', (e) => {
+    if (e.target === ui.mistModalOverlay) closeMistModal();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !ui.mistModalOverlay.classList.contains('is-hidden')) {
+      closeMistModal();
+    }
+  });
   ui.btnLoadSites.addEventListener('click', loadSites);
   ui.btnRunTroubleshoot.addEventListener('click', runTroubleshoot);
   ui.btnMistStatus.addEventListener('click', runMistStatus);

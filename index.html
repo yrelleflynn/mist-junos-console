@@ -68,9 +68,24 @@
               <option value="hardware">Hardware (RTS/CTS)</option>
             </select>
 
+            <div class="connection-state-card">
+              <div class="connection-state-label">Connection State</div>
+              <span id="connection-state-pill" class="connection-state-pill state-disconnected">Disconnected</span>
+            </div>
+
             <div class="sidebar-actions">
-              <button id="btn-connect" class="btn btn-primary">Connect</button>
+              <button id="btn-connect" class="btn btn-primary">Choose Serial Port</button>
               <button id="btn-disconnect" class="btn btn-danger" disabled>Disconnect</button>
+              <button id="btn-clear-connection" class="btn btn-secondary" disabled>Clear Terminal</button>
+            </div>
+            <div class="connection-helper">
+              Opens browser port picker (Chrome/Edge only).
+            </div>
+            <div id="selected-port" class="connection-selected-port">Selected Port: None selected</div>
+            <div class="connection-next-steps">
+              <div><strong>01 Login to Switch</strong> — after connecting, authenticate to Junos.</div>
+              <div><strong>02 Identify Switch</strong> — confirm hostname/serial before cloud checks.</div>
+              <div>Optional: configure Mist API and load sites for cloud troubleshooting.</div>
             </div>
 
             <div class="remote-session-block">
@@ -97,23 +112,8 @@
             Mist API
           </button>
           <div class="accordion-content" id="accordion-mist-api">
-            <label for="mist-cloud">Cloud Region</label>
-            <select id="mist-cloud"></select>
-
-            <label for="mist-api-token">API Token</label>
-            <input type="password" id="mist-api-token" placeholder="Your Mist API token" autocomplete="off">
-
-            <label for="mist-org-id">Org ID</label>
-            <input type="text" id="mist-org-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
-
-            <label for="mist-site">Site</label>
-            <div class="input-row">
-              <select id="mist-site" disabled>
-                <option value="">— Load sites first —</option>
-              </select>
-              <button id="btn-load-sites" class="btn btn-secondary btn-sm">Load</button>
-            </div>
-
+            <button id="btn-open-mist-modal" class="btn btn-secondary">Configure Mist API</button>
+            <div class="connection-helper">Optional: configure Mist API and load sites for cloud troubleshooting.</div>
             <div id="mist-api-status" class="status-text"></div>
           </div>
         </div>
@@ -212,6 +212,40 @@
       <!-- Terminal area -->
       <div id="terminal-container"></div>
 
+    </div>
+
+    <div id="mist-modal-overlay" class="mist-modal-overlay is-hidden" aria-hidden="true">
+      <div class="mist-modal" role="dialog" aria-modal="true" aria-labelledby="mist-modal-title">
+        <div class="mist-modal-header">
+          <h3 id="mist-modal-title">Mist API Integration Setup</h3>
+          <button id="btn-close-mist-modal" class="mist-modal-close" type="button" aria-label="Close Mist setup">&times;</button>
+        </div>
+        <p class="mist-modal-description">
+          Configure your Mist Cloud credentials to enable cloud-managed diagnostics and automated onboarding features.
+        </p>
+
+        <label for="mist-cloud">Mist Cloud / Region</label>
+        <select id="mist-cloud"></select>
+
+        <label for="mist-api-token">API Token</label>
+        <input type="password" id="mist-api-token" placeholder="Enter your Mist API token" autocomplete="off">
+
+        <label for="mist-org-id">Organization ID</label>
+        <input type="text" id="mist-org-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
+
+        <label for="mist-site">Optional: Configure Mist API and Load Sites</label>
+        <div class="input-row">
+          <select id="mist-site" disabled>
+            <option value="">— Load sites first —</option>
+          </select>
+          <button id="btn-load-sites" class="btn btn-secondary btn-sm">Load Sites</button>
+        </div>
+
+        <div class="mist-modal-actions">
+          <button id="btn-cancel-mist-modal" class="btn btn-secondary" type="button">Cancel</button>
+          <button id="btn-save-mist-modal" class="btn btn-primary" type="button">Save Configuration</button>
+        </div>
+      </div>
     </div>
 
   </div>
