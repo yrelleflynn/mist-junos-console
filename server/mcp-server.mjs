@@ -164,6 +164,7 @@ function checkCommandSafety(command) {
 let ws = null;
 let wsReady = false;
 let wsError = null;
+let wsConnecting = false; // guard against concurrent connect attempts
 
 /** @type {{ resolve: Function, collector: string[], timer: ReturnType<typeof setTimeout> } | null} */
 let pendingCommand = null;
@@ -266,6 +267,36 @@ function connectWs() {
   });
 }
 
+/**
+ * Ensure the WebSocket is connected and joined to the session.
+ * Called lazily before each console tool invocation so that a session
+ * created after the MCP server starts (or after a disconnect) is picked up
+ * automatically without restarting the server.
+ *
+ * @returns {Promise<string|null>} null on success, error message string on failure.
+ */
+async function ensureWsConnected() {
+  if (wsReady) return null;
+  if (!SESSION_ID) return 'No session ID configured.';
+  if (wsConnecting) return 'Connection attempt already in progress — try again shortly.';
+
+  // Clean up any stale socket before retrying
+  if (ws) {
+    try { ws.terminate(); } catch { /* ignore */ }
+    ws = null;
+  }
+
+  wsConnecting = true;
+  try {
+    await connectWs();
+    return null;
+  } catch (err) {
+    return err.message;
+  } finally {
+    wsConnecting = false;
+  }
+}
+
 function sendSerial(text) {
   if (!ws || !wsReady) throw new Error('Not connected to console session.');
   const encoded = Buffer.from(text, 'utf8').toString('base64');
@@ -310,33 +341,27 @@ function mistRequest(method, path, body) {
 // ── Tool implementations ───────────────────────────────────────────────────
 
 async function toolSendCommand({ command, timeout_ms = 15000, force = false }) {
-  if (/^\s*request\s+system\s+reboot\b/i.test(command) && force) {
-    // force-reboot: skip safety check, fall through
-  } else {
+  // Safety checks run before attempting connection (no need to be online to block a command)
+  const isForceReboot = /^\s*request\s+system\s+reboot\b/i.test(command) && force;
+  let warnMsg = null;
+
+  if (!isForceReboot) {
     const safety = checkCommandSafety(command);
     if (safety.blocked) {
       return { isError: true, content: [{ type: 'text', text: `BLOCKED: ${safety.reason}` }] };
     }
-    if (!ws || !wsReady) {
-      return { isError: true, content: [{ type: 'text', text: wsError || 'Not connected to console session.' }] };
-    }
-    if (safety.warned) {
-      const result = await runCommand(command, timeout_ms);
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({ ...result, warning: safety.warning }),
-        }],
-      };
-    }
+    if (safety.warned) warnMsg = safety.warning;
   }
 
-  if (!ws || !wsReady) {
-    return { isError: true, content: [{ type: 'text', text: wsError || 'Not connected to console session.' }] };
+  // Lazily connect if not already joined (handles session created after server start)
+  const connErr = await ensureWsConnected();
+  if (connErr) {
+    return { isError: true, content: [{ type: 'text', text: connErr }] };
   }
 
   const result = await runCommand(command, timeout_ms);
-  return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+  const payload = warnMsg ? { ...result, warning: warnMsg } : result;
+  return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
 }
 
 function runCommand(command, timeout_ms) {
@@ -375,8 +400,9 @@ async function toolReadOutput({ lines = 50 }) {
 }
 
 async function toolGetSessionState() {
-  if (!ws || !wsReady) {
-    return { isError: true, content: [{ type: 'text', text: wsError || 'Not connected to console session.' }] };
+  const connErr = await ensureWsConnected();
+  if (connErr) {
+    return { isError: true, content: [{ type: 'text', text: connErr }] };
   }
   const result = await runCommand('', 5000);
   const mode = detectMode(result.output);
