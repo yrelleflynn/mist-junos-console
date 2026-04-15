@@ -18,11 +18,12 @@
  *   MCP_PORT         HTTP listen port (default 3334)
  *   MCP_HOST         HTTP bind address (default 0.0.0.0)
  *   MCP_ALLOW_CIDR   Comma-separated allowed subnets (default 10.100.100.0/24,192.168.1.0/24); localhost always allowed
+ *   HUB_URL          Hub HTTP base URL for session discovery (default http://127.0.0.1:3333)
  *   WS_URL           WebSocket hub URL (default ws://127.0.0.1:3333/ws)
- *   MCP_SESSION_ID   Alternative to positional session-id argument
- *   MIST_API_HOST    e.g. api.mist.com
- *   MIST_API_TOKEN   Mist API token
- *   MIST_ORG_ID      Mist organisation ID
+ *   MCP_SESSION_ID   Session ID override (auto-discovered from hub if not set)
+ *   MIST_API_HOST    e.g. api.mist.com (auto-discovered from session if not set)
+ *   MIST_API_TOKEN   Mist API token   (auto-discovered from session if not set)
+ *   MIST_ORG_ID      Mist org ID      (auto-discovered from session if not set)
  */
 
 import http from 'node:http';
@@ -45,9 +46,11 @@ const MCP_HOST = process.env.MCP_HOST || '0.0.0.0';
 const MCP_ALLOW_CIDRS = (process.env.MCP_ALLOW_CIDR || '10.100.100.0/24,192.168.1.0/24')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
-// Session ID: skip '--http' if it appears as first positional arg
+// Session ID: skip '--http' if it appears as first positional arg.
+// May be empty — auto-discovered from the hub on first console tool call.
 const _args = process.argv.slice(2).filter((a) => a !== '--http');
-const SESSION_ID = _args[0] || process.env.MCP_SESSION_ID || '';
+let SESSION_ID = _args[0] || process.env.MCP_SESSION_ID || '';
+const HUB_URL = process.env.HUB_URL || 'http://127.0.0.1:3333';
 const WS_URL = process.env.WS_URL || 'ws://127.0.0.1:3333/ws';
 
 // Credentials — populated from env vars at startup; overridden by session credentials if absent.
@@ -268,17 +271,65 @@ function connectWs() {
 }
 
 /**
+ * Call the hub's /api/session endpoint to get the current active operator
+ * session ID and Mist credentials. Populates SESSION_ID and credential vars
+ * if they are not already set.
+ *
+ * @returns {Promise<string|null>} null on success, error message on failure.
+ */
+async function discoverSession() {
+  return new Promise((resolve) => {
+    const req = http.get(`${HUB_URL}/api/session`, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try {
+          const body = JSON.parse(data);
+          if (!body.sessionId) {
+            resolve('No active operator session found on hub. Enable the remote session in the browser first.');
+            return;
+          }
+          // Populate session ID if not already set
+          if (!SESSION_ID) SESSION_ID = body.sessionId;
+          // Populate Mist credentials from session if env vars are absent
+          if (body.mistCredentials) {
+            const c = body.mistCredentials;
+            if (!MIST_API_HOST && c.apiHost) MIST_API_HOST = c.apiHost;
+            if (!MIST_API_TOKEN && c.apiToken) MIST_API_TOKEN = c.apiToken;
+            if (!MIST_ORG_ID && c.orgId) MIST_ORG_ID = c.orgId;
+            console.error('[mcp] Discovered Mist credentials from hub session.');
+          }
+          console.error(`[mcp] Discovered session: ${SESSION_ID}`);
+          resolve(null);
+        } catch (err) {
+          resolve(`Failed to parse hub /api/session response: ${err.message}`);
+        }
+      });
+    });
+    req.on('error', (err) => {
+      resolve(`Hub unreachable at ${HUB_URL} — is the server running? (${err.message})`);
+    });
+    req.end();
+  });
+}
+
+/**
  * Ensure the WebSocket is connected and joined to the session.
- * Called lazily before each console tool invocation so that a session
- * created after the MCP server starts (or after a disconnect) is picked up
- * automatically without restarting the server.
+ * Called lazily before each console tool invocation. Auto-discovers the
+ * session from the hub if SESSION_ID is not set, so no session ID needs
+ * to be passed on the command line.
  *
  * @returns {Promise<string|null>} null on success, error message string on failure.
  */
 async function ensureWsConnected() {
   if (wsReady) return null;
-  if (!SESSION_ID) return 'No session ID configured.';
   if (wsConnecting) return 'Connection attempt already in progress — try again shortly.';
+
+  // Auto-discover session ID (and credentials) from hub if not configured
+  if (!SESSION_ID) {
+    const discoverErr = await discoverSession();
+    if (discoverErr) return discoverErr;
+  }
 
   // Clean up any stale socket before retrying
   if (ws) {
@@ -776,18 +827,19 @@ async function startHttp() {
 // ── Startup ────────────────────────────────────────────────────────────────
 
 async function main() {
-  // Connect to console session (non-fatal — API-only usage still works)
+  // Attempt an eager connection if a session ID was explicitly provided.
+  // Otherwise, session discovery happens lazily on first console tool call —
+  // this avoids startup failures when the operator hasn't yet enabled the session.
   if (SESSION_ID) {
     try {
       await connectWs();
     } catch (err) {
-      console.error('[mcp] Console session unavailable:', err.message);
-      console.error('[mcp] Console tools will return errors; Mist API tools still work.');
+      console.error('[mcp] Console session unavailable at startup:', err.message);
+      console.error('[mcp] Will retry on first tool call.');
       wsError = err.message;
     }
   } else {
-    wsError = 'No session ID provided — console tools disabled. Pass session ID as first argument or set MCP_SESSION_ID.';
-    console.error('[mcp]', wsError);
+    console.error(`[mcp] No session ID set — will auto-discover from ${HUB_URL}/api/session on first console tool call.`);
   }
 
   if (USE_HTTP) {

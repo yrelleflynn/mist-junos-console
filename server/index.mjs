@@ -81,11 +81,32 @@ function mistProxyHandler(req, res) {
 }
 
 const server = http.createServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok' }));
     return;
   }
+
+  // MCP server calls this to auto-discover the active operator session and Mist credentials.
+  // Only the first active operator session is returned.
+  if (req.method === 'GET' && req.url === '/api/session') {
+    let found = null;
+    for (const [id, sess] of sessions) {
+      const hasActiveOp = sess.members.some(
+        (m) => m.role === 'operator' && m.ws.readyState === 1,
+      );
+      if (hasActiveOp) {
+        found = { sessionId: id, mistCredentials: sess.mistCredentials ?? null };
+        break;
+      }
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(found ?? { sessionId: null, mistCredentials: null }));
+    return;
+  }
+
   if (req.url === '/mist-proxy' || req.url?.startsWith('/mist-proxy?')) {
     mistProxyHandler(req, res);
     return;
