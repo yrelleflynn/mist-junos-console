@@ -211,6 +211,7 @@ function init(): void {
   }
 
   let consoleSession: ConsoleSessionService | null = null;
+  let currentMistCreds: { apiHost: string; apiToken: string; orgId: string } | undefined;
 
   function tearDownRemoteSession(): void {
     if (consoleSession) {
@@ -245,7 +246,7 @@ function init(): void {
       ui.remoteSessionEnabled.checked = false;
       tearDownRemoteSession();
     };
-    cs.startAsOperator();
+    cs.startAsOperator(currentMistCreds);
   }
 
   // ---- UI state helpers ----
@@ -426,6 +427,7 @@ function init(): void {
     }
 
     mistApi.configure(token, cloud.apiHost, orgId);
+    currentMistCreds = { apiHost: cloud.apiHost, apiToken: token, orgId };
     setMistStatus('Loading sites…', 'info');
     ui.btnLoadSites.disabled = true;
 

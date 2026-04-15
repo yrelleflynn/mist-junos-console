@@ -44,6 +44,7 @@ export class ConsoleSessionService {
   private role: ConsoleSessionRole | null = null;
   private pendingSupportSessionId: string | null = null;
   private pendingOperatorJoin = false;
+  private pendingMistCredentials: { apiHost: string; apiToken: string; orgId: string } | null = null;
 
   onJoined: ((sessionId: string, role: ConsoleSessionRole) => void) | null = null;
   onRemoteSerialTx: ((data: Uint8Array) => void) | null = null;
@@ -65,7 +66,8 @@ export class ConsoleSessionService {
   }
 
   /** Operator: open socket and create a new session. */
-  startAsOperator(): void {
+  startAsOperator(mistCredentials?: { apiHost: string; apiToken: string; orgId: string }): void {
+    this.pendingMistCredentials = mistCredentials ?? null;
     this.close();
     this.pendingOperatorJoin = true;
     this.pendingSupportSessionId = null;
@@ -86,7 +88,9 @@ export class ConsoleSessionService {
 
     ws.onopen = () => {
       if (this.pendingOperatorJoin) {
-        ws.send(JSON.stringify({ type: 'join', role: 'operator' }));
+        const joinMsg: Record<string, unknown> = { type: 'join', role: 'operator' };
+        if (this.pendingMistCredentials) joinMsg.mistCredentials = this.pendingMistCredentials;
+        ws.send(JSON.stringify(joinMsg));
       } else if (this.pendingSupportSessionId) {
         ws.send(
           JSON.stringify({
@@ -185,5 +189,6 @@ export class ConsoleSessionService {
     this.role = null;
     this.pendingOperatorJoin = false;
     this.pendingSupportSessionId = null;
+    this.pendingMistCredentials = null;
   }
 }

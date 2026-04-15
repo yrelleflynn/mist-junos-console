@@ -164,11 +164,15 @@ wss.on('connection', (ws) => {
             return;
           }
           const id = randomUUID();
-          sessions.set(id, { members: [{ ws, role: 'operator' }] });
+          // Store optional Mist credentials if the operator provided them
+          const mistCredentials = (msg.mistCredentials && typeof msg.mistCredentials === 'object')
+            ? msg.mistCredentials
+            : null;
+          sessions.set(id, { members: [{ ws, role: 'operator' }], mistCredentials });
           sessionId = id;
           role = 'operator';
           ws.send(JSON.stringify({ type: 'joined', sessionId: id, role: 'operator' }));
-          console.log('[ws] operator created session', id);
+          console.log('[ws] operator created session', id, mistCredentials ? '(with Mist credentials)' : '');
           return;
         }
         const sid = msg.sessionId;
@@ -189,7 +193,10 @@ wss.on('connection', (ws) => {
         sess.members.push({ ws, role: 'support' });
         sessionId = sid;
         role = 'support';
-        ws.send(JSON.stringify({ type: 'joined', sessionId: sid, role: 'support' }));
+        // Relay Mist credentials to support viewers if the operator shared them
+        const joinedMsg = { type: 'joined', sessionId: sid, role: 'support',
+          ...(sess.mistCredentials ? { mistCredentials: sess.mistCredentials } : {}) };
+        ws.send(JSON.stringify(joinedMsg));
         console.log('[ws] support joined', sid);
         return;
       }

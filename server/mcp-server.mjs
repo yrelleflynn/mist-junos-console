@@ -49,9 +49,10 @@ const _args = process.argv.slice(2).filter((a) => a !== '--http');
 const SESSION_ID = _args[0] || process.env.MCP_SESSION_ID || '';
 const WS_URL = process.env.WS_URL || 'ws://127.0.0.1:3333/ws';
 
-const MIST_API_HOST = process.env.MIST_API_HOST || '';
-const MIST_API_TOKEN = process.env.MIST_API_TOKEN || '';
-const MIST_ORG_ID = process.env.MIST_ORG_ID || '';
+// Credentials — populated from env vars at startup; overridden by session credentials if absent.
+let MIST_API_HOST = process.env.MIST_API_HOST || '';
+let MIST_API_TOKEN = process.env.MIST_API_TOKEN || '';
+let MIST_ORG_ID = process.env.MIST_ORG_ID || '';
 
 // ── IP allowlist ───────────────────────────────────────────────────────────
 
@@ -194,6 +195,14 @@ function connectWs() {
       if (msg.type === 'joined') {
         clearTimeout(timeout);
         wsReady = true;
+        // Accept Mist credentials from session if not already set via env vars
+        if (msg.mistCredentials && typeof msg.mistCredentials === 'object') {
+          const c = msg.mistCredentials;
+          if (!MIST_API_HOST && c.apiHost) { MIST_API_HOST = c.apiHost; }
+          if (!MIST_API_TOKEN && c.apiToken) { MIST_API_TOKEN = c.apiToken; }
+          if (!MIST_ORG_ID && c.orgId) { MIST_ORG_ID = c.orgId; }
+          console.error('[mcp] Received Mist credentials from session (env vars take precedence).');
+        }
         console.error(`[mcp] Joined session ${SESSION_ID} as support`);
         resolve();
         return;
