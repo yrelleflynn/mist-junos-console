@@ -93,6 +93,7 @@ export interface TroubleshootStep {
 export class TroubleshootService {
   private runner: CommandRunnerService;
   private mistApi: MistApiService | null;
+  private lastCtx: TroubleshootContext | null = null;
 
   constructor(runner: CommandRunnerService, mistApi?: MistApiService) {
     this.runner = runner;
@@ -277,7 +278,72 @@ export class TroubleshootService {
       report(r);
     }
 
+    this.lastCtx = ctx;
     return results;
+  }
+
+  /**
+   * Re-run a single check by its result ID using the context from the last full run.
+   * Returns the new result(s) for that check.
+   */
+  async runSingleCheck(checkId: string): Promise<CheckResult[]> {
+    if (!this.lastCtx) {
+      throw new Error('Run the full Cloud Check first before running individual tests.');
+    }
+    const ctx = { ...this.lastCtx };
+    const { cloud } = ctx;
+
+    await this.runner.ensureOperationalMode();
+
+    switch (checkId) {
+      case 'lldp': {
+        const r = await this.checkLldp(ctx.uplinkPort);
+        return [r.result];
+      }
+      case 'upstream-port-config': {
+        if (!ctx.uplinkNeighbor) {
+          return [{ id: checkId, name: 'Upstream Switch Port Config', status: 'skip', detail: 'No LLDP neighbor detected — run full check first.' }];
+        }
+        const r = await this.lookupUpstreamPortConfig(ctx.uplinkNeighbor);
+        return [r.result];
+      }
+      case 'port-status':
+        return [await this.checkPortStatus(ctx.uplinkPort)];
+      case 'interface-errors':
+        return [await this.checkInterfaceErrors(ctx.uplinkPort)];
+      case 'vlan-config':
+        return [await this.checkVlanConfig(ctx.uplinkPort)];
+      case 'mgmt-ip': {
+        const r = await this.checkInterfaceIp();
+        return [r.result];
+      }
+      case 'dhcp-lease':
+        return [await this.checkDhcpLease()];
+      case 'arp':
+        return [await this.checkArp()];
+      case 'default-route':
+        return [await this.checkDefaultRoute()];
+      case 'dns-config':
+        return [await this.checkDnsConfig()];
+      case 'dns-resolution':
+        return [await this.checkDnsResolution(cloud)];
+      case 'route-to-mist':
+        return [await this.checkRouteToMistEndpoints(cloud)];
+      case 'mist-agent':
+        return [await this.checkMistAgentVersion()];
+      case 'mist-processes':
+        return [await this.checkMistAgentProcesses()];
+      case 'outbound-ssh-config': {
+        const r = await this.checkOutboundSshConfig();
+        return [r.result];
+      }
+      case 'cloud-connections': {
+        const ipResult = await this.checkInterfaceIp();
+        return [await this.checkActiveCloudConnections(ipResult.mgmtIp, cloud)];
+      }
+      default:
+        throw new Error(`Cannot run check '${checkId}' individually.`);
+    }
   }
 
   /**

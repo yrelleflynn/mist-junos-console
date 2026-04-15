@@ -42,6 +42,7 @@ function init(): void {
     btnClear: document.getElementById('btn-clear') as HTMLButtonElement,
     terminalContainer: document.getElementById('terminal-container') as HTMLElement,
     connectionBadge: document.getElementById('connection-badge') as HTMLElement,
+    mistCloudBadge: document.getElementById('mist-cloud-badge') as HTMLElement,
     baudRate: document.getElementById('baud-rate') as HTMLSelectElement,
     dataBits: document.getElementById('data-bits') as HTMLSelectElement,
     parity: document.getElementById('parity') as HTMLSelectElement,
@@ -106,6 +107,109 @@ function init(): void {
   // Store the last match result for use in config drift
   let lastMatchResult: MistMatchResult | null = null;
 
+  // ---- Mist online status polling ----
+  let mistPollInterval: ReturnType<typeof setInterval> | null = null;
+  let mistPollSiteId: string | null = null;   // null = no site assignment; inventory fallback used
+  let mistPollDeviceId: string | null = null; // set whenever a device is identified in Mist
+  let mistPollInFlight = false;
+
+  /** Stop the 30s interval but keep the device IDs so manual clicks still work. */
+  function stopMistStatusPoll(): void {
+    if (mistPollInterval !== null) {
+      clearInterval(mistPollInterval);
+      mistPollInterval = null;
+    }
+  }
+
+  /** Full reset — called on serial disconnect or before a new identify. */
+  function clearMistPollState(): void {
+    stopMistStatusPoll();
+    mistPollSiteId = null;
+    mistPollDeviceId = null;
+  }
+
+  async function pollMistStatus(): Promise<void> {
+    if (!mistPollDeviceId) return;
+    if (mistPollInFlight) return;
+    mistPollInFlight = true;
+
+    const pillEl = document.getElementById('mist-status-pill');
+    if (!pillEl) {
+      // Identity panel was replaced — stop the interval but keep IDs so a manual click can still fire
+      stopMistStatusPoll();
+      mistPollInFlight = false;
+      return;
+    }
+
+    const lastSeenEl = document.getElementById('mist-last-seen-value');
+    const pollStatusEl = document.getElementById('mist-poll-status');
+
+    let isConnected: boolean | null = null;
+    let lastSeenMs: number | null = null;
+
+    try {
+      // Primary: stats endpoint — needs site_id, gives status + last_seen
+      if (mistPollSiteId) {
+        const stats = await mistApi.getDeviceStats(mistPollSiteId, mistPollDeviceId);
+        if (stats) {
+          isConnected =
+            stats.status != null &&
+            /connected/i.test(stats.status) &&
+            !/disconnect/i.test(stats.status);
+          if (stats.last_seen) lastSeenMs = stats.last_seen * 1000;
+        }
+      }
+
+      // Fallback: inventory `connected` field — works even without site_id
+      if (isConnected === null) {
+        const device = await mistApi.findDeviceById(mistPollDeviceId);
+        if (device) {
+          isConnected = device.connected === true;
+        }
+      }
+    } catch {
+      // Network/proxy error — leave isConnected null
+    }
+
+    // Always update both the pill and the header badge
+    if (isConnected === true) {
+      pillEl.className = 'mist-status-pill mist-status-connected';
+      pillEl.textContent = 'Connected';
+      setMistCloudBadge('online');
+    } else if (isConnected === false) {
+      pillEl.className = 'mist-status-pill mist-status-disconnected';
+      pillEl.textContent = 'Disconnected';
+      setMistCloudBadge('offline');
+    } else {
+      // Could not determine status (API unreachable) — don't flip to online, stay offline
+      setMistCloudBadge('offline');
+    }
+
+    if (lastSeenEl && lastSeenMs) {
+      const dt = new Date(lastSeenMs);
+      lastSeenEl.textContent = dt.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+    }
+
+    if (pollStatusEl) {
+      const now = new Date();
+      pollStatusEl.textContent = isConnected !== null
+        ? `Mist status checked ${now.toLocaleTimeString()} · polling every 30s`
+        : `Poll error ${now.toLocaleTimeString()} — will retry in 30s`;
+    }
+
+    mistPollInFlight = false;
+  }
+
+  /** Start polling every 30s. siteId may be null for unassigned devices (inventory fallback used). */
+  function startMistStatusPoll(siteId: string | null, deviceId: string): void {
+    clearMistPollState();
+    mistPollSiteId = siteId;
+    mistPollDeviceId = deviceId;
+    mistPollInterval = setInterval(() => {
+      void pollMistStatus();
+    }, 30000);
+  }
+
   let consoleSession: ConsoleSessionService | null = null;
 
   function tearDownRemoteSession(): void {
@@ -165,6 +269,8 @@ function init(): void {
       ui.btnRootPassword.disabled = true;
       ui.btnOfflineTimeline.disabled = true;
       lastMatchResult = null;
+      clearMistPollState();
+      setMistCloudBadge('offline');
       ui.remoteSessionEnabled.disabled = true;
       ui.remoteSessionEnabled.checked = false;
       tearDownRemoteSession();
@@ -185,6 +291,16 @@ function init(): void {
   function setMistStatus(text: string, type: 'success' | 'error' | 'info' = 'info'): void {
     ui.mistApiStatus.textContent = text;
     ui.mistApiStatus.className = `status-text ${type}`;
+  }
+
+  function setMistCloudBadge(state: 'online' | 'offline' | 'checking'): void {
+    const labels: Record<string, string> = {
+      online: 'Connected to Mist',
+      offline: 'Not connected to Mist',
+      checking: 'Checking Mist…',
+    };
+    ui.mistCloudBadge.textContent = labels[state];
+    ui.mistCloudBadge.className = `mist-cloud-badge mist-cloud-badge-${state}`;
   }
 
   // ---- Serial events ----
@@ -341,6 +457,33 @@ function init(): void {
     }
   }
 
+  // ---- Troubleshoot: check descriptions ----
+  const CHECK_DESCRIPTIONS: Record<string, string> = {
+    'lldp': 'Discovers LLDP neighbors to identify the uplink port and upstream switch. Used to determine which port to check and look up upstream configuration in Mist.',
+    'upstream-port-config': 'Looks up the upstream switch port configuration from Mist to verify that VLAN and trunk settings match what is expected on this device.',
+    'port-status': 'Verifies the uplink port link is operationally up. A down link means physical connectivity is broken.',
+    'interface-errors': 'Checks the uplink interface for input/output errors, dropped packets, and link flaps that could indicate hardware or cabling issues.',
+    'vlan-config': 'Verifies the management VLAN is present and correctly configured in the switch VLAN table.',
+    'mgmt-ip': 'Checks that the switch has obtained a management IP address — either via DHCP or static assignment on the management interface.',
+    'dhcp-lease': 'Shows the active DHCP lease for the management interface, including the assigned IP, server, and lease expiry.',
+    'arp': 'Checks the ARP table for a valid entry pointing to the default gateway, confirming Layer 2 reachability to the next hop.',
+    'default-route': 'Verifies a default route (0.0.0.0/0) is present in the routing table, which is required for internet and cloud access.',
+    'dns-config': 'Checks that DNS servers are configured on the switch so that cloud hostnames can be resolved.',
+    'dns-resolution': 'Tests whether Mist cloud hostnames resolve via DNS — a prerequisite for cloud connectivity.',
+    'route-to-mist': 'Checks the routing table for valid routes to Mist cloud endpoint IP addresses.',
+    'mist-agent': 'Checks the installed Mist agent version and whether an update is available from the cloud.',
+    'mist-processes': 'Verifies the Mist cloud daemon processes (mcd/jmd) are running, which are required for cloud management.',
+    'outbound-ssh-config': 'Checks the outbound SSH server configuration used by Mist to establish management sessions to the switch.',
+    'cloud-connections': 'Verifies that active outbound TCP connections to Mist cloud endpoints are currently established.',
+    'mist-last-seen': 'Shows the last time this device was seen online by the Mist cloud, useful for identifying recent disconnections.',
+    'mist-events': 'Shows recent Mist cloud events for this device to identify connection-related issues.',
+    'switch-uptime': 'Reports how long the switch has been running. A recent reboot may explain a disconnection from the cloud.',
+    'switch-logs': 'Analyzes system log messages for errors or warnings related to cloud connectivity.',
+    'switch-logs-messages': 'Reviews the system messages log for recent errors or warnings.',
+    'switch-logs-mist-agent': 'Analyzes Mist agent log messages for errors or connectivity failures.',
+    'switch-logs-mist-agent-missing': 'Checks whether the Mist agent log is missing, which would indicate the agent has not run.',
+  };
+
   // ---- Troubleshoot: status icons ----
   function statusIcon(status: CheckStatus): string {
     switch (status) {
@@ -358,10 +501,11 @@ function init(): void {
   // Accumulated check results for context-aware remediation
   let accumulatedResults: CheckResult[] = [];
 
-  function renderCheckResult(result: CheckResult, allResults?: CheckResult[]): HTMLElement {
+  function renderCheckResult(result: CheckResult, allResults?: CheckResult[], testNumber?: number): HTMLElement {
     const el = document.createElement('div');
     el.className = `ts-check ${result.status}`;
     el.id = `ts-check-${result.id}`;
+    if (testNumber !== undefined) el.dataset.testNumber = String(testNumber);
 
     // Track results for context-aware remediation
     if (allResults) {
@@ -375,28 +519,25 @@ function init(): void {
       result.commands = rem.commands;
     }
 
-    const hasContent = result.raw || result.remediation || result.commands;
-
+    el.style.cursor = 'pointer';
     el.innerHTML = `
+      ${testNumber !== undefined ? `<span class="ts-check-number">${testNumber}</span>` : ''}
       <span class="ts-check-icon">${statusIcon(result.status)}</span>
       <div class="ts-check-body">
-        <div class="ts-check-name">${result.name}${hasContent ? '<span class="ts-expand-hint">ⓘ</span>' : ''}</div>
+        <div class="ts-check-name">${result.name}<span class="ts-expand-hint">ⓘ</span></div>
         <div class="ts-check-detail">${result.detail}</div>
       </div>
     `;
 
-    if (hasContent) {
-      el.style.cursor = 'pointer';
-      el.addEventListener('click', () => {
-        showCheckModal(result);
-      });
-    }
+    el.addEventListener('click', () => {
+      showCheckModal(result, testNumber);
+    });
 
     return el;
   }
 
-  /** Show a floating modal with check details, remediation, run fix, and raw output */
-  function showCheckModal(result: CheckResult): void {
+  /** Show a floating modal with check details, description, run-test-now, remediation, and raw output */
+  function showCheckModal(result: CheckResult, testNumber?: number): void {
     // Remove any existing modal
     const existing = document.getElementById('check-modal-overlay');
     if (existing) existing.remove();
@@ -408,337 +549,392 @@ function init(): void {
     const modal = document.createElement('div');
     modal.className = 'check-modal';
 
-    // Header
-    let html = `<div class="check-modal-header">`;
-    html += `<span class="check-modal-status ts-check-icon ${result.status}">${statusIcon(result.status)}</span>`;
-    html += `<span class="check-modal-title">${result.name}</span>`;
-    html += `<button class="check-modal-close" id="check-modal-close-btn">&times;</button>`;
-    html += `</div>`;
-
-    // Detail
-    html += `<div class="check-modal-detail">${result.detail}</div>`;
-
-    // Remediation text
-    if (result.remediation) {
-      html += `<div class="check-modal-section">`;
-      html += `<div class="check-modal-section-title">Remediation</div>`;
-      html += `<pre class="check-modal-remediation">${escapeHtml(result.remediation)}</pre>`;
-      html += `</div>`;
-    }
-
-    // Executable commands
-    if (result.commands && result.commands.length > 0) {
-      html += `<div class="check-modal-section">`;
-      html += `<div class="check-modal-section-title">Commands</div>`;
-      html += `<pre class="check-modal-raw">`;
-      for (const cmd of result.commands) {
-        html += escapeHtml(cmd) + '\n';
-      }
-      html += `</pre>`;
-      // Check if any commands contain placeholders like <ip>
-      const hasPlaceholders = result.commands.some((c) => /<\w+>/.test(c));
-      if (hasPlaceholders) {
-        html += `<div class="check-modal-placeholder-warn">⚠ Commands contain placeholders (e.g. &lt;ip&gt;) that must be edited before running.</div>`;
-      } else {
-        html += `<div class="check-modal-actions">`;
-        html += `<button class="btn btn-primary" id="check-modal-run-fix">Run Fix</button>`;
-        html += `</div>`;
-      }
-      html += `<div id="check-modal-output"></div>`;
-      html += `</div>`;
-    }
-
-    // Raw output
-    if (result.raw) {
-      html += `<div class="check-modal-section">`;
-      html += `<div class="check-modal-section-title">Raw Output</div>`;
-      html += `<pre class="check-modal-raw">${escapeHtml(result.raw)}</pre>`;
-      html += `</div>`;
-    }
-
-    modal.innerHTML = html;
     overlay.appendChild(modal);
     document.body.appendChild(overlay);
 
-    // Close handlers
-    const closeModal = () => overlay.remove();
-    document.getElementById('check-modal-close-btn')?.addEventListener('click', closeModal);
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) closeModal();
-    });
-    document.addEventListener('keydown', function escHandler(e) {
-      if (e.key === 'Escape') {
-        closeModal();
-        document.removeEventListener('keydown', escHandler);
+    // Build and attach all modal content (called initially and after re-run)
+    function renderModal() {
+      const canRerun = typeof (troubleshooter as any).runSingleCheck === 'function';
+      const numberLabel = testNumber !== undefined ? `<span class="check-modal-number">#${testNumber}</span>` : '';
+
+      // Header
+      let html = `<div class="check-modal-header">`;
+      html += `<span class="check-modal-status ts-check-icon ${result.status}">${statusIcon(result.status)}</span>`;
+      html += `${numberLabel}<span class="check-modal-title">${result.name}</span>`;
+      if (canRerun) {
+        html += `<button class="btn btn-sm btn-secondary" id="check-modal-run-test-now">Run Test Now</button>`;
       }
-    });
+      html += `<button class="check-modal-close" id="check-modal-close-btn">&times;</button>`;
+      html += `</div>`;
 
-    // Run Fix button handler
-    const runFixBtn = document.getElementById('check-modal-run-fix');
-    if (runFixBtn && result.commands) {
-      const commands = result.commands;
-      runFixBtn.addEventListener('click', async () => {
-        runFixBtn.setAttribute('disabled', 'true');
-        runFixBtn.textContent = 'Running…';
-        const outputEl = document.getElementById('check-modal-output')!;
-        outputEl.innerHTML = '';
+      // What this test checks
+      const desc = CHECK_DESCRIPTIONS[result.id];
+      if (desc) {
+        html += `<div class="check-modal-description">`;
+        html += `<span class="check-modal-description-label">What this test checks</span>`;
+        html += `<span class="check-modal-description-text">${escapeHtml(desc)}</span>`;
+        html += `</div>`;
+      }
 
-        try {
-          // Determine if commands need config mode (set/delete/activate/deactivate)
-          const cliCommands = commands.filter((c) => !c.startsWith('__mist_api_update__'));
-          const needsConfigMode = cliCommands.some((c) =>
-            /^(set |delete |activate |deactivate )/.test(c)
-          );
-          const isOperational = cliCommands.some((c) =>
-            /^(restart |request |clear )/.test(c)
-          );
-          const isMistApiOnly = cliCommands.length === 0;
+      // Result detail
+      html += `<div class="check-modal-detail">${result.detail}</div>`;
 
-          // Step 0: Detect current mode and get to the right place
-          if (!isMistApiOnly) {
-            outputEl.innerHTML += `<div class="check-modal-cmd-line">Detecting CLI mode…</div>`;
-            let currentMode = await cmdRunner.detectMode();
-            outputEl.innerHTML += `<div class="check-modal-cmd-line">Current mode: ${currentMode}</div>`;
+      // Remediation text
+      if (result.remediation) {
+        html += `<div class="check-modal-section">`;
+        html += `<div class="check-modal-section-title">Remediation</div>`;
+        html += `<pre class="check-modal-remediation">${escapeHtml(result.remediation)}</pre>`;
+        html += `</div>`;
+      }
 
-          if (currentMode === 'login') {
-            outputEl.innerHTML += `<div class="check-modal-cmd-line">Switch requires login. Attempting to log in…</div>`;
+      // Executable commands
+      if (result.commands && result.commands.length > 0) {
+        html += `<div class="check-modal-section">`;
+        html += `<div class="check-modal-section-title">Commands</div>`;
+        html += `<pre class="check-modal-raw">`;
+        for (const cmd of result.commands) {
+          html += escapeHtml(cmd) + '\n';
+        }
+        html += `</pre>`;
+        const hasPlaceholders = result.commands.some((c) => /<\w+>/.test(c));
+        if (hasPlaceholders) {
+          html += `<div class="check-modal-placeholder-warn">⚠ Commands contain placeholders (e.g. &lt;ip&gt;) that must be edited before running.</div>`;
+        } else {
+          html += `<div class="check-modal-actions">`;
+          html += `<button class="btn btn-primary" id="check-modal-run-fix">Run Fix</button>`;
+          html += `</div>`;
+        }
+        html += `<div id="check-modal-output"></div>`;
+        html += `</div>`;
+      }
 
-            // Try to get root password from Mist
-            let rootPw: string | null = null;
-            const siteId = ui.mistSite.value;
-            if (siteId && mistApi.isConfigured) {
-              rootPw = await mistApi.getRootPassword(siteId);
+      // Raw output
+      if (result.raw) {
+        html += `<div class="check-modal-section">`;
+        html += `<div class="check-modal-section-title">Raw Output</div>`;
+        html += `<pre class="check-modal-raw">${escapeHtml(result.raw)}</pre>`;
+        html += `</div>`;
+      }
+
+      modal.innerHTML = html;
+
+      // Close handlers
+      const closeModal = () => overlay.remove();
+      modal.querySelector('#check-modal-close-btn')?.addEventListener('click', closeModal);
+
+      // Run Test Now button
+      const runTestNowBtn = modal.querySelector<HTMLButtonElement>('#check-modal-run-test-now');
+      if (runTestNowBtn) {
+        runTestNowBtn.addEventListener('click', async () => {
+          runTestNowBtn.disabled = true;
+          runTestNowBtn.textContent = 'Running…';
+          try {
+            const newResults = await (troubleshooter as any).runSingleCheck(result.id) as CheckResult[];
+            const newResult = newResults.find((r: CheckResult) => r.id === result.id) ?? newResults[0];
+            if (newResult) {
+              // Clear previous results and copy fresh data
+              result.status = newResult.status;
+              result.detail = newResult.detail;
+              result.raw = newResult.raw;
+              result.remediation = newResult.remediation;
+              result.commands = newResult.commands;
+              // Re-generate remediation if needed
+              if (!result.remediation && (result.status === 'fail' || result.status === 'warn')) {
+                const rem = troubleshooter.getRemediation(result, accumulatedResults);
+                result.remediation = rem.text;
+                result.commands = rem.commands;
+              }
+              // Update the result card in the list
+              const existingCard = document.getElementById(`ts-check-${result.id}`);
+              if (existingCard) {
+                const cardNum = existingCard.dataset.testNumber ? parseInt(existingCard.dataset.testNumber) : testNumber;
+                const rendered = renderCheckResult(result, accumulatedResults, cardNum);
+                existingCard.replaceWith(rendered);
+              }
+              // Rebuild modal content with fresh result
+              renderModal();
             }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            runTestNowBtn.disabled = false;
+            runTestNowBtn.textContent = 'Run Test Now';
+            // Show error in header area
+            const errEl = document.createElement('div');
+            errEl.className = 'check-modal-run-error';
+            errEl.textContent = `Error: ${msg}`;
+            runTestNowBtn.insertAdjacentElement('afterend', errEl);
+          }
+        });
+      }
 
-            // Send username 'root'
-            const userResult = await cmdRunner.sendAndWaitFor('root\n', /[Pp]assword:|>|#|%/, 5000);
+      // Run Fix button handler
+      const runFixBtn = modal.querySelector<HTMLButtonElement>('#check-modal-run-fix');
+      if (runFixBtn && result.commands) {
+        const commands = result.commands;
+        runFixBtn.addEventListener('click', async () => {
+          runFixBtn.setAttribute('disabled', 'true');
+          runFixBtn.textContent = 'Running…';
+          const outputEl = modal.querySelector<HTMLElement>('#check-modal-output')!;
+          outputEl.innerHTML = '';
 
-            if (/[Pp]assword:/i.test(userResult.output)) {
-              // Password required
-              if (rootPw) {
-                outputEl.innerHTML += `<div class="check-modal-cmd-line">Using root password from Mist site settings…</div>`;
-                const passResult = await cmdRunner.sendAndWaitFor(rootPw + '\n', />|#|%|login:/i, 10000);
+          try {
+            // Determine if commands need config mode (set/delete/activate/deactivate)
+            const cliCommands = commands.filter((c) => !c.startsWith('__mist_api_update__'));
+            const needsConfigMode = cliCommands.some((c) =>
+              /^(set |delete |activate |deactivate )/.test(c)
+            );
+            const isOperational = cliCommands.some((c) =>
+              /^(restart |request |clear )/.test(c)
+            );
+            const isMistApiOnly = cliCommands.length === 0;
 
-                if (/login:/i.test(passResult.output)) {
-                  // Mist password rejected — ask user
-                  outputEl.innerHTML += `<div class="check-modal-cmd-error">Mist root password was rejected.</div>`;
-                  const userPw = prompt('Mist root password was rejected.\nEnter the root password for this switch:');
-                  if (!userPw) {
-                    outputEl.innerHTML += `<div class="check-modal-cmd-error">Cannot proceed without login.</div>`;
-                    runFixBtn.textContent = 'Run Fix';
-                    runFixBtn.removeAttribute('disabled');
-                    return;
-                  }
-                  // Try again with user-provided password
-                  await cmdRunner.sendAndWaitFor('root\n', /[Pp]assword:/i, 5000);
-                  const retry = await cmdRunner.sendAndWaitFor(userPw + '\n', />|#|%|login:/i, 10000);
-                  if (/login:/i.test(retry.output)) {
-                    outputEl.innerHTML += `<div class="check-modal-cmd-error">Login failed. Check credentials.</div>`;
-                    runFixBtn.textContent = 'Run Fix';
-                    runFixBtn.removeAttribute('disabled');
-                    return;
-                  }
+            // Step 0: Detect current mode and get to the right place
+            if (!isMistApiOnly) {
+              outputEl.innerHTML += `<div class="check-modal-cmd-line">Detecting CLI mode…</div>`;
+              let currentMode = await cmdRunner.detectMode();
+              outputEl.innerHTML += `<div class="check-modal-cmd-line">Current mode: ${currentMode}</div>`;
+
+              if (currentMode === 'login') {
+                outputEl.innerHTML += `<div class="check-modal-cmd-line">Switch requires login. Attempting to log in…</div>`;
+
+                // Try to get root password from Mist
+                let rootPw: string | null = null;
+                const siteId = ui.mistSite.value;
+                if (siteId && mistApi.isConfigured) {
+                  rootPw = await mistApi.getRootPassword(siteId);
                 }
-              } else {
-                // No Mist password — prompt user with guidance
-                const userPw = prompt(
-                  'The switch requires a password to log in.\n\n' +
-                  'No root password was found in Mist site settings.\n\n' +
-                  'Default credentials:\n' +
-                  '  Username: root\n' +
-                  '  Password: (blank — press OK with empty field for factory default)\n\n' +
-                  'Enter root password (or leave empty for factory default):'
-                );
 
-                if (userPw === null) {
-                  // User cancelled
-                  outputEl.innerHTML += `<div class="check-modal-cmd-error">Cannot proceed without login.</div>`;
+                // Send username 'root'
+                const userResult = await cmdRunner.sendAndWaitFor('root\n', /[Pp]assword:|>|#|%/, 5000);
+
+                if (/[Pp]assword:/i.test(userResult.output)) {
+                  // Password required
+                  if (rootPw) {
+                    outputEl.innerHTML += `<div class="check-modal-cmd-line">Using root password from Mist site settings…</div>`;
+                    const passResult = await cmdRunner.sendAndWaitFor(rootPw + '\n', />|#|%|login:/i, 10000);
+
+                    if (/login:/i.test(passResult.output)) {
+                      // Mist password rejected — ask user
+                      outputEl.innerHTML += `<div class="check-modal-cmd-error">Mist root password was rejected.</div>`;
+                      const userPw = prompt('Mist root password was rejected.\nEnter the root password for this switch:');
+                      if (!userPw) {
+                        outputEl.innerHTML += `<div class="check-modal-cmd-error">Cannot proceed without login.</div>`;
+                        runFixBtn.textContent = 'Run Fix';
+                        runFixBtn.removeAttribute('disabled');
+                        return;
+                      }
+                      // Try again with user-provided password
+                      await cmdRunner.sendAndWaitFor('root\n', /[Pp]assword:/i, 5000);
+                      const retry = await cmdRunner.sendAndWaitFor(userPw + '\n', />|#|%|login:/i, 10000);
+                      if (/login:/i.test(retry.output)) {
+                        outputEl.innerHTML += `<div class="check-modal-cmd-error">Login failed. Check credentials.</div>`;
+                        runFixBtn.textContent = 'Run Fix';
+                        runFixBtn.removeAttribute('disabled');
+                        return;
+                      }
+                    }
+                  } else {
+                    // No Mist password — prompt user with guidance
+                    const userPw = prompt(
+                      'The switch requires a password to log in.\n\n' +
+                      'No root password was found in Mist site settings.\n\n' +
+                      'Default credentials:\n' +
+                      '  Username: root\n' +
+                      '  Password: (blank — press OK with empty field for factory default)\n\n' +
+                      'Enter root password (or leave empty for factory default):'
+                    );
+
+                    if (userPw === null) {
+                      outputEl.innerHTML += `<div class="check-modal-cmd-error">Cannot proceed without login.</div>`;
+                      runFixBtn.textContent = 'Run Fix';
+                      runFixBtn.removeAttribute('disabled');
+                      return;
+                    }
+
+                    if (userPw === '') {
+                      await cmdRunner.send('\n');
+                    } else {
+                      await cmdRunner.send(userPw + '\n');
+                    }
+                    await new Promise((r) => setTimeout(r, 3000));
+                  }
+
+                  // Check if we got past login
+                  if (/%\s*$/.test(userResult.output) || /%/.test(await (async () => { const m = await cmdRunner.detectMode(); return m; })())) {
+                    await cmdRunner.send('cli\n');
+                    await new Promise((r) => setTimeout(r, 1500));
+                  }
+                } else if (/%\s*$/.test(userResult.output)) {
+                  outputEl.innerHTML += `<div class="check-modal-cmd-line">Factory default switch (no password). Entering CLI…</div>`;
+                  await cmdRunner.send('cli\n');
+                  await new Promise((r) => setTimeout(r, 1500));
+                } else if (/>\s*$/.test(userResult.output)) {
+                  outputEl.innerHTML += `<div class="check-modal-cmd-line">Factory default switch (no password). Logged in.</div>`;
+                }
+
+                // Verify we're now logged in
+                currentMode = await cmdRunner.detectMode();
+                if (currentMode === 'login' || currentMode === 'unknown') {
+                  outputEl.innerHTML += `<div class="check-modal-cmd-error">Login failed. Check credentials and try the Login button.</div>`;
                   runFixBtn.textContent = 'Run Fix';
                   runFixBtn.removeAttribute('disabled');
                   return;
                 }
 
-                if (userPw === '') {
-                  // Try empty password (factory default shouldn't ask, but just in case)
-                  await cmdRunner.send('\n');
+                outputEl.innerHTML += `<div class="check-modal-cmd-success">Logged in successfully.</div>`;
+              }
+
+              // For operational commands, ensure we're in operational mode
+              if (isOperational && !needsConfigMode) {
+                await cmdRunner.ensureOperationalMode();
+              }
+
+              // Pre-check: root authentication must exist before committing config
+              if (needsConfigMode) {
+                if (currentMode !== 'operational') {
+                  await cmdRunner.ensureOperationalMode();
+                }
+
+                outputEl.innerHTML += `<div class="check-modal-cmd-line">Checking root authentication…</div>`;
+                const rootAuthCmd = await cmdRunner.execute('show configuration system root-authentication', 10000);
+                const hasRootAuth = rootAuthCmd.success &&
+                  (rootAuthCmd.output.includes('encrypted-password') || rootAuthCmd.output.includes('ssh-'));
+
+                if (!hasRootAuth) {
+                  outputEl.innerHTML += `<div class="check-modal-cmd-error">Root authentication is not configured — required before commit.</div>`;
+
+                  let rootPw: string | null = null;
+                  const siteId = ui.mistSite.value;
+                  if (siteId && mistApi.isConfigured) {
+                    rootPw = await mistApi.getRootPassword(siteId);
+                    if (rootPw) {
+                      outputEl.innerHTML += `<div class="check-modal-cmd-line">Setting root password from Mist site settings…</div>`;
+                    }
+                  }
+
+                  if (!rootPw) {
+                    rootPw = prompt('Root password is not set on this switch.\nEnter a root password to configure:');
+                  }
+
+                  if (!rootPw) {
+                    outputEl.innerHTML += `<div class="check-modal-cmd-error">Cannot proceed without a root password. Set one manually:\n  set system root-authentication plain-text-password</div>`;
+                    runFixBtn.textContent = 'Run Fix';
+                    runFixBtn.removeAttribute('disabled');
+                    return;
+                  }
+
+                  outputEl.innerHTML += `<div class="check-modal-cmd-line"><span class="check-modal-cmd-prompt">&gt;</span> set system root-authentication plain-text-password ••••••••</div>`;
+                  await cmdRunner.ensureConfigMode();
+                  await cmdRunner.send('set system root-authentication plain-text-password\n');
+                  await new Promise((r) => setTimeout(r, 1500));
+                  const pw1 = await cmdRunner.sendAndWaitFor(rootPw + '\n', /[Pp]assword:|secret:|#/, 5000);
+                  if (pw1.matched) {
+                    await cmdRunner.sendAndWaitFor(rootPw + '\n', /#/, 5000);
+                  }
+                  outputEl.innerHTML += `<div class="check-modal-cmd-success">Root password set.</div>`;
                 } else {
-                  await cmdRunner.send(userPw + '\n');
+                  await cmdRunner.ensureConfigMode();
                 }
-                await new Promise((r) => setTimeout(r, 3000));
+
+                outputEl.innerHTML += `<div class="check-modal-cmd-line">In configuration mode.</div>`;
               }
+            } // end if (!isMistApiOnly)
 
-              // Check if we got past login
-              if (/%\s*$/.test(userResult.output) || /%/.test(await (async () => { const m = await cmdRunner.detectMode(); return m; })())) {
-                await cmdRunner.send('cli\n');
-                await new Promise((r) => setTimeout(r, 1500));
-              }
-            } else if (/%\s*$/.test(userResult.output)) {
-              // Factory default — went straight to shell
-              outputEl.innerHTML += `<div class="check-modal-cmd-line">Factory default switch (no password). Entering CLI…</div>`;
-              await cmdRunner.send('cli\n');
-              await new Promise((r) => setTimeout(r, 1500));
-            } else if (/>\s*$/.test(userResult.output)) {
-              // Factory default — went to operational mode
-              outputEl.innerHTML += `<div class="check-modal-cmd-line">Factory default switch (no password). Logged in.</div>`;
-            }
+            // Execute each command
+            for (const cmd of commands) {
+              if (cmd.startsWith('__mist_api_update__')) {
+                const parts = cmd.split('__');
+                const apiSiteId = parts[3];
+                const apiDeviceId = parts[4];
+                const payload = JSON.parse(parts.slice(5).join('__'));
 
-            // Verify we're now logged in
-            currentMode = await cmdRunner.detectMode();
-            if (currentMode === 'login' || currentMode === 'unknown') {
-              outputEl.innerHTML += `<div class="check-modal-cmd-error">Login failed. Check credentials and try the Login button.</div>`;
-              runFixBtn.textContent = 'Run Fix';
-              runFixBtn.removeAttribute('disabled');
-              return;
-            }
+                outputEl.innerHTML += `<div class="check-modal-cmd-line"><span class="check-modal-cmd-prompt">API</span> Updating Mist device config…</div>`;
 
-            outputEl.innerHTML += `<div class="check-modal-cmd-success">Logged in successfully.</div>`;
-          }
-
-          // For operational commands, ensure we're in operational mode
-          if (isOperational && !needsConfigMode) {
-            await cmdRunner.ensureOperationalMode();
-          }
-
-          // Pre-check: root authentication must exist before committing config
-          if (needsConfigMode) {
-            // Make sure we're in operational mode first to check root auth
-            if (currentMode !== 'operational') {
-              await cmdRunner.ensureOperationalMode();
-            }
-
-            outputEl.innerHTML += `<div class="check-modal-cmd-line">Checking root authentication…</div>`;
-            const rootAuthCmd = await cmdRunner.execute('show configuration system root-authentication', 10000);
-            const hasRootAuth = rootAuthCmd.success &&
-              (rootAuthCmd.output.includes('encrypted-password') || rootAuthCmd.output.includes('ssh-'));
-
-            if (!hasRootAuth) {
-              outputEl.innerHTML += `<div class="check-modal-cmd-error">Root authentication is not configured — required before commit.</div>`;
-
-              // Try to get password from Mist API
-              let rootPw: string | null = null;
-              const siteId = ui.mistSite.value;
-              if (siteId && mistApi.isConfigured) {
-                rootPw = await mistApi.getRootPassword(siteId);
-                if (rootPw) {
-                  outputEl.innerHTML += `<div class="check-modal-cmd-line">Setting root password from Mist site settings…</div>`;
+                try {
+                  await mistApi.updateDeviceConfig(apiSiteId, apiDeviceId, payload);
+                  outputEl.innerHTML += `<div class="check-modal-cmd-success">✓ Mist device config updated successfully. Config will be pushed on next sync.</div>`;
+                } catch (apiErr) {
+                  const apiMsg = apiErr instanceof Error ? apiErr.message : String(apiErr);
+                  outputEl.innerHTML += `<div class="check-modal-cmd-error">Mist API update failed: ${escapeHtml(apiMsg)}</div>`;
                 }
+                continue;
               }
 
-              // If no Mist password, prompt the user
-              if (!rootPw) {
-                rootPw = prompt('Root password is not set on this switch.\nEnter a root password to configure:');
+              outputEl.innerHTML += `<div class="check-modal-cmd-line"><span class="check-modal-cmd-prompt">&gt;</span> ${escapeHtml(cmd)}</div>`;
+              const cmdResult = await cmdRunner.execute(cmd, 15000, 2000);
+              const cmdOutput = cmdResult.output.trim();
+              if (cmdOutput) {
+                outputEl.innerHTML += `<pre class="check-modal-cmd-output">${escapeHtml(cmdOutput)}</pre>`;
               }
-
-              if (!rootPw) {
-                outputEl.innerHTML += `<div class="check-modal-cmd-error">Cannot proceed without a root password. Set one manually:\n  set system root-authentication plain-text-password</div>`;
-                runFixBtn.textContent = 'Run Fix';
-                runFixBtn.removeAttribute('disabled');
-                return;
+              if (cmdResult.error) {
+                outputEl.innerHTML += `<div class="check-modal-cmd-error">${escapeHtml(cmdResult.error)}</div>`;
               }
-
-              // Set the root password — enter config mode, set password, exit
-              outputEl.innerHTML += `<div class="check-modal-cmd-line"><span class="check-modal-cmd-prompt">&gt;</span> set system root-authentication plain-text-password ••••••••</div>`;
-              await cmdRunner.ensureConfigMode();
-              await cmdRunner.send('set system root-authentication plain-text-password\n');
-              await new Promise((r) => setTimeout(r, 1500));
-              const pw1 = await cmdRunner.sendAndWaitFor(rootPw + '\n', /[Pp]assword:|secret:|#/, 5000);
-              if (pw1.matched) {
-                await cmdRunner.sendAndWaitFor(rootPw + '\n', /#/, 5000);
-              }
-              // Stay in config mode — we need it for the fix commands
-              outputEl.innerHTML += `<div class="check-modal-cmd-success">Root password set.</div>`;
-            } else {
-              // Enter config mode
-              await cmdRunner.ensureConfigMode();
             }
 
-            outputEl.innerHTML += `<div class="check-modal-cmd-line">In configuration mode.</div>`;
-          }
-          } // end if (!isMistApiOnly)
+            // If we entered config mode, offer to commit
+            if (needsConfigMode) {
+              outputEl.innerHTML += `<div class="check-modal-actions" style="margin-top:10px;">`;
+              outputEl.innerHTML += `<button class="btn btn-primary" id="check-modal-commit">Commit</button>`;
+              outputEl.innerHTML += `<button class="btn btn-secondary" id="check-modal-rollback">Rollback</button>`;
+              outputEl.innerHTML += `</div>`;
 
-          // Execute each command
-          for (const cmd of commands) {
-            // Special command: Mist API update
-            if (cmd.startsWith('__mist_api_update__')) {
-              const parts = cmd.split('__');
-              // Format: __mist_api_update__{siteId}__{deviceId}__{jsonPayload}
-              const apiSiteId = parts[3];
-              const apiDeviceId = parts[4];
-              const payload = JSON.parse(parts.slice(5).join('__'));
+              modal.querySelector('#check-modal-commit')?.addEventListener('click', async () => {
+                const commitBtn = modal.querySelector('#check-modal-commit') as HTMLButtonElement;
+                const rollbackBtn = modal.querySelector('#check-modal-rollback') as HTMLButtonElement;
+                commitBtn.disabled = true;
+                rollbackBtn.disabled = true;
+                commitBtn.textContent = 'Committing…';
 
-              outputEl.innerHTML += `<div class="check-modal-cmd-line"><span class="check-modal-cmd-prompt">API</span> Updating Mist device config…</div>`;
+                const commitResult = await cmdRunner.execute('commit and-quit', 60000, 5000);
+                const commitOutput = commitResult.output.trim();
 
-              try {
-                await mistApi.updateDeviceConfig(apiSiteId, apiDeviceId, payload);
-                outputEl.innerHTML += `<div class="check-modal-cmd-success">✓ Mist device config updated successfully. Config will be pushed on next sync.</div>`;
-              } catch (apiErr) {
-                const apiMsg = apiErr instanceof Error ? apiErr.message : String(apiErr);
-                outputEl.innerHTML += `<div class="check-modal-cmd-error">Mist API update failed: ${escapeHtml(apiMsg)}</div>`;
-              }
-              continue;
+                if (commitOutput.includes('commit complete') || commitOutput.includes('configuration check succeeds')) {
+                  outputEl.innerHTML += `<div class="check-modal-cmd-success">✓ Commit successful</div>`;
+                } else if (commitOutput.includes('error')) {
+                  outputEl.innerHTML += `<div class="check-modal-cmd-error">Commit failed — check output below</div>`;
+                  outputEl.innerHTML += `<pre class="check-modal-cmd-output">${escapeHtml(commitOutput)}</pre>`;
+                } else {
+                  outputEl.innerHTML += `<pre class="check-modal-cmd-output">${escapeHtml(commitOutput)}</pre>`;
+                }
+              });
+
+              modal.querySelector('#check-modal-rollback')?.addEventListener('click', async () => {
+                const commitBtn = modal.querySelector('#check-modal-commit') as HTMLButtonElement;
+                const rollbackBtn = modal.querySelector('#check-modal-rollback') as HTMLButtonElement;
+                commitBtn.disabled = true;
+                rollbackBtn.disabled = true;
+                rollbackBtn.textContent = 'Rolling back…';
+
+                await cmdRunner.execute('rollback 0', 10000);
+                await cmdRunner.execute('exit', 5000);
+                outputEl.innerHTML += `<div class="check-modal-cmd-line">Changes rolled back.</div>`;
+              });
+            } else if (isOperational) {
+              outputEl.innerHTML += `<div class="check-modal-cmd-success">✓ Commands executed</div>`;
             }
 
-            outputEl.innerHTML += `<div class="check-modal-cmd-line"><span class="check-modal-cmd-prompt">&gt;</span> ${escapeHtml(cmd)}</div>`;
-            const cmdResult = await cmdRunner.execute(cmd, 15000, 2000);
-            const cmdOutput = cmdResult.output.trim();
-            if (cmdOutput) {
-              outputEl.innerHTML += `<pre class="check-modal-cmd-output">${escapeHtml(cmdOutput)}</pre>`;
-            }
-            if (cmdResult.error) {
-              outputEl.innerHTML += `<div class="check-modal-cmd-error">${escapeHtml(cmdResult.error)}</div>`;
-            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            outputEl.innerHTML += `<div class="check-modal-cmd-error">Error: ${escapeHtml(msg)}</div>`;
           }
 
-          // If we entered config mode, offer to commit
-          if (needsConfigMode) {
-            outputEl.innerHTML += `<div class="check-modal-actions" style="margin-top:10px;">`;
-            outputEl.innerHTML += `<button class="btn btn-primary" id="check-modal-commit">Commit</button>`;
-            outputEl.innerHTML += `<button class="btn btn-secondary" id="check-modal-rollback">Rollback</button>`;
-            outputEl.innerHTML += `</div>`;
+          runFixBtn.textContent = 'Done';
+        });
+      }
+    } // end renderModal
 
-            document.getElementById('check-modal-commit')?.addEventListener('click', async () => {
-              const commitBtn = document.getElementById('check-modal-commit') as HTMLButtonElement;
-              const rollbackBtn = document.getElementById('check-modal-rollback') as HTMLButtonElement;
-              commitBtn.disabled = true;
-              rollbackBtn.disabled = true;
-              commitBtn.textContent = 'Committing…';
+    renderModal();
 
-              const commitResult = await cmdRunner.execute('commit and-quit', 60000, 5000);
-              const commitOutput = commitResult.output.trim();
-
-              if (commitOutput.includes('commit complete') || commitOutput.includes('configuration check succeeds')) {
-                outputEl.innerHTML += `<div class="check-modal-cmd-success">✓ Commit successful</div>`;
-              } else if (commitOutput.includes('error')) {
-                outputEl.innerHTML += `<div class="check-modal-cmd-error">Commit failed — check output below</div>`;
-                outputEl.innerHTML += `<pre class="check-modal-cmd-output">${escapeHtml(commitOutput)}</pre>`;
-              } else {
-                outputEl.innerHTML += `<pre class="check-modal-cmd-output">${escapeHtml(commitOutput)}</pre>`;
-              }
-            });
-
-            document.getElementById('check-modal-rollback')?.addEventListener('click', async () => {
-              const commitBtn = document.getElementById('check-modal-commit') as HTMLButtonElement;
-              const rollbackBtn = document.getElementById('check-modal-rollback') as HTMLButtonElement;
-              commitBtn.disabled = true;
-              rollbackBtn.disabled = true;
-              rollbackBtn.textContent = 'Rolling back…';
-
-              await cmdRunner.execute('rollback 0', 10000);
-              const quitResult = await cmdRunner.execute('exit', 5000);
-              outputEl.innerHTML += `<div class="check-modal-cmd-line">Changes rolled back.</div>`;
-            });
-          } else if (isOperational) {
-            outputEl.innerHTML += `<div class="check-modal-cmd-success">✓ Commands executed</div>`;
-          }
-
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          outputEl.innerHTML += `<div class="check-modal-cmd-error">Error: ${escapeHtml(msg)}</div>`;
-        }
-
-        runFixBtn.textContent = 'Done';
-      });
-    }
+    // Overlay-level handlers (attached once, survive renderModal re-calls)
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+    document.addEventListener('keydown', function escHandler(e) {
+      if (e.key === 'Escape') {
+        overlay.remove();
+        document.removeEventListener('keydown', escHandler);
+      }
+    });
   }
 
   function renderSummary(results: CheckResult[]): HTMLElement {
@@ -768,11 +964,26 @@ function init(): void {
     allResults: CheckResult[];
   } {
     const allResults: CheckResult[] = [];
+    let testCounter = 0;
+    // Map result id → test number (1-indexed), preserved across re-renders
+    const testNumbers = new Map<string, number>();
 
     // Summary bar at the top
     const summaryEl = document.createElement('div');
     summaryEl.className = 'ts-results-summary-header';
     summaryEl.innerHTML = `<span class="ts-results-title">${title}</span><span class="ts-results-running">Running…</span>`;
+
+    // "Show all tests" toggle row
+    const toggleRow = document.createElement('div');
+    toggleRow.className = 'ts-show-all-toggle';
+    const toggleId = `ts-show-all-${Date.now()}`;
+    toggleRow.innerHTML = `
+      <label class="ts-show-all-label" for="${toggleId}">
+        <input type="checkbox" id="${toggleId}" class="ts-show-all-checkbox">
+        Show all tests
+      </label>
+      <span class="ts-filter-count"></span>
+    `;
 
     // Consolidated log box — all result lines in one place
     const logBox = document.createElement('pre');
@@ -781,7 +992,6 @@ function init(): void {
     logBox.title = 'Click to expand';
 
     logBox.addEventListener('click', () => {
-      // Build all result lines for the modal
       const lines = allResults.map((r) =>
         `[${statusIcon(r.status)}] ${r.name}: ${r.detail}`
       );
@@ -799,14 +1009,50 @@ function init(): void {
 
     // Individual results container (clickable items with detail modals)
     const resultsEl = document.createElement('div');
-    resultsEl.className = 'ts-results-list';
+    resultsEl.className = 'ts-results-list ts-hide-passed';
+
+    // "No issues" message shown when filter hides all results
+    const noIssuesEl = document.createElement('div');
+    noIssuesEl.className = 'ts-no-issues';
+    noIssuesEl.textContent = 'All checks passed — tick "Show all tests" to review.';
+    noIssuesEl.style.display = 'none';
 
     // Wrapper
     const container = document.createElement('div');
     container.className = 'ts-results-container';
     container.appendChild(summaryEl);
+    container.appendChild(toggleRow);
     container.appendChild(logBox);
     container.appendChild(resultsEl);
+    container.appendChild(noIssuesEl);
+
+    // Toggle handler
+    const checkbox = toggleRow.querySelector<HTMLInputElement>('.ts-show-all-checkbox')!;
+    const filterCountEl = toggleRow.querySelector<HTMLElement>('.ts-filter-count')!;
+
+    const updateFilterState = () => {
+      if (checkbox.checked) {
+        resultsEl.classList.remove('ts-hide-passed');
+        noIssuesEl.style.display = 'none';
+      } else {
+        resultsEl.classList.add('ts-hide-passed');
+        // Count visible (non-pass, non-skip) items
+        const visibleCount = allResults.filter(
+          (r) => r.status !== 'pass' && r.status !== 'skip'
+        ).length;
+        noIssuesEl.style.display = visibleCount === 0 && allResults.length > 0 ? '' : 'none';
+      }
+      // Update filter count label
+      if (!checkbox.checked && allResults.length > 0) {
+        const issueCount = allResults.filter((r) => r.status !== 'pass' && r.status !== 'skip').length;
+        filterCountEl.textContent = issueCount === 0
+          ? `${allResults.length} of ${allResults.length} shown`
+          : `${issueCount} of ${allResults.length} shown`;
+      } else {
+        filterCountEl.textContent = allResults.length > 0 ? `${allResults.length} of ${allResults.length} shown` : '';
+      }
+    };
+    checkbox.addEventListener('change', updateFilterState);
 
     const updateSummary = () => {
       const counts = { pass: 0, fail: 0, warn: 0, skip: 0, info: 0 };
@@ -820,21 +1066,29 @@ function init(): void {
         <span class="ts-summary-warn">⚠${counts.warn}</span>
         <span class="ts-summary-skip">—${counts.skip}</span>
       `;
+      updateFilterState();
     };
 
     const addResult = (result: CheckResult) => {
       allResults.push(result);
 
+      // Assign a test number (stable across re-renders of the same check)
+      if (!testNumbers.has(result.id)) {
+        testCounter++;
+        testNumbers.set(result.id, testCounter);
+      }
+      const num = testNumbers.get(result.id)!;
+
       // Add to the consolidated log box
       const line = document.createElement('div');
       line.className = `ts-log-line ${result.status}`;
-      line.textContent = `[${statusIcon(result.status)}] ${result.name}: ${result.detail}`;
+      line.textContent = `[${num}] [${statusIcon(result.status)}] ${result.name}: ${result.detail}`;
       logBox.appendChild(line);
       logBox.scrollTop = logBox.scrollHeight;
 
       // Add to the clickable results list
       const existing = document.getElementById(`ts-check-${result.id}`);
-      const rendered = renderCheckResult(result, allResults);
+      const rendered = renderCheckResult(result, allResults, num);
       if (existing) {
         existing.replaceWith(rendered);
       } else {
@@ -861,6 +1115,7 @@ function init(): void {
       } else if (counts.fail > 0) {
         summaryEl.classList.add('has-fail');
       }
+      updateFilterState();
     };
 
     return { container, addResult, finalise, allResults };
@@ -1121,6 +1376,8 @@ function init(): void {
 
   // ---- Device Identification ----
   async function identifySwitch(): Promise<void> {
+    clearMistPollState();
+    setMistCloudBadge('checking');
     ui.btnIdentify.disabled = true;
     ui.deviceIdentity.innerHTML = '<div class="status-text info">Identifying switch…</div>';
 
@@ -1168,11 +1425,12 @@ function init(): void {
             ? 'mist-status-pill mist-status-disconnected'
             : 'mist-status-pill mist-status-unknown';
         const pillLabel = cloudReachable ? 'Connected' : cloudDisconnected ? 'Disconnected' : 'Unknown';
-        html += `<div class="${pillClass}">${pillLabel}</div>`;
+        html += `<div id="mist-status-pill" class="${pillClass}">${pillLabel}</div>`;
         term.writeSystem(`  Mist cloud state: ${pillLabel}`);
+        setMistCloudBadge(cloudReachable ? 'online' : cloudDisconnected ? 'offline' : 'offline');
 
         if (result.mistLastSeenUtcIso) {
-          html += `<div class="device-info-row"><span class="device-info-label">Last seen (UTC)</span><span class="device-info-value">${result.mistLastSeenUtcIso}</span></div>`;
+          html += `<div class="device-info-row"><span class="device-info-label">Last seen (UTC)</span><span id="mist-last-seen-value" class="device-info-value">${result.mistLastSeenUtcIso}</span></div>`;
           term.writeSystem(`  Last seen (UTC): ${result.mistLastSeenUtcIso}`);
         }
         if (result.mistLastConfigUtcIso) {
@@ -1184,6 +1442,8 @@ function init(): void {
           html += `<div class="device-info-row"><span class="device-info-label">Mist cloud</span><span class="device-info-value">${result.mistCloudStatusLine}</span></div>`;
           term.writeSystem(`  Mist cloud: ${result.mistCloudStatusLine}`);
         }
+
+        html += `<div id="mist-poll-status" class="mist-poll-status">Polling Mist every 30s…</div>`;
 
         if (result.mistCloudReachableHint) {
           html +=
@@ -1199,16 +1459,25 @@ function init(): void {
       } else if (!mistApi.isConfigured) {
         html += '<div class="device-mist-match no-api">Mist API not configured — cannot search inventory</div>';
         term.writeSystem('  Mist: API not configured');
+        setMistCloudBadge('offline');
       } else {
         html += '<div class="device-mist-match not-found">Not found in Mist inventory</div>';
         term.writeSystem('  Mist: Not found in inventory');
+        setMistCloudBadge('offline');
       }
 
       ui.deviceIdentity.innerHTML = html;
+
+      // Start polling Mist online status every 30s.
+      // site_id can be null — inventory fallback is used for unassigned devices.
+      if (lastMatchResult?.mistDevice?.id && mistApi.isConfigured) {
+        startMistStatusPoll(lastMatchResult.mistDevice.site_id ?? null, lastMatchResult.mistDevice.id);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       ui.deviceIdentity.innerHTML = `<div class="status-text error">Error: ${msg}</div>`;
       term.writeError(`Identification failed: ${msg}`);
+      setMistCloudBadge('offline');
     } finally {
       ui.btnIdentify.disabled = false;
     }
@@ -1532,6 +1801,13 @@ function init(): void {
   }
 
   // ---- Event listeners ----
+  ui.mistCloudBadge.addEventListener('click', () => {
+    if (mistPollDeviceId) {
+      setMistCloudBadge('checking');
+      void pollMistStatus();
+    }
+  });
+
   ui.btnConnect.addEventListener('click', connect);
   ui.btnDisconnect.addEventListener('click', disconnect);
   ui.btnClear.addEventListener('click', () => term.clear());

@@ -127,6 +127,74 @@ html, body {
   border: 1px solid rgba(56, 139, 253, 0.3);
 }
 
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Mist cloud status badge (header) */
+.mist-cloud-badge {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 20px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+  transition: opacity 0.15s;
+}
+
+.mist-cloud-badge:hover {
+  opacity: 0.8;
+}
+
+.mist-cloud-badge::before {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.mist-cloud-badge-online {
+  background: rgba(35, 134, 54, 0.15);
+  color: #41d87b;
+  border: 1px solid rgba(35, 134, 54, 0.3);
+}
+
+.mist-cloud-badge-online::before {
+  background: #41d87b;
+  box-shadow: 0 0 5px rgba(65, 216, 123, 0.7);
+}
+
+.mist-cloud-badge-offline {
+  background: rgba(218, 54, 51, 0.15);
+  color: var(--text-error);
+  border: 1px solid rgba(218, 54, 51, 0.3);
+}
+
+.mist-cloud-badge-offline::before {
+  background: var(--text-error);
+}
+
+.mist-cloud-badge-checking {
+  background: rgba(139, 148, 158, 0.12);
+  color: var(--text-secondary);
+  border: 1px solid rgba(139, 148, 158, 0.3);
+}
+
+.mist-cloud-badge-checking::before {
+  background: var(--text-secondary);
+  opacity: 0.5;
+}
+
 /* ---- Main layout ---- */
 #main {
   display: flex;
@@ -482,6 +550,78 @@ html, body {
   color: var(--text-muted);
 }
 
+/* Test number badge */
+.ts-check-number {
+  flex-shrink: 0;
+  min-width: 20px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 3px;
+  padding: 0 4px;
+  margin-top: 1px;
+}
+
+/* "Show all tests" toggle row */
+.ts-show-all-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.ts-show-all-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  user-select: none;
+}
+
+.ts-show-all-label:hover {
+  color: var(--text-primary);
+}
+
+.ts-show-all-checkbox {
+  width: 13px;
+  height: 13px;
+  cursor: pointer;
+  accent-color: var(--accent-blue);
+}
+
+.ts-filter-count {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+/* Hidden pass/skip tests when filter is active */
+.ts-hide-passed .ts-check.pass,
+.ts-hide-passed .ts-check.skip {
+  display: none;
+}
+
+/* "No issues found" message */
+.ts-no-issues {
+  padding: 12px 14px;
+  font-size: 11px;
+  color: #41d87b;
+  font-family: var(--font-mono);
+  text-align: center;
+  background: rgba(65, 216, 123, 0.06);
+}
+
 /* ---- Check Detail Modal ---- */
 .check-modal-overlay {
   position: fixed;
@@ -527,6 +667,17 @@ html, body {
   flex: 1;
 }
 
+.check-modal-number {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 3px;
+  padding: 1px 5px;
+  flex-shrink: 0;
+}
+
 .check-modal-close {
   background: none;
   border: none;
@@ -539,6 +690,46 @@ html, body {
 
 .check-modal-close:hover {
   color: var(--text-primary);
+}
+
+/* "Run Test Now" button in modal header */
+.check-modal-header .btn-sm {
+  font-size: 11px;
+  padding: 3px 10px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.check-modal-run-error {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-error);
+  padding: 2px 6px;
+}
+
+/* "What this test checks" description band */
+.check-modal-description {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 16px;
+  background: rgba(121, 192, 255, 0.06);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.check-modal-description-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent-blue);
+}
+
+.check-modal-description-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
 }
 
 .check-modal-detail {
@@ -841,6 +1032,13 @@ html, body {
   color: var(--text-secondary);
   background: rgba(139, 148, 158, 0.12);
   border-color: rgba(139, 148, 158, 0.3);
+}
+
+.mist-poll-status {
+  font-size: 10px;
+  color: var(--text-secondary);
+  margin: 2px 0 6px;
+  opacity: 0.7;
 }
 
 /* ---- Config Drift Results ---- */
