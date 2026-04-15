@@ -356,22 +356,47 @@ function sendSerial(text) {
 
 // ── Mist API helper ────────────────────────────────────────────────────────
 
-function mistRequest(method, path, body) {
-  return new Promise((resolve, reject) => {
-    if (!MIST_API_HOST || !MIST_API_TOKEN) {
-      reject(new Error('Mist API credentials not configured (MIST_API_HOST, MIST_API_TOKEN).'));
-      return;
-    }
+/**
+ * Resolve Mist credentials for a tool call.
+ * Per-call parameters take priority; module-level env vars are the fallback.
+ *
+ * @param {object} input - tool input (may contain api_host, api_token, org_id)
+ * @returns {{ apiHost: string, apiToken: string, orgId: string } | { error: string }}
+ */
+function resolveMistCreds(input = {}) {
+  const apiHost  = (input.api_host  || MIST_API_HOST  || '').trim();
+  const apiToken = (input.api_token || MIST_API_TOKEN || '').trim();
+  const orgId    = (input.org_id    || MIST_ORG_ID    || '').trim();
+  if (!apiHost || !apiToken) {
+    return {
+      error: 'Mist API credentials not configured. ' +
+             'Provide api_host, api_token, and org_id parameters, ' +
+             'or set MIST_API_HOST / MIST_API_TOKEN / MIST_ORG_ID env vars.',
+    };
+  }
+  return { apiHost, apiToken, orgId };
+}
 
+/**
+ * Make an HTTPS request to the Mist API.
+ *
+ * @param {string} method
+ * @param {string} path
+ * @param {object|null} body
+ * @param {string} apiHost
+ * @param {string} apiToken
+ */
+function mistRequest(method, path, body, apiHost, apiToken) {
+  return new Promise((resolve, reject) => {
     const requestBody = body != null ? JSON.stringify(body) : null;
     const headers = {
-      Authorization: `Token ${MIST_API_TOKEN}`,
+      Authorization: `Token ${apiToken}`,
       'Content-Type': 'application/json',
     };
     if (requestBody) headers['Content-Length'] = Buffer.byteLength(requestBody);
 
     const req = https.request(
-      { hostname: MIST_API_HOST, path, method, headers },
+      { hostname: apiHost, path, method, headers },
       (res) => {
         let data = '';
         res.on('data', (c) => { data += c; });
@@ -460,30 +485,36 @@ async function toolGetSessionState() {
   return { content: [{ type: 'text', text: JSON.stringify({ mode }) }] };
 }
 
-async function toolMistApiGet({ path }) {
+async function toolMistApiGet(input) {
+  const creds = resolveMistCreds(input);
+  if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
   try {
-    const result = await mistRequest('GET', path, null);
+    const result = await mistRequest('GET', input.path, null, creds.apiHost, creds.apiToken);
     return { content: [{ type: 'text', text: JSON.stringify(result) }] };
   } catch (err) {
     return { isError: true, content: [{ type: 'text', text: err.message }] };
   }
 }
 
-async function toolMistApiPut({ path, body }) {
+async function toolMistApiPut(input) {
+  const creds = resolveMistCreds(input);
+  if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
   try {
-    const result = await mistRequest('PUT', path, body);
+    const result = await mistRequest('PUT', input.path, input.body, creds.apiHost, creds.apiToken);
     return { content: [{ type: 'text', text: JSON.stringify(result) }] };
   } catch (err) {
     return { isError: true, content: [{ type: 'text', text: err.message }] };
   }
 }
 
-async function toolListSites() {
-  if (!MIST_ORG_ID) {
-    return { isError: true, content: [{ type: 'text', text: 'MIST_ORG_ID not configured.' }] };
+async function toolListSites(input = {}) {
+  const creds = resolveMistCreds(input);
+  if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
+  if (!creds.orgId) {
+    return { isError: true, content: [{ type: 'text', text: 'org_id is required for list_sites.' }] };
   }
   try {
-    const result = await mistRequest('GET', `/api/v1/orgs/${MIST_ORG_ID}/sites`, null);
+    const result = await mistRequest('GET', `/api/v1/orgs/${creds.orgId}/sites`, null, creds.apiHost, creds.apiToken);
     const sites = Array.isArray(result.body)
       ? result.body.map((s) => ({ id: s.id, name: s.name }))
       : result.body;
@@ -493,32 +524,38 @@ async function toolListSites() {
   }
 }
 
-async function toolGetDeviceConfig({ site_id, device_id }) {
+async function toolGetDeviceConfig(input) {
+  const creds = resolveMistCreds(input);
+  if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
   try {
-    const result = await mistRequest('GET', `/api/v1/sites/${site_id}/devices/${device_id}`, null);
+    const result = await mistRequest('GET', `/api/v1/sites/${input.site_id}/devices/${input.device_id}`, null, creds.apiHost, creds.apiToken);
     return { content: [{ type: 'text', text: JSON.stringify(result) }] };
   } catch (err) {
     return { isError: true, content: [{ type: 'text', text: err.message }] };
   }
 }
 
-async function toolGetDeviceStats({ site_id, device_id }) {
+async function toolGetDeviceStats(input) {
+  const creds = resolveMistCreds(input);
+  if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
   try {
-    const result = await mistRequest('GET', `/api/v1/sites/${site_id}/stats/devices/${device_id}`, null);
+    const result = await mistRequest('GET', `/api/v1/sites/${input.site_id}/stats/devices/${input.device_id}`, null, creds.apiHost, creds.apiToken);
     return { content: [{ type: 'text', text: JSON.stringify(result) }] };
   } catch (err) {
     return { isError: true, content: [{ type: 'text', text: err.message }] };
   }
 }
 
-async function toolGetInventory({ site_id } = {}) {
-  if (!MIST_ORG_ID) {
-    return { isError: true, content: [{ type: 'text', text: 'MIST_ORG_ID not configured.' }] };
+async function toolGetInventory(input = {}) {
+  const creds = resolveMistCreds(input);
+  if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
+  if (!creds.orgId) {
+    return { isError: true, content: [{ type: 'text', text: 'org_id is required for get_inventory.' }] };
   }
   try {
-    const result = await mistRequest('GET', `/api/v1/orgs/${MIST_ORG_ID}/inventory?type=switch`, null);
+    const result = await mistRequest('GET', `/api/v1/orgs/${creds.orgId}/inventory?type=switch`, null, creds.apiHost, creds.apiToken);
     let devices = Array.isArray(result.body) ? result.body : [];
-    if (site_id) devices = devices.filter((d) => d.site_id === site_id);
+    if (input.site_id) devices = devices.filter((d) => d.site_id === input.site_id);
     const mapped = devices.map((d) => ({
       id: d.id,
       name: d.name,
@@ -533,9 +570,11 @@ async function toolGetInventory({ site_id } = {}) {
   }
 }
 
-async function toolGetSiteSetting({ site_id }) {
+async function toolGetSiteSetting(input) {
+  const creds = resolveMistCreds(input);
+  if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
   try {
-    const result = await mistRequest('GET', `/api/v1/sites/${site_id}/setting`, null);
+    const result = await mistRequest('GET', `/api/v1/sites/${input.site_id}/setting`, null, creds.apiHost, creds.apiToken);
     return { content: [{ type: 'text', text: JSON.stringify(result) }] };
   } catch (err) {
     return { isError: true, content: [{ type: 'text', text: err.message }] };
@@ -543,6 +582,22 @@ async function toolGetSiteSetting({ site_id }) {
 }
 
 // ── Tool definitions ───────────────────────────────────────────────────────
+
+/** Optional per-call Mist credential properties, shared across all Mist API tool schemas. */
+const MIST_CRED_PROPS = {
+  api_host: {
+    type: 'string',
+    description: 'Mist API host (e.g. api.gc1.mist.com). Falls back to MIST_API_HOST env var.',
+  },
+  api_token: {
+    type: 'string',
+    description: 'Mist API token. Falls back to MIST_API_TOKEN env var.',
+  },
+  org_id: {
+    type: 'string',
+    description: 'Mist organization ID. Falls back to MIST_ORG_ID env var.',
+  },
+};
 
 const TOOLS = [
   {
@@ -592,76 +647,82 @@ const TOOLS = [
   },
   {
     name: 'mist_api_get',
-    description: 'Make a GET request to the Mist API.',
+    description: 'Make a GET request to the Mist API. Credentials fall back to server env vars if not supplied.',
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'API path, e.g. /api/v1/orgs/{org_id}/sites' },
+        ...MIST_CRED_PROPS,
       },
       required: ['path'],
     },
   },
   {
     name: 'mist_api_put',
-    description: 'Make a PUT request to the Mist API.',
+    description: 'Make a PUT request to the Mist API. Credentials fall back to server env vars if not supplied.',
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'API path.' },
         body: { type: 'object', description: 'JSON body to send.' },
+        ...MIST_CRED_PROPS,
       },
       required: ['path', 'body'],
     },
   },
   {
     name: 'list_sites',
-    description: 'List all sites in the configured Mist org. Returns id and name for each site.',
-    inputSchema: { type: 'object', properties: {} },
+    description: 'List all sites in the Mist org. Returns id and name for each site. Credentials fall back to server env vars if not supplied.',
+    inputSchema: {
+      type: 'object',
+      properties: { ...MIST_CRED_PROPS },
+    },
   },
   {
     name: 'get_device_config',
-    description: 'Get the full device configuration from Mist for a specific switch.',
+    description: 'Get the full device configuration from Mist for a specific switch. Credentials fall back to server env vars if not supplied.',
     inputSchema: {
       type: 'object',
       properties: {
         site_id: { type: 'string', description: 'Mist site ID.' },
         device_id: { type: 'string', description: 'Mist device ID.' },
+        ...MIST_CRED_PROPS,
       },
       required: ['site_id', 'device_id'],
     },
   },
   {
     name: 'get_device_stats',
-    description: 'Get live device stats (including port_stat) from Mist for a specific switch.',
+    description: 'Get live device stats (including port_stat) from Mist for a specific switch. Credentials fall back to server env vars if not supplied.',
     inputSchema: {
       type: 'object',
       properties: {
         site_id: { type: 'string', description: 'Mist site ID.' },
         device_id: { type: 'string', description: 'Mist device ID.' },
+        ...MIST_CRED_PROPS,
       },
       required: ['site_id', 'device_id'],
     },
   },
   {
     name: 'get_inventory',
-    description: 'Get the switch inventory for the configured Mist org, optionally filtered by site.',
+    description: 'Get the switch inventory for a Mist org, optionally filtered by site. Credentials fall back to server env vars if not supplied.',
     inputSchema: {
       type: 'object',
       properties: {
-        site_id: {
-          type: 'string',
-          description: 'If provided, only return devices assigned to this site.',
-        },
+        site_id: { type: 'string', description: 'If provided, only return devices assigned to this site.' },
+        ...MIST_CRED_PROPS,
       },
     },
   },
   {
     name: 'get_site_setting',
-    description: 'Get site settings from Mist, including switch_mgmt.root_password.',
+    description: 'Get site settings from Mist, including switch_mgmt.root_password. Credentials fall back to server env vars if not supplied.',
     inputSchema: {
       type: 'object',
       properties: {
         site_id: { type: 'string', description: 'Mist site ID.' },
+        ...MIST_CRED_PROPS,
       },
       required: ['site_id'],
     },
@@ -688,7 +749,7 @@ function createMcpServer() {
       case 'get_session_state': return toolGetSessionState();
       case 'mist_api_get':      return toolMistApiGet(input);
       case 'mist_api_put':      return toolMistApiPut(input);
-      case 'list_sites':        return toolListSites();
+      case 'list_sites':        return toolListSites(input);
       case 'get_device_config': return toolGetDeviceConfig(input);
       case 'get_device_stats':  return toolGetDeviceStats(input);
       case 'get_inventory':     return toolGetInventory(input);
