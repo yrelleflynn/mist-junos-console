@@ -1001,6 +1001,101 @@ html, body {
   border-color: rgba(139, 148, 158, 0.3);
 }
 
+.cloud-status-panel {
+  margin-top: 10px;
+  padding: 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+
+.cloud-status-panel-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.cloud-status-panel-title {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.cloud-status-panel-meta {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.cloud-status-grid {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.cloud-status-card {
+  padding: 8px;
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.cloud-status-card-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.cloud-status-card-detail {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-primary);
+}
+
+.cloud-status-pill {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.cloud-status-pill.state-connected,
+.cloud-status-pill.state-pass {
+  color: #41d87b;
+  background: rgba(35, 134, 54, 0.15);
+  border-color: rgba(35, 134, 54, 0.35);
+}
+
+.cloud-status-pill.state-disconnected,
+.cloud-status-pill.state-fail {
+  color: var(--text-error);
+  background: rgba(218, 54, 51, 0.12);
+  border-color: rgba(218, 54, 51, 0.35);
+}
+
+.cloud-status-pill.state-degraded,
+.cloud-status-pill.state-warn {
+  color: #e3b341;
+  background: rgba(227, 179, 65, 0.14);
+  border-color: rgba(227, 179, 65, 0.35);
+}
+
+.cloud-status-pill.state-info,
+.cloud-status-pill.state-unknown {
+  color: var(--text-secondary);
+  background: rgba(139, 148, 158, 0.12);
+  border-color: rgba(139, 148, 158, 0.3);
+}
+
 /* ---- Config Drift Results ---- */
 #config-drift-results {
   margin-top: 10px;

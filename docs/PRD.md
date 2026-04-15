@@ -133,6 +133,31 @@ Based on the current implementation, the product already includes:
 - The app must allow configuration of Mist cloud, API token, org, and site.
 - The app must retrieve site lists and relevant device/site data from Mist.
 - The app must identify devices by serial, MAC, or hostname where possible.
+- The product should use Mist APIs in a layered way: session context first, then device intent and last-known device status after switch identification.
+- The UI should distinguish between live console-derived state, Mist intended state, and Mist last-known state.
+
+#### Current vs target Mist auth model
+
+Current state:
+
+- this tool is a separate frontend and backend
+- the backend needs an explicit way to call Mist APIs
+- the current user-facing cloud, token, org, and site inputs are acceptable as a prototype and development model
+- the fact that a user may already be logged into the Mist UI does not automatically give this tool’s backend access to Mist APIs
+
+Target state:
+
+- this tool should eventually be launched from or hosted by Mist
+- the user should not need to manually enter Mist API credentials
+- the tool should inherit user, org, and site context through trusted Mist authentication and backend integration
+- backend-owned Mist API access should remain the architectural pattern, even when the user-facing credential step disappears
+
+Design implication:
+
+- do not design around directly reusing an arbitrary browser Mist session as the primary long-term model
+- design around a trusted auth and context handoff from Mist to this tool, with the backend continuing to own Mist API interactions
+
+See [`docs/MIST-API-INTEGRATION.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/MIST-API-INTEGRATION.md) for the detailed endpoint usage model.
 
 ### Troubleshooting
 
@@ -140,6 +165,10 @@ Based on the current implementation, the product already includes:
 - Checks must support stop conditions for missing prerequisites such as no management IP or no default route.
 - Each check must produce a status, explanation, raw evidence, and remediation guidance where applicable.
 - The troubleshooting flow must remain understandable to non-expert operators.
+- For disconnect investigation, the product should prefer collecting and presenting evidence over making overconfident claims about exact root cause.
+- The troubleshooting flow should incorporate high-signal device-native status indicators where available, including the JMA cloud connectivity state reported by the switch.
+- The UI should keep both Mist device connected state and switch-reported JMA connectivity state visible as separate but related indicators.
+- The product should periodically refresh lightweight status indicators such as Mist device status and JMA connectivity state while the session is active.
 
 ### Config comparison
 
@@ -160,6 +189,7 @@ Based on the current implementation, the product already includes:
 - The app must mirror RX and TX traffic appropriately.
 - The product must make the trust boundary obvious to the operator.
 - The product must clearly indicate whether a session participant is a human support user or an AI agent.
+- AI agent integration should prefer read-only Mist context plus backend-owned live session/workflow tools rather than unrestricted raw command access.
 
 ## Non-Functional Requirements
 
@@ -261,13 +291,14 @@ As an operator recovering a disconnected switch, I want to preview and apply the
 
 1. The tool identifies the switch and matches it to the correct Mist device.
 2. The tool fetches the full intended config from Mist, for example via `config_cmd`.
-3. The tool stages the config in Junos configuration mode.
-4. The tool generates a preview diff where possible using Junos-native comparison such as `show | compare`.
-5. The user explicitly approves the final apply step.
-6. The tool runs `commit check`.
-7. If `commit check` succeeds, the tool performs the final commit with a clear comment, for example:
+3. The tool prepends the known Mist-managed cleanup delete commands before the retrieved `set` commands.
+4. The tool stages the candidate config in Junos configuration mode.
+5. The tool generates a preview diff where possible using Junos-native comparison such as `show | compare`.
+6. The user explicitly approves the final apply step.
+7. The tool runs `commit check`.
+8. If `commit check` succeeds, the tool performs the final commit with a clear comment, for example:
    `commit comment "junos console bridge Mist UI config sync"`
-8. The tool shows post-commit verification and rollback guidance.
+9. The tool shows post-commit verification and rollback guidance.
 
 #### Scope decisions
 
@@ -277,7 +308,7 @@ As an operator recovering a disconnected switch, I want to preview and apply the
 - the workflow should rely on `commit check` before final commit
 - rollback should be manual but guided
 - unmanaged config should be preserved
-- Mist-managed config may be updated or removed as needed
+- Mist-managed config should be cleared using the known Mist cleanup delete commands before the intended `set` commands are applied
 
 #### Safety and rollback model
 
@@ -292,12 +323,20 @@ As an operator recovering a disconnected switch, I want to preview and apply the
 
 #### Mist alignment requirement
 
-The workflow should mirror Mist behavior as closely as possible. The last Mist `via netconf` commit should align with the Mist device `config_timestamp` or “last config” time when detectable.
+The workflow should mirror Mist behavior as closely as possible. The current known model is:
+
+1. apply the Mist-managed cleanup delete commands
+2. apply the intended `set` commands from `config_cmd`
+3. run `commit check`
+4. commit
+
+The last Mist `via netconf` commit should align with the Mist device `config_timestamp` or “last config” time when detectable.
 
 #### Acceptance criteria
 
 - feature is available only after successful device identification and Mist matching
 - tool fetches the full intended Mist config
+- tool prepends the known Mist cleanup delete commands before the intended `set` commands
 - tool stages the config and produces a Junos-style diff preview where possible
 - user must explicitly approve before final commit
 - tool runs `commit check` before final commit
@@ -307,9 +346,32 @@ The workflow should mirror Mist behavior as closely as possible. The last Mist `
 - tool shows post-commit verification guidance using `show system commit`
 - tool can point to the most recent Mist-driven config timestamp when available
 
-#### Open question
+#### Current known cleanup domains
 
-How Mist determines deletion and cleanup of previously managed config during reprovision still needs to be confirmed for faithful implementation.
+The current known Mist cleanup step deletes the following managed configuration domains before applying the intended `set` commands:
+
+- `delete protocols`
+- `delete interfaces`
+- `delete apply-groups`
+- `delete groups`
+- `delete vlans`
+- `delete system syslog`
+- `delete snmp`
+- `delete firewall`
+- `delete routing-instances`
+- `delete forwarding-options`
+- `delete policy-options`
+- `delete system ntp`
+- `delete system name-server`
+- `delete routing-options`
+- `delete system time-zone`
+- `delete system host-name`
+- `delete virtual-chassis`
+- `delete class-of-service`
+- `delete access`
+- `delete system processes dhcp-service traceoptions`
+
+This should be treated as the current known Mist-managed cleanup list and verified over time against Mist behavior.
 
 ### Priority Feature B: Live Switch Front Panel View
 

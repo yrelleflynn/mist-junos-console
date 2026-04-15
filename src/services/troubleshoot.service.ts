@@ -14,6 +14,12 @@ import {
   getJunosLogLineUtcMs,
   parseCurrentTimeFromUptime,
 } from '../utils/junos-log-time';
+import {
+  LldpNeighbor,
+  parseLldpNeighborsOutput,
+  selectUplinkNeighbor,
+} from './troubleshoot/parsers/lldp.parser';
+import { parseJmaConnectivityState } from './troubleshoot/parsers/jma-connectivity.parser';
 
 export type CheckStatus = 'pending' | 'running' | 'pass' | 'fail' | 'warn' | 'skip' | 'info';
 
@@ -29,13 +35,7 @@ export interface CheckResult {
 
 export type CheckProgressCallback = (result: CheckResult) => void;
 
-export interface LldpNeighbor {
-  localInterface: string;
-  parentInterface: string;
-  chassisId: string;     // MAC address of the upstream switch
-  portInfo: string;      // Port description/name on the upstream switch (Mist port alias)
-  systemName: string;    // Hostname of the upstream switch
-}
+export type { LldpNeighbor } from './troubleshoot/parsers/lldp.parser';
 
 export interface UpstreamPortConfig {
   neighborName: string;
@@ -414,6 +414,32 @@ export class TroubleshootService {
     results.push(...timelineResults);
 
     return results;
+  }
+
+  async getJmaConnectivityState(options: { silent?: boolean } = {}) {
+    const cmd = await this.runner.execute('show lldp local-information', 15000, 3000, {
+      silent: options.silent,
+    });
+    if (!cmd.success && !cmd.output.trim()) {
+      return {
+        code: null,
+        name: 'Unknown',
+        severity: 'unknown' as const,
+        label: 'Unknown',
+        message: '',
+        errno: null,
+        detail: cmd.error || 'Could not read switch-reported JMA connectivity state.',
+      };
+    }
+
+    const parsed = parseJmaConnectivityState(cmd.output);
+    if (parsed.code === null && !cmd.success) {
+      return {
+        ...parsed,
+        detail: cmd.error || parsed.detail,
+      };
+    }
+    return parsed;
   }
 
   // ---- Individual checks ----
@@ -971,26 +997,9 @@ export class TroubleshootService {
       };
     }
 
-    const lines = cmd.output.split('\n').filter((l) => l.trim().length > 0);
+    const { neighbors } = parseLldpNeighborsOutput(cmd.output);
 
-    // Find the header line to determine column positions
-    const headerLine = lines.find((l) => /Local Interface/i.test(l));
-    let colPositions = { localIf: 0, parentIf: 0, chassisId: 0, portInfo: 0, systemName: 0 };
-
-    if (headerLine) {
-      colPositions = {
-        localIf: headerLine.indexOf('Local Interface'),
-        parentIf: headerLine.indexOf('Parent Interface'),
-        chassisId: headerLine.indexOf('Chassis Id'),
-        portInfo: headerLine.indexOf('Port info'),
-        systemName: headerLine.indexOf('System Name'),
-      };
-    }
-
-    // Parse LLDP neighbor lines
-    const neighborLines = lines.filter((l) => /^(ge-|xe-|et-|mge-)/.test(l.trim()));
-
-    if (neighborLines.length === 0) {
+    if (neighbors.length === 0) {
       return {
         result: { id, name, status: 'fail', detail: 'No LLDP neighbors found', raw: cmd.output },
         detectedPort: null,
@@ -998,43 +1007,7 @@ export class TroubleshootService {
       };
     }
 
-    // Parse the first neighbor (uplink) using column positions
-    const parseLine = (line: string): LldpNeighbor => {
-      if (colPositions.systemName > 0) {
-        // Use column positions from header
-        return {
-          localInterface: line.substring(colPositions.localIf, colPositions.parentIf).trim(),
-          parentInterface: line.substring(colPositions.parentIf, colPositions.chassisId).trim(),
-          chassisId: line.substring(colPositions.chassisId, colPositions.portInfo).trim(),
-          portInfo: line.substring(colPositions.portInfo, colPositions.systemName).trim(),
-          systemName: line.substring(colPositions.systemName).trim(),
-        };
-      }
-      // Fallback: split by whitespace (less reliable for multi-word port info)
-      const parts = line.trim().split(/\s{2,}/);
-      return {
-        localInterface: parts[0] || '',
-        parentInterface: parts[1] || '',
-        chassisId: parts[2] || '',
-        portInfo: parts[3] || '',
-        systemName: parts[4] || '',
-      };
-    };
-
-    // Parse all neighbors
-    const neighbors = neighborLines.map(parseLine);
-
-    // Find the uplink neighbor
-    let uplinkNeighbor: LldpNeighbor | null = null;
-    let detectedPort: string | null = null;
-
-    if (userPort) {
-      uplinkNeighbor = neighbors.find((n) => n.localInterface === userPort) || neighbors[0];
-      detectedPort = userPort;
-    } else {
-      uplinkNeighbor = neighbors[0];
-      detectedPort = uplinkNeighbor.localInterface || null;
-    }
+    const { neighbor: uplinkNeighbor, detectedPort } = selectUplinkNeighbor(neighbors, userPort);
 
     const count = neighbors.length;
     let detail = `${count} neighbor(s). Uplink: ${detectedPort || 'none'}`;

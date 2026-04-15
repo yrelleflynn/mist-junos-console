@@ -167,6 +167,25 @@ Recommended first targets:
 
 See [`docs/REFACTOR-CYCLE-1.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/REFACTOR-CYCLE-1.md) for the concrete scope, work order, and exit criteria.
 
+## Refactor Cycle 2
+
+After Cycle 1, the next bounded refactor should focus on context and state seams rather than additional parser-first cleanup.
+
+Primary goals:
+
+1. extract Mist context workflow from `src/main.ts`
+2. introduce shared Mist and device context state types
+3. extract device identity workflow from `src/main.ts`
+4. add focused tests around the new controller or state seam
+
+Why this is the right next move:
+
+- the next feature set depends on cleaner shared state
+- Mist status, JMA status, config sync, and AI summary features all rely on context-heavy flows
+- `main.ts` still holds too much orchestration and implicit state
+
+See [`docs/REFACTOR-CYCLE-2.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/REFACTOR-CYCLE-2.md) for the concrete scope, work order, and exit criteria.
+
 ## Feature Delivery Backlog
 
 ### Next feature priority
@@ -233,6 +252,88 @@ Key risks:
 - masking secrets reliably without corrupting useful troubleshooting context
 - keeping live-session download responsive while logs continue to grow
 - defining a backend log format that is simple now but extensible later
+
+### Feature 4: Disconnect evidence collection
+
+This feature should collect useful evidence related to a switch going offline rather than over-claiming deterministic root-cause identification.
+
+Recommended implementation slices:
+
+1. Reframe the mental model from “offline timeline” to “disconnect evidence” or equivalent.
+2. Define an anchor model based on Mist disconnect event or `last_seen`, with explicit confidence.
+3. Prioritize UTC-native `jmd.log` and `mcd.log` as primary evidence sources.
+4. Add candidate rotated-log selection heuristics rather than assuming the active log is sufficient.
+5. Present collected evidence with explicit source labels such as `mist_last_known`, `mist_event`, and `live_log`.
+6. Treat AI/support interpretation as a first-class consumer of the collected evidence bundle.
+
+Key risks:
+
+- log rotation may hide relevant evidence in older files
+- disconnect timing is approximate rather than definitive
+- overconfident UI wording can mislead users about causality
+- system `messages` timezone handling is noisier than UTC-native daemon logs
+
+### Troubleshooting enhancement: JMA cloud connectivity state
+
+Add a planned troubleshooting check that reads the switch-reported JMA connectivity state from:
+
+- `show lldp local-information`
+
+Purpose:
+
+- surface the switch’s own interpreted cloud-connectivity state via `cc-state`, `cc-message`, and `cc-errno`
+- provide a high-signal summary of where the Mist connectivity flow is failing
+
+Recommended placement in the troubleshooting flow:
+
+- as the first visible diagnostic check in the troubleshooting flow
+- followed by lower-level checks that validate and explain the state
+
+Recommended implementation slices:
+
+1. Parse `cc-state`, `cc-message`, and `cc-errno` from command output.
+2. Maintain a code-owned lookup table for known states such as:
+   - `102 NoIPAddress`
+   - `103 NoDefaultGateway`
+   - `104 DefaultGatewayUnreachable`
+   - `105 NoDNS`
+   - `106 DNSLookupFailed`
+   - `108 CloudUnreachable`
+   - `109 CloudAuthFailure`
+   - `111 Connected`
+3. Map states into product statuses such as `pass`, `warn`, `fail`, or `info`.
+4. Use the parsed state as a structured signal in both operator-facing troubleshooting and future AI-assisted diagnosis.
+
+Why it matters:
+
+- it provides a switch-native connectivity assessment rather than relying only on inferred checks
+- it is a compact, high-value signal for both operators and AI agents
+- it pairs naturally with Mist last-known connected state as a live status monitor
+
+Key risk:
+
+- the implementation should not depend on the explanatory state-reference text always being present in command output; the numeric state mapping should live in code
+
+See [`docs/JMA-CONNECTIVITY-STATE.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/JMA-CONNECTIVITY-STATE.md) for the proposed state mapping, related checks, remediation guidance, and mismatch handling model.
+
+### Status monitor refinement
+
+The UI should show two related but distinct status indicators:
+
+1. Mist device connected state
+2. switch-reported JMA connectivity state
+
+Recommended behavior:
+
+- keep both visible in the UI while a session is active
+- refresh both periodically using lightweight polling
+- show the last refresh time
+- pause or defer polling during heavy workflows if needed
+
+Why it matters:
+
+- the difference between Mist last-known state and current switch-reported state is often diagnostically valuable
+- this gives operators and AI agents a live recovery signal without rerunning the full troubleshooting suite
 
 ## Exit Criteria For Refactor Phase
 

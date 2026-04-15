@@ -148,6 +148,24 @@
             </div>
 
             <div id="device-identity" class="device-info-panel"></div>
+            <div id="cloud-status-panel" class="cloud-status-panel is-hidden">
+              <div class="cloud-status-panel-header">
+                <span class="cloud-status-panel-title">Cloud Status</span>
+                <span id="cloud-status-last-updated" class="cloud-status-panel-meta">Not yet checked</span>
+              </div>
+              <div class="cloud-status-grid">
+                <div class="cloud-status-card">
+                  <div class="cloud-status-card-label">Mist Status</div>
+                  <span id="mist-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
+                  <div id="mist-monitor-detail" class="cloud-status-card-detail">Identify the switch to compare against Mist state.</div>
+                </div>
+                <div class="cloud-status-card">
+                  <div class="cloud-status-card-label">JMA Connectivity State</div>
+                  <span id="jma-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
+                  <div id="jma-monitor-detail" class="cloud-status-card-detail">Connect and identify the switch to read the switch-reported cloud connectivity state.</div>
+                </div>
+              </div>
+            </div>
 
             <div class="sidebar-actions" style="margin-top:8px;">
               <button id="btn-root-password" class="btn btn-secondary" disabled>Get Root Password</button>
