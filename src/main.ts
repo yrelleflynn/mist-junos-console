@@ -1438,7 +1438,7 @@ function init(): void {
         </div>
         <div class="identify-row">
           <span class="identify-label">Assigned to Site:</span>
-          <span class="identify-value ${siteName ? '' : 'identify-no'}">${siteName ?? 'No'}</span>
+          <span class="identify-value ${siteName ? '' : 'identify-unknown'}">${siteName ?? 'Unassigned'}</span>
         </div>
         <div class="identify-row">
           <span class="identify-label">Device Online:</span>
