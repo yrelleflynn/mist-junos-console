@@ -83,6 +83,77 @@ Create a short ADR when a change affects architecture, trust boundaries, or long
 - app state management approach
 - troubleshooting step plugin/module structure
 
+## Stitch In Our Workflow
+
+Use Google Stitch as a UI design and interaction design tool, not as the source of truth for product requirements.
+
+### Source-of-truth rule
+
+- the PRD defines what the product must do
+- Stitch defines how a feature may look and flow
+- implementation follows the PRD, informed by Stitch designs
+
+### When to use Stitch
+
+Use Stitch for features that benefit from screen design, interaction design, or state exploration, for example:
+
+- live switch front panel view
+- config sync preview and apply flow
+- session logging and transcript download UX
+- human support and AI agent session indicators
+
+Do not use Stitch as the primary tool for:
+
+- backend architecture
+- API contracts
+- trust boundary decisions
+- security policy
+- parsing or protocol design
+
+### Expected artifact chain
+
+For each meaningful UI feature, the preferred chain is:
+
+1. PRD requirement
+2. Stitch screen or flow exploration
+3. exported `DESIGN.md`
+4. implementation tasks
+5. code
+
+### Practical repo convention
+
+Store Stitch-related artifacts under `docs/ui/`.
+
+Recommended layout:
+
+- `docs/ui/<feature-slug>/DESIGN.md`
+- `docs/ui/<feature-slug>/NOTES.md`
+- optional screenshots or exports for reference
+
+### Review rule
+
+Before implementation starts, review the Stitch design against the PRD and ask:
+
+- does the design actually satisfy the user story?
+- are empty, loading, warning, and failure states covered?
+- does the design imply backend behavior that has not been agreed?
+- are support and AI trust indicators explicit where relevant?
+
+### Implementation rule
+
+Treat `DESIGN.md` as a frontend handoff artifact:
+
+- component and layout guidance
+- interaction expectations
+- state behavior
+- content and labeling hints
+
+Do not treat `DESIGN.md` as a replacement for acceptance criteria, engineering design, or technical decisions.
+
+### Living update rule
+
+If implementation meaningfully changes the designed experience, update the design artifact or add a note describing the divergence.
+
 ## Testing Strategy
 
 Adopt tests in this order:
@@ -109,12 +180,14 @@ Each item should include a size estimate and a clear owner or status.
 
 - confirm the problem and acceptance criteria
 - check whether the PRD or engineering review needs updating
+- if the work is UI-heavy, confirm whether a Stitch design artifact is needed
 
 ### During implementation
 
 - keep changes scoped
 - prefer one refactor axis at a time
 - add or extend verification while the context is fresh
+- if using Stitch, keep the implementation aligned with the chosen `DESIGN.md`
 
 ### Before merging
 
@@ -135,3 +208,21 @@ For this project, the most productive next cycle is:
 3. extract the first chunk of `main.ts` into feature controllers or workflows
 4. split the first troubleshooting phase into smaller modules
 5. only then continue net-new features unless a user-critical gap appears
+
+## Feature Design Workflow
+
+Use the following lightweight workflow for UI-heavy features:
+
+1. Define the feature in the PRD or backlog.
+2. Create a feature folder under `docs/ui/<feature-slug>/`.
+3. Write a short feature brief using the template in [`docs/ui/FEATURE-DESIGN-TEMPLATE.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/ui/FEATURE-DESIGN-TEMPLATE.md).
+4. Use Stitch to generate or iterate on the screen or flow.
+5. Export or capture the resulting `DESIGN.md` into that feature folder.
+6. Review the design against the PRD and note any gaps or open questions in `NOTES.md`.
+7. Break implementation into tasks covering:
+   - data requirements
+   - UI states
+   - interactions
+   - testing or verification
+8. Implement the feature.
+9. Update the design notes if the final product differs materially from the Stitch design.

@@ -148,12 +148,32 @@ That can happen incrementally while keeping the current runtime model.
 - redesign Mist credential handling
 - redesign remote session trust model
 
+## Refactor Cycle 1
+
+The project is ready for a first bounded refactor cycle before major new feature delivery.
+
+Primary goals:
+
+1. add a minimal test harness
+2. extract one workflow from `src/main.ts`
+3. modularize one contained troubleshooting slice
+4. preserve current behavior while creating reusable seams
+
+Recommended first targets:
+
+- `CommandRunnerService` tests
+- remote session workflow extraction
+- LLDP/uplink troubleshooting slice extraction
+
+See [`docs/REFACTOR-CYCLE-1.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/REFACTOR-CYCLE-1.md) for the concrete scope, work order, and exit criteria.
+
 ## Feature Delivery Backlog
 
 ### Next feature priority
 
 1. Sync disconnected switch to Mist intended config
 2. Live switch front panel view
+3. Session logging and export
 
 ### Feature 1: Sync disconnected switch to Mist intended config
 
@@ -192,6 +212,27 @@ Key risks:
 - accurately modeling multiple hardware layouts
 - keeping the UI Mist-familiar without copying implementation details too literally
 - deriving complete live port state from CLI output consistently across models
+
+### Feature 3: Session logging and export
+
+This feature strengthens supportability, troubleshooting continuity, and future audit and AI workflows.
+
+Recommended implementation slices:
+
+1. Define a session log schema that separates transcript content from event or system logging.
+2. Capture terminal RX and TX plus actor attribution where applicable.
+3. Capture session lifecycle, participant, Mist action, troubleshooting, and config-apply events.
+4. Add secret masking for both exported and stored logs.
+5. Add UI support to download the current accumulated transcript during an active session.
+6. Persist backend logs with search-friendly metadata such as session ID, device, site, and timestamp.
+7. Apply a 30-day retention policy to backend logs.
+8. Render a single operator-facing transcript from the structured event stream rather than treating UI output as the source of truth.
+
+Key risks:
+
+- masking secrets reliably without corrupting useful troubleshooting context
+- keeping live-session download responsive while logs continue to grow
+- defining a backend log format that is simple now but extensible later
 
 ## Exit Criteria For Refactor Phase
 

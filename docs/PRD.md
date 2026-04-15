@@ -28,6 +28,7 @@ Give an operator a single browser-based workspace that can:
 - explain likely root causes and next actions
 - support guided adoption and recovery
 - optionally allow a remote support participant to join the session safely
+- optionally allow an AI agent to join the session safely under clear policy controls
 
 ## Users
 
@@ -154,9 +155,11 @@ Based on the current implementation, the product already includes:
 ### Remote support
 
 - The app must allow an operator to start a support session.
-- The app must allow a support user to join by session ID.
+- The app must allow a human support user to join by session ID or a future authenticated equivalent.
+- The app may allow an AI agent to join a session under explicit operator consent and policy controls.
 - The app must mirror RX and TX traffic appropriately.
 - The product must make the trust boundary obvious to the operator.
+- The product must clearly indicate whether a session participant is a human support user or an AI agent.
 
 ## Non-Functional Requirements
 
@@ -165,6 +168,7 @@ Based on the current implementation, the product already includes:
 - Mist API tokens should not remain a browser-side concern long term.
 - Remote sessions require authentication, authorization, auditability, and expiry before production rollout.
 - Session identifiers must be treated as secrets until replaced by authenticated access controls.
+- Human support joins and AI agent joins must each have explicit consent, identity, and audit controls.
 
 ### Reliability
 
@@ -212,6 +216,8 @@ The current codebase is functionally promising but not yet structured for sustai
 - Web Serial is browser-limited and requires Chrome or Edge
 - production deployment will need HTTPS and browser-compatible origin setup
 - current remote support model is not production-safe without auth and auditing
+- human support participants introduce risks around unauthorized access, mistaken operator trust, and interactive changes without sufficient audit controls
+- AI agent participants introduce additional risks around over-broad automation, unsafe command injection, unclear accountability, and operator over-trust in generated actions
 - Mist token handling needs a backend-first design
 - Junos CLI parsing can be brittle across prompt, pagination, and software-version variations
 
@@ -348,6 +354,98 @@ The data/model layer should support multiple switch form factors from the beginn
 - device view shows all relevant IP addresses
 - UI is visually aligned with Mist’s front-panel mental model
 - architecture supports multiple switch form factors through model-driven layout definitions
+
+### Priority Feature C: Session Logging And Export
+
+#### Summary
+
+Capture both terminal transcript data and session or event activity, allow the operator to download logs during or after the session, and store masked backend logs for support and troubleshooting.
+
+#### Why it matters
+
+Session logs create a durable record of what happened during troubleshooting and recovery. They help operators share outcomes, help support reconstruct issues accurately, and provide a foundation for auditability and future AI-assisted analysis.
+
+#### User story
+
+As an operator or support engineer, I want a complete record of a troubleshooting session so I can review what happened, share it, and support follow-up troubleshooting.
+
+#### Product direction
+
+Use two related logging outputs:
+
+1. Terminal transcript
+2. Event and system log
+
+The operator experience should still present a single unified session history, with the transcript and event/system entries rendered together chronologically using clear markers for non-terminal actions.
+
+#### Terminal transcript
+
+- human-readable
+- plain text
+- downloadable by the operator
+- available during the live session and after it ends
+- intended to reflect the session transcript without requiring backend log access
+
+#### Event and system log
+
+- stored in the backend
+- includes timestamps and markers
+- includes UI, system, session, and workflow events
+- reserved for support or admin use in v1
+
+#### Scope decisions
+
+- users can download the terminal transcript at any point during a session
+- users can also download the transcript after the session ends
+- the terminal transcript should remain plain text
+- the event and system log should include timestamps and markers
+- secrets should be masked
+- backend logs should be retained for 30 days
+- backend logs should be searchable by session ID, device, site, or timestamp
+- the initial backend implementation may use file naming conventions to support that searchability
+- backend logs should not be directly exposed to end users in v1
+
+#### What should be captured
+
+Terminal transcript:
+
+- console RX and TX stream
+- actor-labeled input where applicable
+
+Event and system log:
+
+- session start and end
+- operator connect and disconnect
+- human support join and leave
+- AI agent join and leave
+- Mist API actions
+- troubleshooting runs
+- config sync preview and apply events
+- commit and `commit check` outcomes
+- major system notices, warnings, and errors
+
+#### Security and privacy behavior
+
+- sensitive values must be masked in exported and stored logs
+- logs should not expose passwords, API tokens, or other sensitive secrets
+- the UI should make it clear that session activity is being logged
+- backend log access should be restricted to support or admin workflows
+
+#### Acceptance criteria
+
+- the operator can download the terminal transcript during an active session
+- the operator can download the terminal transcript after the session ends
+- the downloadable terminal transcript is plain text
+- backend stores a masked terminal transcript and event or system log for each session
+- backend logs are retained for 30 days
+- backend logs can be searched by session ID, device, site, or timestamp
+- sensitive values are masked in both exported and stored logs
+- backend logs are not directly exposed to end users in v1
+
+#### Design note
+
+See [`docs/SESSION-LOGGING-DESIGN.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/SESSION-LOGGING-DESIGN.md) for the session model decision: one unified operator-facing history backed by a structured backend event stream.
+Implementation details for the first-pass schema and masking rules live in [`docs/SESSION-EVENT-SCHEMA.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/SESSION-EVENT-SCHEMA.md) and [`docs/SESSION-MASKING-POLICY.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/SESSION-MASKING-POLICY.md).
 
 ## Acceptance Criteria For The Next Development Cycle
 
