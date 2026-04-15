@@ -17,7 +17,7 @@
  *   MCP_TRANSPORT    "stdio" (default) or "http"
  *   MCP_PORT         HTTP listen port (default 3334)
  *   MCP_HOST         HTTP bind address (default 0.0.0.0)
- *   MCP_ALLOW_CIDR   Allowed source subnet (default 10.100.100.0/24); localhost always allowed
+ *   MCP_ALLOW_CIDR   Comma-separated allowed subnets (default 10.100.100.0/24,192.168.1.0/24); localhost always allowed
  *   WS_URL           WebSocket hub URL (default ws://127.0.0.1:3333/ws)
  *   MCP_SESSION_ID   Alternative to positional session-id argument
  *   MIST_API_HOST    e.g. api.mist.com
@@ -42,7 +42,8 @@ import {
 const USE_HTTP = process.env.MCP_TRANSPORT === 'http' || process.argv.includes('--http');
 const MCP_PORT = Number(process.env.MCP_PORT || 3334);
 const MCP_HOST = process.env.MCP_HOST || '0.0.0.0';
-const MCP_ALLOW_CIDR = process.env.MCP_ALLOW_CIDR || '10.100.100.0/24';
+const MCP_ALLOW_CIDRS = (process.env.MCP_ALLOW_CIDR || '10.100.100.0/24,192.168.1.0/24')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 
 // Session ID: skip '--http' if it appears as first positional arg
 const _args = process.argv.slice(2).filter((a) => a !== '--http');
@@ -82,7 +83,7 @@ function isAllowedIp(remoteAddress) {
   if (raw === '127.0.0.1' || raw === '::1' || raw === 'localhost') return true;
   // Validate it looks like an IPv4 address before subnet check
   if (!/^\d+\.\d+\.\d+\.\d+$/.test(raw)) return false;
-  return inSubnet(raw, MCP_ALLOW_CIDR);
+  return MCP_ALLOW_CIDRS.some((cidr) => inSubnet(raw, cidr));
 }
 
 // ── ANSI stripping ─────────────────────────────────────────────────────────
@@ -742,7 +743,7 @@ async function startHttp() {
     console.error(`[mcp] HTTP MCP server listening on ${MCP_HOST}:${MCP_PORT}`);
     console.error(`[mcp]   Endpoint : http://<host>:${MCP_PORT}/mcp`);
     console.error(`[mcp]   Health   : http://<host>:${MCP_PORT}/health`);
-    console.error(`[mcp]   Allowed  : 127.0.0.1 + ${MCP_ALLOW_CIDR}`);
+    console.error(`[mcp]   Allowed  : 127.0.0.1 + ${MCP_ALLOW_CIDRS.join(', ')}`);
   });
 }
 
