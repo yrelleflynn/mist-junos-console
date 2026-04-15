@@ -1466,17 +1466,7 @@ function init(): void {
       // If not in inventory, wire up the adopt shortcut link
       const adoptLink = ui.deviceIdentity.querySelector<HTMLButtonElement>('.identify-adopt-link');
       if (adoptLink) {
-        adoptLink.addEventListener('click', () => {
-          const trigger = document.querySelector<HTMLElement>('.accordion-trigger[data-target="device"]');
-          const content = document.getElementById('accordion-device');
-          if (trigger && content && !trigger.classList.contains('active')) {
-            trigger.classList.add('active');
-            content.classList.add('open');
-            setTimeout(() => term.fit(), 300);
-          }
-          ui.btnAdopt.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          setTimeout(() => ui.btnAdopt.focus(), 350);
-        });
+        adoptLink.addEventListener('click', () => showAdoptModal());
       }
 
       // Start polling Mist online status every 30s.
@@ -1771,6 +1761,331 @@ function init(): void {
       term.writeError(`Adoption fetch error: ${msg}`);
       ui.btnAdopt.disabled = false;
     }
+  }
+
+  // ---- Adopt Switch Modal ----
+  async function showAdoptModal(): Promise<void> {
+    if (!mistApi.isConfigured) {
+      alert('Configure Mist API first (cloud, token, org ID).');
+      return;
+    }
+
+    // Build overlay
+    const overlay = document.createElement('div');
+    overlay.className = 'check-modal-overlay';
+
+    const modal = document.createElement('div');
+    modal.className = 'check-modal';
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    const close = () => overlay.remove();
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    document.addEventListener('keydown', function onKey(e) {
+      if (e.key === 'Escape') { close(); document.removeEventListener('keydown', onKey); }
+    });
+
+    function setContent(html: string): void {
+      modal.innerHTML = html;
+    }
+
+    // Phase 0: loading
+    setContent(`
+      <div class="check-modal-header">
+        <span class="check-modal-title">Adopt Switch</span>
+        <button class="btn btn-sm check-modal-close">✕</button>
+      </div>
+      <div class="check-modal-body">
+        <div class="status-text info">Fetching adoption commands from Mist…</div>
+      </div>
+    `);
+    modal.querySelector('.check-modal-close')!.addEventListener('click', close);
+
+    let commands: string;
+    let hasRootAuth: boolean;
+    let mistRootPassword: string | null = null;
+    let commandLines: string[];
+
+    try {
+      commands = await mistApi.getAdoptionCommands();
+
+      if (!commands || !commands.includes('set ')) {
+        setContent(`
+          <div class="check-modal-header">
+            <span class="check-modal-title">Adopt Switch</span>
+            <button class="btn btn-sm check-modal-close">✕</button>
+          </div>
+          <div class="check-modal-body">
+            <div class="status-text error">No adoption commands returned from API. The endpoint may not be available for your account.</div>
+          </div>
+        `);
+        modal.querySelector('.check-modal-close')!.addEventListener('click', close);
+        return;
+      }
+
+      commandLines = commands.split('\n').filter((l: string) => l.trim().length > 0);
+
+      // Check root auth on switch
+      term.writeSystem('— Checking root authentication before adoption —');
+      await cmdRunner.ensureOperationalMode();
+      const rootAuthCmd = await cmdRunner.execute('show configuration system root-authentication', 10000);
+      hasRootAuth = rootAuthCmd.success &&
+        (rootAuthCmd.output.includes('encrypted-password') || rootAuthCmd.output.includes('ssh-'));
+
+      // Try Mist site password
+      if (!hasRootAuth) {
+        const siteId = ui.mistSite.value;
+        if (siteId) {
+          mistRootPassword = await mistApi.getRootPassword(siteId);
+          if (mistRootPassword) {
+            term.writeSystem('  Root password found in Mist site settings.');
+          }
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setContent(`
+        <div class="check-modal-header">
+          <span class="check-modal-title">Adopt Switch</span>
+          <button class="btn btn-sm check-modal-close">✕</button>
+        </div>
+        <div class="check-modal-body">
+          <div class="status-text error">Error: ${escapeHtml(msg)}</div>
+        </div>
+      `);
+      modal.querySelector('.check-modal-close')!.addEventListener('click', close);
+      return;
+    }
+
+    const needsPasswordInput = !hasRootAuth && !mistRootPassword;
+    const totalCommands = commandLines.length + (!hasRootAuth ? 1 : 0);
+
+    // Phase 1: commands display
+    function renderCommandsPhase(statusMsg = '', errorMsg = ''): void {
+      let commandsHtml = '';
+      if (!hasRootAuth) {
+        commandsHtml += `<div class="adopt-cmd-line adopt-cmd-rootpw"><span class="drift-category">Root Auth</span>set system root-authentication plain-text-password ••••••••</div>`;
+      }
+      for (const line of commandLines) {
+        commandsHtml += `<div class="adopt-cmd-line">${escapeHtml(line.trim())}</div>`;
+      }
+
+      const pwBlock = needsPasswordInput ? `
+        <div class="adopt-pw-block">
+          <label for="adopt-modal-pw" class="adopt-pw-label">Root Password (required — not found in Mist)</label>
+          <input type="password" id="adopt-modal-pw" class="adopt-modal-pw-input" placeholder="Enter root password…" autocomplete="off">
+          <div id="adopt-modal-pw-error" class="adopt-pw-error" style="display:none;">Please enter a root password before applying.</div>
+        </div>
+      ` : '';
+
+      const rootNote = !hasRootAuth ? `<div class="status-text info adopt-root-note">Root password will be set before adoption commands are applied.</div>` : '';
+
+      setContent(`
+        <div class="check-modal-header">
+          <span class="check-modal-title">Adopt Switch</span>
+          <button class="btn btn-sm check-modal-close">✕</button>
+        </div>
+        <div class="check-modal-description">
+          <span class="check-modal-description-label">Adoption commands</span>
+          <span class="check-modal-description-text">${totalCommands} command${totalCommands !== 1 ? 's' : ''} will be applied to onboard this switch to Mist.</span>
+        </div>
+        <div class="check-modal-body">
+          <div class="adopt-cmd-list">${commandsHtml}</div>
+          ${rootNote}
+          ${pwBlock}
+          ${statusMsg ? `<div class="status-text info adopt-apply-status">${escapeHtml(statusMsg)}</div>` : ''}
+          ${errorMsg ? `<div class="status-text error adopt-apply-status">${escapeHtml(errorMsg)}</div>` : ''}
+          <div class="check-modal-actions">
+            <button id="adopt-modal-apply" class="btn btn-primary">Apply to Switch</button>
+            <button class="btn btn-secondary check-modal-close">Cancel</button>
+          </div>
+        </div>
+      `);
+      modal.querySelectorAll('.check-modal-close').forEach(b => b.addEventListener('click', close));
+
+      const applyBtn = modal.querySelector<HTMLButtonElement>('#adopt-modal-apply')!;
+      applyBtn.addEventListener('click', async () => {
+        let rootPassword = mistRootPassword;
+
+        if (needsPasswordInput) {
+          const pwInput = modal.querySelector<HTMLInputElement>('#adopt-modal-pw')!;
+          const pwError = modal.querySelector<HTMLElement>('#adopt-modal-pw-error')!;
+          const pw = pwInput.value.trim();
+          if (!pw) {
+            pwError.style.display = '';
+            pwInput.focus();
+            return;
+          }
+          pwError.style.display = 'none';
+          rootPassword = pw;
+        }
+
+        await runApplyPhase(rootPassword);
+      });
+    }
+
+    async function runApplyPhase(rootPassword: string | null): Promise<void> {
+      // Show progress in modal body
+      const updateStatus = (msg: string) => {
+        const existing = modal.querySelector<HTMLElement>('.adopt-apply-status');
+        if (existing) existing.textContent = msg;
+      };
+
+      // Disable apply button
+      const applyBtn = modal.querySelector<HTMLButtonElement>('#adopt-modal-apply');
+      if (applyBtn) applyBtn.disabled = true;
+      const cancelBtns = modal.querySelectorAll<HTMLButtonElement>('.check-modal-close');
+      cancelBtns.forEach(b => (b.disabled = true));
+
+      // Add/update status line
+      let statusDiv = modal.querySelector<HTMLElement>('.adopt-apply-status');
+      if (!statusDiv) {
+        statusDiv = document.createElement('div');
+        statusDiv.className = 'status-text info adopt-apply-status';
+        const actions = modal.querySelector('.check-modal-actions');
+        if (actions) modal.querySelector('.check-modal-body')!.insertBefore(statusDiv, actions);
+      }
+      statusDiv.className = 'status-text info adopt-apply-status';
+      statusDiv.textContent = 'Entering config mode…';
+      term.writeSystem('— Applying adoption commands to switch —');
+
+      try {
+        // Enter config mode
+        const editResult = await cmdRunner.execute('edit', 5000);
+        if (!editResult.output.includes('#') && !editResult.success) {
+          statusDiv.className = 'status-text error adopt-apply-status';
+          statusDiv.textContent = 'Failed to enter config mode. Are you logged in as root?';
+          term.writeError('Failed to enter config mode.');
+          if (applyBtn) applyBtn.disabled = false;
+          cancelBtns.forEach(b => (b.disabled = false));
+          return;
+        }
+
+        // Set root password if needed
+        if (rootPassword) {
+          statusDiv.textContent = 'Setting root password…';
+          term.writeSystem('  Setting root authentication…');
+          await cmdRunner.send('set system root-authentication plain-text-password\n');
+          await new Promise((r) => setTimeout(r, 1000));
+          const pw1 = await cmdRunner.sendAndWaitFor(rootPassword + '\n', /password:|secret:/, 5000);
+          if (pw1.matched) {
+            await cmdRunner.sendAndWaitFor(rootPassword + '\n', /#/, 5000);
+          }
+          term.writeSystem('  Root password set.');
+        }
+
+        statusDiv.textContent = 'Applying adoption commands…';
+
+        // Apply each command
+        let applied = 0;
+        for (const line of commandLines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          await cmdRunner.execute(trimmed, 5000, 500);
+          applied++;
+          statusDiv.textContent = `Applied ${applied} / ${commandLines.length} commands…`;
+        }
+
+        term.writeSystem(`  Applied ${applied} commands. Awaiting commit.`);
+
+        // Phase 2: show Commit / Rollback buttons
+        renderCommitPhase(applied);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        statusDiv.className = 'status-text error adopt-apply-status';
+        statusDiv.textContent = `Error: ${msg}`;
+        term.writeError(`Adoption apply error: ${msg}`);
+        if (applyBtn) applyBtn.disabled = false;
+        cancelBtns.forEach(b => (b.disabled = false));
+      }
+    }
+
+    function renderCommitPhase(applied: number): void {
+      setContent(`
+        <div class="check-modal-header">
+          <span class="check-modal-title">Adopt Switch</span>
+          <button class="btn btn-sm check-modal-close">✕</button>
+        </div>
+        <div class="check-modal-description">
+          <span class="check-modal-description-label">Commands applied</span>
+          <span class="check-modal-description-text">${applied} command${applied !== 1 ? 's' : ''} applied. Review changes in the terminal, then commit or discard.</span>
+        </div>
+        <div class="check-modal-body">
+          <div class="status-text info" id="adopt-commit-status">Ready to commit. This will save the changes and the switch will begin connecting to Mist.</div>
+          <div class="check-modal-actions adopt-commit-actions">
+            <button id="adopt-modal-commit" class="btn btn-primary">Commit</button>
+            <button id="adopt-modal-rollback" class="btn btn-danger">Rollback &amp; Discard</button>
+          </div>
+        </div>
+      `);
+      modal.querySelector('.check-modal-close')!.addEventListener('click', close);
+
+      const commitBtn = modal.querySelector<HTMLButtonElement>('#adopt-modal-commit')!;
+      const rollbackBtn = modal.querySelector<HTMLButtonElement>('#adopt-modal-rollback')!;
+      const commitStatus = modal.querySelector<HTMLElement>('#adopt-commit-status')!;
+
+      commitBtn.addEventListener('click', async () => {
+        commitBtn.disabled = true;
+        rollbackBtn.disabled = true;
+        commitStatus.className = 'status-text info';
+        commitStatus.textContent = 'Committing…';
+        term.writeSystem('  Committing adoption configuration…');
+        try {
+          const result = await cmdRunner.execute('commit and-quit', 60000, 5000);
+          if (result.output.includes('commit complete') || result.output.includes('configuration check succeeds')) {
+            commitStatus.className = 'status-text success';
+            commitStatus.textContent = 'Committed successfully. The switch should connect to Mist within a few minutes.';
+            term.writeSystem('  Commit successful. Switch should connect to Mist shortly.');
+            commitBtn.style.display = 'none';
+            rollbackBtn.style.display = 'none';
+          } else if (result.output.includes('error')) {
+            commitStatus.className = 'status-text error';
+            commitStatus.textContent = 'Commit returned errors. Check the terminal output.';
+            term.writeError('Commit may have failed. Check terminal output.');
+            commitBtn.disabled = false;
+            rollbackBtn.disabled = false;
+          } else {
+            commitStatus.className = 'status-text info';
+            commitStatus.textContent = 'Commit sent. Check terminal for result.';
+            commitBtn.disabled = false;
+            rollbackBtn.disabled = false;
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          commitStatus.className = 'status-text error';
+          commitStatus.textContent = `Commit error: ${msg}`;
+          term.writeError(`Commit error: ${msg}`);
+          commitBtn.disabled = false;
+          rollbackBtn.disabled = false;
+        }
+      });
+
+      rollbackBtn.addEventListener('click', async () => {
+        commitBtn.disabled = true;
+        rollbackBtn.disabled = true;
+        commitStatus.className = 'status-text info';
+        commitStatus.textContent = 'Rolling back…';
+        term.writeSystem('  Rolling back adoption configuration…');
+        try {
+          await cmdRunner.execute('rollback 0', 10000, 1000);
+          await cmdRunner.execute('exit', 5000, 500);
+          commitStatus.className = 'status-text info';
+          commitStatus.textContent = 'Changes discarded. Switch configuration unchanged.';
+          term.writeSystem('  Rollback complete. No changes committed.');
+          commitBtn.style.display = 'none';
+          rollbackBtn.style.display = 'none';
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          commitStatus.className = 'status-text error';
+          commitStatus.textContent = `Rollback error: ${msg}`;
+          term.writeError(`Rollback error: ${msg}`);
+          commitBtn.disabled = false;
+          rollbackBtn.disabled = false;
+        }
+      });
+    }
+
+    renderCommandsPhase();
   }
 
   // ---- Offline Timeline (standalone) ----

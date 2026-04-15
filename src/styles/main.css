@@ -1011,6 +1011,78 @@ html, body {
   color: var(--text-primary);
 }
 
+/* ---- Adopt Modal ---- */
+.adopt-cmd-list {
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+
+.adopt-cmd-line {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-primary);
+  padding: 2px 0;
+  line-height: 1.6;
+  word-break: break-all;
+}
+
+.adopt-cmd-rootpw {
+  color: #e3b341;
+  padding-bottom: 4px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.adopt-pw-block {
+  margin-bottom: 10px;
+}
+
+.adopt-pw-label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.adopt-modal-pw-input {
+  width: 100%;
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  padding: 6px 8px;
+  outline: none;
+}
+
+.adopt-modal-pw-input:focus {
+  border-color: var(--border-focus);
+}
+
+.adopt-pw-error {
+  font-size: 11px;
+  color: var(--text-error);
+  margin-top: 4px;
+}
+
+.adopt-root-note {
+  margin-bottom: 8px;
+}
+
+.adopt-apply-status {
+  margin-bottom: 8px;
+}
+
+.adopt-commit-actions {
+  gap: 8px;
+}
+
 /* ---- Device Identity Panel ---- */
 .device-info-panel {
   margin-top: 10px;
