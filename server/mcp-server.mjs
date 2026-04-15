@@ -822,6 +822,18 @@ async function startHttp() {
     console.error(`[mcp]   Health   : http://<host>:${MCP_PORT}/health`);
     console.error(`[mcp]   Allowed  : 127.0.0.1 + ${MCP_ALLOW_CIDRS.join(', ')}`);
   });
+
+  httpServer.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[mcp] ERROR: Port ${MCP_PORT} is already in use.`);
+      console.error(`[mcp] Kill the existing process first:`);
+      console.error(`[mcp]   Windows: for /f "tokens=5" %a in ('netstat -ano ^| findstr :${MCP_PORT}') do taskkill /PID %a /F`);
+      console.error(`[mcp]   Linux/Mac: lsof -ti:${MCP_PORT} | xargs kill -9`);
+    } else {
+      console.error('[mcp] HTTP server error:', err.message);
+    }
+    process.exit(1);
+  });
 }
 
 // ── Startup ────────────────────────────────────────────────────────────────
