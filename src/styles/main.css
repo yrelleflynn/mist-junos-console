@@ -1494,6 +1494,104 @@ html, body {
   font-weight: 600;
 }
 
+/* ---- Config Sync Preview Results ---- */
+#config-sync-results {
+  margin-top: 10px;
+}
+
+.config-sync-section-title {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  margin-top: 10px;
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.config-sync-summary {
+  font-size: 12px;
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.config-sync-pre {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  overflow-x: auto;
+  white-space: pre;
+  max-height: 220px;
+  overflow-y: auto;
+  color: var(--text-primary);
+  margin-top: 4px;
+}
+
+.config-sync-error {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 4px 8px;
+  background: rgba(218, 54, 51, 0.08);
+  border: 1px solid rgba(218, 54, 51, 0.3);
+  border-radius: var(--radius);
+  color: var(--text-error);
+  margin-bottom: 4px;
+  word-break: break-all;
+}
+
+.config-sync-error-cmd {
+  display: inline-block;
+  font-weight: 700;
+  margin-right: 6px;
+}
+
+.config-sync-error-msg {
+  color: rgba(249, 117, 131, 0.8);
+}
+
+.config-sync-check-status {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-weight: 700;
+}
+
+.config-sync-check-status.pass {
+  background: rgba(65, 216, 123, 0.12);
+  color: #41d87b;
+  border: 1px solid rgba(65, 216, 123, 0.3);
+}
+
+.config-sync-check-status.fail {
+  background: rgba(218, 54, 51, 0.1);
+  color: var(--text-error);
+  border: 1px solid rgba(218, 54, 51, 0.3);
+}
+
+.config-sync-rollback-notice {
+  font-size: 11px;
+  padding: 5px 8px;
+  margin-top: 8px;
+  border-radius: var(--radius);
+  background: rgba(65, 216, 123, 0.07);
+  border: 1px solid rgba(65, 216, 123, 0.25);
+  color: #41d87b;
+}
+
 /* ---- Inline code in panels ---- */
 .device-mist-match code,
 .device-info-panel code,

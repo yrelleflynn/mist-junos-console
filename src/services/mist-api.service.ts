@@ -25,6 +25,39 @@ interface MistSelfResponse {
     name?: string;
     role?: string;
   }>;
+  orgs?: Array<{
+    id?: string;
+    org_id?: string;
+    name?: string;
+    org_name?: string;
+  }>;
+  data?: {
+    privileges?: Array<{
+      scope?: string;
+      org_id?: string;
+      org_name?: string;
+      name?: string;
+      role?: string;
+    }>;
+    orgs?: Array<{
+      id?: string;
+      org_id?: string;
+      name?: string;
+      org_name?: string;
+    }>;
+    organizations?: Array<{
+      id?: string;
+      org_id?: string;
+      name?: string;
+      org_name?: string;
+    }>;
+  };
+  organizations?: Array<{
+    id?: string;
+    org_id?: string;
+    name?: string;
+    org_name?: string;
+  }>;
 }
 
 interface MistOrgDetailResponse {
@@ -160,13 +193,27 @@ export class MistApiService {
    * Uses explicit credentials so this can be called before orgId is configured.
    */
   async getAccessibleOrgs(token: string, apiHost: string): Promise<MistOrg[]> {
-    const self = await this.getWithCredentials<MistSelfResponse>(token, apiHost, '/api/v1/self');
-    const privileges = self.privileges ?? [];
+    const self = await this.getWithCredentials<MistSelfResponse | MistSelfResponse['privileges']>(token, apiHost, '/api/v1/self');
+    const selfObj: MistSelfResponse = Array.isArray(self) ? { privileges: self } : (self ?? {});
+    const privileges =
+      selfObj.privileges
+      ?? selfObj.data?.privileges
+      ?? [];
+    const topLevelOrgs =
+      selfObj.orgs
+      ?? selfObj.organizations
+      ?? selfObj.data?.orgs
+      ?? selfObj.data?.organizations
+      ?? [];
     const orgMap = new Map<string, MistOrg>();
     const unresolvedOrgIds = new Set<string>();
+    const orgScopedPrivileges = privileges.filter((p) => p.scope === 'org' && p.org_id);
+    const fallbackPrivileges = orgScopedPrivileges.length > 0
+      ? orgScopedPrivileges
+      : privileges.filter((p) => p.org_id);
 
-    for (const p of privileges) {
-      if (p.scope === 'org' && p.org_id) {
+    for (const p of fallbackPrivileges) {
+      if (p.org_id) {
         const name = p.name ?? p.org_name ?? '';
         if (!orgMap.has(p.org_id)) {
           orgMap.set(p.org_id, { id: p.org_id, name: name || p.org_id });
@@ -174,6 +221,18 @@ export class MistApiService {
         if (!name) {
           unresolvedOrgIds.add(p.org_id);
         }
+      }
+    }
+
+    for (const org of topLevelOrgs) {
+      const orgId = org.id ?? org.org_id ?? '';
+      if (!orgId) continue;
+      const name = org.name ?? org.org_name ?? '';
+      if (!orgMap.has(orgId)) {
+        orgMap.set(orgId, { id: orgId, name: name || orgId });
+      }
+      if (!name) {
+        unresolvedOrgIds.add(orgId);
       }
     }
 

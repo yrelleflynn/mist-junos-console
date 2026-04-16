@@ -20,7 +20,7 @@ export interface MistMatchResult {
   identity: SwitchIdentity;
   mistDevice: MistInventoryDevice | null;
   mistConfig: MistDeviceConfig | null;
-  matchedBy: 'serial' | 'mac' | null;
+  matchedBy: 'serial' | 'mac' | 'name' | null;
   mistSiteName?: string | null;
   /**
    * Mist inventory `connected` when the API returns it (fresh from the same inventory fetch as the match).
@@ -53,25 +53,158 @@ export class SwitchIdentityService {
   }
 
   private parseChassisHardware(output: string): Pick<SwitchIdentity, 'serial' | 'model'> {
+    const lines = output.split('\n');
+
+    for (const rawLine of lines) {
+      const line = rawLine.replace(/\r/g, '');
+      if (!/^\s*Chassis(?:\s{2,}|\s*$)/i.test(line)) continue;
+
+      const columns = line.trim().split(/\s{2,}/).filter(Boolean);
+      if (columns.length >= 3) {
+        const candidateModel = this.sanitizeModel(columns[columns.length - 1]);
+        const candidateSerial = this.sanitizeSerial(
+          columns[columns.length - 2],
+          candidateModel,
+        );
+        if (candidateModel || candidateSerial) {
+          return { serial: candidateSerial, model: candidateModel };
+        }
+      }
+
+      const tokens = line.trim().split(/\s+/).filter(Boolean);
+      if (tokens.length >= 3) {
+        const candidateModel = this.sanitizeModel(tokens[tokens.length - 1]);
+        const candidateSerial = this.sanitizeSerial(tokens[tokens.length - 2], candidateModel);
+        if (candidateModel || candidateSerial) {
+          return { serial: candidateSerial, model: candidateModel };
+        }
+      }
+    }
+
+    return { serial: null, model: null };
+  }
+
+  private looksLikeModel(value: string | null | undefined): boolean {
+    if (!value) return false;
+    return /^(EX|QFX|SRX|MX|ACX|PTX|NFX|VQFX|VMX|VSRX)/i.test(value.trim());
+  }
+
+  private sanitizeHostname(value: string | null | undefined): string | null {
+    if (!value) return null;
+    const cleaned = value.trim().replace(/[;,\]:]+$/, '');
+    if (!cleaned) return null;
+    const lowered = cleaned.toLowerCase();
+    if (lowered === 'host-name' || lowered === 'hostname') return null;
+    return cleaned;
+  }
+
+  private sanitizeModel(value: string | null | undefined): string | null {
+    if (!value) return null;
+    const cleaned = value.trim().replace(/[;,\]]+$/, '').toUpperCase();
+    return this.looksLikeModel(cleaned) ? cleaned : null;
+  }
+
+  private sanitizeSerial(value: string | null | undefined, model: string | null): string | null {
+    if (!value) return null;
+    const cleaned = value.trim().replace(/[;,\]]+$/, '');
+    if (!cleaned) return null;
+    if (model && cleaned.toUpperCase() === model.toUpperCase()) return null;
+    if (this.looksLikeModel(cleaned)) return null;
+    return cleaned;
+  }
+
+  private parseShowVersion(output: string): Pick<SwitchIdentity, 'hostname' | 'serial' | 'model' | 'junosVersion'> {
+    let hostname: string | null = null;
+    let serial: string | null = null;
+    let model: string | null = null;
+    let junosVersion: string | null = null;
+
     const lines = output
       .split('\n')
       .map((line) => line.trim())
       .filter((line) => line.length > 0);
 
-    const chassisLine = lines.find((line) => /^Chassis(?:\s{2,}|\s*$)/i.test(line));
-    if (!chassisLine) {
-      return { serial: null, model: null };
+    for (const line of lines) {
+      let match = line.match(/^Hostname:\s*(\S+)/i);
+      if (match) {
+        hostname = this.sanitizeHostname(match[1]);
+        continue;
+      }
+
+      match = line.match(/^Model:\s*(\S+)/i);
+      if (match) {
+        model = this.sanitizeModel(match[1]);
+        continue;
+      }
+
+      match = line.match(/^(?:System\s+serial\s+number|Serial number)\s*:\s*(\S+)/i);
+      if (match) {
+        serial = this.sanitizeSerial(match[1], model);
+        continue;
+      }
+
+      match = line.match(/^Junos:\s*(\S+)/i);
+      if (match) {
+        junosVersion = match[1];
+        continue;
+      }
+
+      match = line.match(/^JUNOS\s+\S+\s+\[(\S+)\]/i);
+      if (match) {
+        junosVersion = match[1];
+      }
     }
 
-    const columns = chassisLine.split(/\s{2,}/).map((part) => part.trim()).filter(Boolean);
-    const fields = columns.slice(1);
-    if (fields.length === 0) {
-      return { serial: null, model: null };
+    return { hostname, serial, model, junosVersion };
+  }
+
+  private parsePromptHostname(output: string): string | null {
+    const promptMatches = [...output.matchAll(/[\w.-]+@([A-Za-z0-9._:-]+)[>#%]/g)];
+    const lastMatch = promptMatches[promptMatches.length - 1];
+    return this.sanitizeHostname(lastMatch?.[1] ?? null);
+  }
+
+  private parseMacAddress(output: string): string | null {
+    const lines = output
+      .split('\n')
+      .map((line) => line.replace(/\r/g, '').trim())
+      .filter((line) => line.length > 0);
+
+    for (const line of lines) {
+      if (!/^(?:Private\s+)?Base address\b/i.test(line)) continue;
+      const match = line.match(/([0-9a-f]{2}(?::[0-9a-f]{2}){5})/i);
+      if (match) {
+        return match[1].toLowerCase();
+      }
     }
 
-    const model = fields.length >= 2 ? fields[fields.length - 1] : null;
-    const serial = fields.length >= 2 ? fields[fields.length - 2] : null;
-    return { serial, model };
+    const uniqueMacs = [...new Set(
+      lines.flatMap((line) => line.match(/([0-9a-f]{2}(?::[0-9a-f]{2}){5})/ig) ?? [])
+    )];
+
+    if (uniqueMacs.length === 1) {
+      return uniqueMacs[0].toLowerCase();
+    }
+
+    return null;
+  }
+
+  private computeMistReachableHint(
+    mistInventoryConnected: boolean | null,
+    mistStatsStatus: string | null,
+    mistRecentlySeen: boolean | null,
+  ): boolean {
+    const explicitlyDisconnected =
+      mistInventoryConnected === false ||
+      (mistStatsStatus != null && /disconnect|offline|unreachable|down|lost/i.test(mistStatsStatus));
+
+    if (explicitlyDisconnected) return false;
+
+    return (
+      mistInventoryConnected === true ||
+      (mistStatsStatus != null && /connected/i.test(mistStatsStatus)) ||
+      mistRecentlySeen === true
+    );
   }
 
   /**
@@ -86,57 +219,93 @@ export class SwitchIdentityService {
       junosVersion: null,
     };
 
-    // Parse the full version output first; this is the most reliable source for
-    // hostname/model/version/serial when read with anchored field matches.
-    const versionCmd = await this.runner.execute('show version', 15000, 2000, {
+    // Prefer the live CLI prompt as the hostname source.
+    const promptResult = await this.runner.sendAndWaitFor('\n', />\s*$|#\s*$|%\s*$/, 3000, {
       silent: options.silent,
     });
-    if (versionCmd.success) {
-      const serialMatch = versionCmd.output.match(/(?:^|\n)(?:System\s+serial\s+number|Serial number)\s*:\s*(\S+)/m);
-      if (serialMatch) identity.serial = serialMatch[1];
-
-      const modelMatch = versionCmd.output.match(/(?:^|\n)Model:\s*(\S+)/m);
-      if (modelMatch) identity.model = modelMatch[1].toUpperCase();
-
-      const hostnameMatch = versionCmd.output.match(/(?:^|\n)Hostname:\s*(\S+)/m);
-      if (hostnameMatch) identity.hostname = hostnameMatch[1];
-
-      const junosMatch = versionCmd.output.match(/(?:^|\n)Junos:\s*(\S+)/m) ||
-                        versionCmd.output.match(/(?:^|\n)JUNOS\s+\S+\s+\[(\S+)\]/m);
-      if (junosMatch) identity.junosVersion = junosMatch[1];
+    if (promptResult.matched) {
+      identity.hostname = this.parsePromptHostname(promptResult.output);
     }
 
-    // Fall back to chassis hardware if version output did not provide model/serial.
+    // Chassis hardware is the most reliable source for model/serial.
+    const filteredChassisCmd = await this.runner.execute(
+      'show chassis hardware | match "^Chassis"',
+      15000,
+      2000,
+      { silent: options.silent },
+    );
+    if (filteredChassisCmd.success) {
+      const parsed = this.parseChassisHardware(filteredChassisCmd.output);
+      identity.serial = this.sanitizeSerial(parsed.serial, identity.model);
+      identity.model = this.sanitizeModel(parsed.model);
+    }
+
     if (!identity.serial || !identity.model) {
       const chassisCmd = await this.runner.execute('show chassis hardware', 15000, 2000, {
         silent: options.silent,
       });
       if (chassisCmd.success) {
         const parsed = this.parseChassisHardware(chassisCmd.output);
-        identity.serial = identity.serial ?? parsed.serial;
-        identity.model = identity.model ?? parsed.model;
+        identity.serial = identity.serial ?? this.sanitizeSerial(parsed.serial, identity.model);
+        identity.model = identity.model ?? this.sanitizeModel(parsed.model);
       }
     }
 
-    // Final fallback for hostname only.
+    // Filtered version output is now mainly for Junos version and secondary fallback.
+    const filteredVersionCmd = await this.runner.execute(
+      'show version | match "^(Hostname:|Model:|Junos:|System serial number:|Serial number:)"',
+      15000,
+      2000,
+      { silent: options.silent },
+    );
+    if (filteredVersionCmd.success) {
+      const parsed = this.parseShowVersion(filteredVersionCmd.output);
+      identity.hostname = identity.hostname ?? parsed.hostname;
+      identity.serial = identity.serial ?? parsed.serial;
+      identity.model = identity.model ?? parsed.model;
+      identity.junosVersion = parsed.junosVersion;
+    }
+
+    if (!identity.hostname || !identity.serial || !identity.model || !identity.junosVersion) {
+      const versionCmd = await this.runner.execute('show version', 15000, 2000, {
+        silent: options.silent,
+      });
+      if (versionCmd.success) {
+        const parsed = this.parseShowVersion(versionCmd.output);
+        identity.hostname = identity.hostname ?? parsed.hostname;
+        identity.serial = identity.serial ?? parsed.serial;
+        identity.model = identity.model ?? parsed.model;
+        identity.junosVersion = identity.junosVersion ?? parsed.junosVersion;
+      }
+    }
+
     if (!identity.hostname) {
-      const hostnameCmd = await this.runner.execute('show configuration system host-name', 10000, 2000, {
+      const hostnameCmd = await this.runner.execute('show configuration system host-name | display set', 10000, 2000, {
         silent: options.silent,
       });
       if (hostnameCmd.success) {
-        const match = hostnameCmd.output.match(/(?:^|\n)\s*host-name\s+(\S+)/m);
-        if (match) identity.hostname = match[1].replace(/;$/, '');
+        const match = hostnameCmd.output.match(/(?:^|\n)\s*(?:set\s+system\s+)?host-name\s+(\S+)/m);
+        if (match) identity.hostname = this.sanitizeHostname(match[1]);
       }
     }
 
     // Get MAC address
-    const macCmd = await this.runner.execute('show chassis mac-addresses', 10000, 2000, {
-      silent: options.silent,
-    });
-    if (macCmd.success) {
-      const macMatch = macCmd.output.match(/(?:Private\s+)?Base address\s+([0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2})/i)
-        || macCmd.output.match(/([0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2})/i);
-      if (macMatch) identity.mac = macMatch[1].toLowerCase();
+    const filteredMacCmd = await this.runner.execute(
+      'show chassis mac-addresses | match "Base address"',
+      10000,
+      2000,
+      { silent: options.silent },
+    );
+    if (filteredMacCmd.success) {
+      identity.mac = this.parseMacAddress(filteredMacCmd.output);
+    }
+    if (!identity.mac) {
+      const macCmd = await this.runner.execute('show chassis mac-addresses', 10000, 2000, {
+        silent: options.silent,
+      });
+      if (macCmd.success) {
+        identity.mac = this.parseMacAddress(macCmd.output);
+      }
     }
 
     return identity;
@@ -149,7 +318,7 @@ export class SwitchIdentityService {
   async identifyAndMatch(options: { silent?: boolean } = {}): Promise<MistMatchResult> {
     const identity = await this.identify(options);
     let mistDevice: MistInventoryDevice | null = null;
-    let matchedBy: 'serial' | 'mac' | null = null;
+    let matchedBy: 'serial' | 'mac' | 'name' | null = null;
 
     if (!this.mistApi.isConfigured) {
       return {
@@ -176,6 +345,11 @@ export class SwitchIdentityService {
       if (mistDevice) matchedBy = 'mac';
     }
 
+    if (!mistDevice && identity.hostname) {
+      mistDevice = await this.mistApi.findDeviceByName(identity.hostname);
+      if (mistDevice) matchedBy = 'name';
+    }
+
     // Pull Mist config if we found the device
     let mistConfig: MistDeviceConfig | null = null;
     let mistSiteName: string | null = null;
@@ -191,6 +365,21 @@ export class SwitchIdentityService {
       } catch {
         // Site detail lookup failed — keep null and let the UI fall back if needed.
       }
+    }
+
+    if (mistDevice) {
+      const mistName = typeof mistDevice.name === 'string' ? mistDevice.name : null;
+      const mistHostname = typeof mistDevice.hostname === 'string' ? mistDevice.hostname : null;
+      const mistSerial = typeof mistDevice.serial === 'string'
+        ? mistDevice.serial
+        : (typeof mistDevice.chassis_serial === 'string' ? mistDevice.chassis_serial : null);
+      const mistModel = typeof mistDevice.model === 'string'
+        ? mistDevice.model
+        : (typeof mistDevice.chassis_model === 'string' ? mistDevice.chassis_model : null);
+
+      identity.hostname = identity.hostname ?? this.sanitizeHostname(mistName ?? mistHostname);
+      identity.serial = identity.serial ?? this.sanitizeSerial(mistSerial, identity.model);
+      identity.model = identity.model ?? this.sanitizeModel(mistModel);
     }
 
     let mistInventoryConnected: boolean | null = null;
@@ -236,10 +425,11 @@ export class SwitchIdentityService {
       if (mistRecentlySeen === true) parts.push('recent last_seen (<10m)');
       else if (mistRecentlySeen === false && mistDevice.site_id) parts.push('no recent last_seen');
 
-      mistCloudReachableHint =
-        mistInventoryConnected === true ||
-        (mistStatsStatus != null && /connected/i.test(mistStatsStatus)) ||
-        mistRecentlySeen === true;
+      mistCloudReachableHint = this.computeMistReachableHint(
+        mistInventoryConnected,
+        mistStatsStatus,
+        mistRecentlySeen,
+      );
 
       mistCloudStatusLine = parts.join(' · ');
     }
@@ -320,10 +510,11 @@ export class SwitchIdentityService {
       }
     }
 
-    const mistCloudReachableHint =
-      mistInventoryConnected === true ||
-      (mistStatsStatus != null && /connected/i.test(mistStatsStatus)) ||
-      mistRecentlySeen === true;
+    const mistCloudReachableHint = this.computeMistReachableHint(
+      mistInventoryConnected,
+      mistStatsStatus,
+      mistRecentlySeen,
+    );
 
     const parts: string[] = [];
     if (mistInventoryConnected === true) parts.push('inventory: connected');

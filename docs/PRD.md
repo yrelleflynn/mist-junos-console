@@ -135,6 +135,8 @@ Based on the current implementation, the product already includes:
 - The app must identify devices by serial, MAC, or hostname where possible.
 - The product should use Mist APIs in a layered way: session context first, then device intent and last-known device status after switch identification.
 - The UI should distinguish between live console-derived state, Mist intended state, and Mist last-known state.
+- Once the serial session is usable, the product may silently gather local identity and Mist context so the operator sees device and cloud status without needing to manually run every setup step.
+- The top session header should show serial session context, switch-local identity, and Mist/JMA cloud status in one stable operator-facing area.
 
 #### Current vs target Mist auth model
 
@@ -176,6 +178,8 @@ See [`docs/MIST-API-INTEGRATION.md`](/Users/mdusty/Library/CloudStorage/OneDrive
 
 - The app must retrieve Mist device config and compare it to running config.
 - The app must make config drift understandable and actionable.
+- The app should compare Mist intent against inherited Junos `display set` output rather than relying on raw textual equality.
+- The app should normalize common Mist intent patterns such as grouped config, `apply-groups`, interface ranges, and array-style `set` commands before deciding drift.
 
 ### Adoption
 

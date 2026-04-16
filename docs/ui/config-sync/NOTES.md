@@ -39,6 +39,41 @@ Start with one end-to-end flow, not every possible screen variation:
 - visible trust and risk messaging
 - Junos-native terminology where helpful
 
+## Current Drift Logic Notes
+
+The current config-drift comparison is intentionally closer to a “major intent drift” check than a byte-for-byte textual diff.
+
+### Current sources
+
+- Mist intent source: `GET /api/v1/sites/{site_id}/devices/{device_id}/config_cmd`
+- live switch source: `show configuration | display inheritance | display set`
+
+### Current normalization rules
+
+- prefer `config_cmd.cli` when available
+- ignore Mist helper comment lines beginning with `#`
+- ignore Mist sync helper `delete ...` lines during drift comparison
+- expand bracket arrays such as `[ guest home-trusted ]` into per-line `set` commands
+- expand bracketed interface members such as `ge-0/0/[10-11]`
+- expand Mist `groups` plus `apply-groups` plus `interface-range` intent into explicit inherited switch lines
+- expand relevant interface-range usage in `protocols rstp` and `protocols dot1x`
+- compare unique canonical lines rather than raw duplicated lines
+- when the Mist payload repeats scalar assignments, keep the effective last value
+
+### Intended interpretation
+
+The drift view is meant to highlight meaningful gaps between Mist intent and running config, not every representational difference between:
+
+- grouped Mist intent
+- inherited Junos output
+- helper cleanup commands used during config sync
+
+### Known residual behavior
+
+A small number of Mist-intended commands may still appear as Mist-only drift if the switch does not accept or realize them on-box even though they appear in `config_cmd`.
+
+That is currently acceptable behavior and should be treated as noteworthy drift rather than automatically hidden.
+
 ## Open Design Questions
 
 - Should the diff appear inline, in a drawer, or in a modal?

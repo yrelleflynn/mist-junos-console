@@ -116,6 +116,22 @@ describe('CloudStatusController', () => {
     expect(controller.state.mist.label).toBe('Disconnected');
   });
 
+  it('refresh() keeps Mist disconnected when last_seen is recent but inventory and stats both say disconnected', async () => {
+    switchIdentity = createSwitchIdentityStub({
+      mistInventoryConnected: false,
+      mistStatsStatus: 'disconnected',
+      mistRecentlySeen: true,
+      mistCloudReachableHint: false,
+      mistCloudStatusLine: 'inventory: not connected · stats: disconnected · recent last_seen (<10m)',
+    });
+    controller = new CloudStatusController(switchIdentity, troubleshooter, { onStatusUpdated });
+
+    await controller.refresh(makeMatchResult(), true);
+
+    expect(controller.state.mist.pillState).toBe('disconnected');
+    expect(controller.state.mist.label).toBe('Disconnected');
+  });
+
   it('refresh() skips JMA polling when serial is disconnected', async () => {
     await controller.refresh(makeMatchResult(), false);
 

@@ -13,6 +13,7 @@ import { MistApiService } from './services/mist-api.service';
 import { TroubleshootService, CheckResult, CheckStatus } from './services/troubleshoot.service';
 import { SwitchIdentityService } from './services/switch-identity.service';
 import { ConfigDriftService, ConfigDiffLine } from './services/config-drift.service';
+import { ConfigSyncService } from './services/config-sync.service';
 import { RemoteSessionController } from './controllers/remote-session.controller';
 import { MistContextController } from './controllers/mist-context.controller';
 import { DeviceContextController } from './controllers/device-context.controller';
@@ -96,6 +97,8 @@ function init(): void {
     rootPasswordResult: document.getElementById('root-password-result') as HTMLElement,
     btnConfigDrift: document.getElementById('btn-config-drift') as HTMLButtonElement,
     configDriftResults: document.getElementById('config-drift-results') as HTMLElement,
+    btnConfigSyncPreview: document.getElementById('btn-config-sync-preview') as HTMLButtonElement,
+    configSyncResults: document.getElementById('config-sync-results') as HTMLElement,
     btnOfflineTimeline: document.getElementById('btn-offline-timeline') as HTMLButtonElement,
     timelineResults: document.getElementById('timeline-results') as HTMLElement,
     btnAdopt: document.getElementById('btn-adopt') as HTMLButtonElement,
@@ -125,6 +128,7 @@ function init(): void {
   const troubleshooter = new TroubleshootService(cmdRunner, mistApi);
   const switchIdentity = new SwitchIdentityService(cmdRunner, mistApi);
   const configDrift = new ConfigDriftService();
+  const configSync = new ConfigSyncService(cmdRunner, mistApi);
   const promptDecoder = new TextDecoder();
   let recentConsoleTail = '';
   let cloudStatusLoopStarted = false;
@@ -281,6 +285,7 @@ function init(): void {
         }
 
         ui.btnConfigDrift.disabled = false;
+        ui.btnConfigSyncPreview.disabled = !mistDevice.site_id;
         ui.btnRootPassword.disabled = !mistDevice.site_id;
         ui.btnOfflineTimeline.disabled = !mistDevice.site_id;
 
@@ -374,9 +379,10 @@ function init(): void {
     ui.btnIdentify.disabled = !connected;
     ui.btnLogin.disabled = !connected;
     ui.btnAdopt.disabled = !connected;
-    // Config drift only enabled after identification succeeds
+    // Config drift and sync only enabled after identification succeeds
     if (!connected) {
       ui.btnConfigDrift.disabled = true;
+      ui.btnConfigSyncPreview.disabled = true;
       ui.btnRootPassword.disabled = true;
       ui.btnOfflineTimeline.disabled = true;
       deviceContext.clear();
@@ -1696,6 +1702,97 @@ function init(): void {
     });
   }
 
+  // ---- Config Sync Preview ----
+  async function previewConfigSync(): Promise<void> {
+    await withCloudStatusPollingPaused(async () => {
+      const matchResult = deviceContext.matchResult;
+      if (!matchResult?.mistDevice?.site_id || !matchResult.mistDevice.id) {
+        ui.configSyncResults.innerHTML =
+          '<div class="status-text error">Identify the switch first and ensure it is found in Mist with a site assignment.</div>';
+        return;
+      }
+
+      ui.btnConfigSyncPreview.disabled = true;
+      ui.configSyncResults.innerHTML = '<div class="status-text info">Fetching Mist intended config…</div>';
+
+      const siteId = matchResult.mistDevice.site_id;
+      const deviceId = matchResult.mistDevice.id;
+
+      term.writeSystem('— Starting config sync preview —');
+
+      try {
+        const result = await configSync.previewSync(siteId, deviceId);
+
+        term.writeSystem(
+          `  Candidate: ${result.candidateCommandCount} commands ` +
+          `(${result.cleanupCommandCount} cleanup + ${result.mistCliCommandCount} from Mist intent)`,
+        );
+
+        let html = '';
+
+        // Candidate summary
+        html += '<div class="config-sync-section-title">Candidate</div>';
+        html += `<div class="config-sync-summary">` +
+          `${result.candidateCommandCount} total commands — ` +
+          `${result.cleanupCommandCount} cleanup deletes + ` +
+          `${result.mistCliCommandCount} from Mist intent` +
+          `</div>`;
+
+        // Staging errors
+        if (result.stagingErrors.length > 0) {
+          html += `<div class="config-sync-section-title">Staging Errors (${result.stagingErrors.length})</div>`;
+          for (const err of result.stagingErrors) {
+            html +=
+              `<div class="config-sync-error">` +
+              `<span class="config-sync-error-cmd">${escapeHtml(err.command)}</span>` +
+              `<span class="config-sync-error-msg">${escapeHtml(err.error)}</span>` +
+              `</div>`;
+            term.writeError(`  Staging error: ${err.command} — ${err.error}`);
+          }
+        }
+
+        // Compare diff
+        const checkLabel = result.commitCheckPassed
+          ? '<span class="config-sync-check-status pass">✓ Passed</span>'
+          : '<span class="config-sync-check-status fail">✗ Failed</span>';
+        html += '<div class="config-sync-section-title">Diff (show | compare)</div>';
+        if (result.compareOutput.trim()) {
+          html += `<pre class="config-sync-pre">${escapeHtml(result.compareOutput)}</pre>`;
+          term.writeSystem('  Compare output available — check the sidebar.');
+        } else {
+          html += '<div class="config-sync-summary">No changes detected — config is already aligned with Mist intent.</div>';
+          term.writeSystem('  No diff detected (already aligned).');
+        }
+
+        // Commit check
+        html += `<div class="config-sync-section-title">Commit Check ${checkLabel}</div>`;
+        if (result.commitCheckOutput.trim()) {
+          html += `<pre class="config-sync-pre">${escapeHtml(result.commitCheckOutput)}</pre>`;
+        }
+        term.writeSystem(`  Commit check: ${result.commitCheckPassed ? 'passed' : 'FAILED'}`);
+
+        // Rollback status
+        if (result.rolledBack) {
+          html += '<div class="config-sync-rollback-notice">✓ Changes rolled back — running config is unchanged.</div>';
+          term.writeSystem('  Rolled back. Running config is unchanged.');
+        } else {
+          html +=
+            '<div class="config-sync-error" style="margin-top:8px;">⚠ Rollback may not have completed cleanly — check the terminal.</div>';
+          term.writeError('  Warning: rollback may not have completed cleanly.');
+        }
+
+        ui.configSyncResults.innerHTML = html;
+        term.writeSystem('— Config sync preview complete —');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
+        term.writeError(`Config sync preview error: ${msg}`);
+      } finally {
+        ui.btnConfigSyncPreview.disabled = false;
+      }
+    });
+  }
+
   // ---- Get Root Password ----
   async function getRootPassword(): Promise<void> {
     await withCloudStatusPollingPaused(async () => {
@@ -2008,6 +2105,7 @@ function init(): void {
   ui.btnLogin.addEventListener('click', loginToSwitch);
   ui.btnRootPassword.addEventListener('click', getRootPassword);
   ui.btnConfigDrift.addEventListener('click', checkConfigDrift);
+  ui.btnConfigSyncPreview.addEventListener('click', previewConfigSync);
   ui.btnOfflineTimeline.addEventListener('click', checkOfflineTimeline);
   ui.btnAdopt.addEventListener('click', adoptSwitch);
 

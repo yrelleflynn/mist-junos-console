@@ -74,6 +74,7 @@ Notes:
 - this endpoint is central to the “console bridge” concept
 - it should usually be called only after the switch is identified and matched to a Mist device
 - the current known sync model is to prepend the known Mist-managed cleanup delete commands before applying the retrieved `set` commands
+- config drift should consume the returned `cli` lines directly when available rather than attempting to reconstruct intent from partial derived fields
 
 ## 3. Device Status And History APIs
 
@@ -170,6 +171,22 @@ Benefits:
 - console command output represents live device state
 - differences between the two are often the useful troubleshooting surface
 
+### Config drift comparison behavior
+
+The current drift comparison should normalize Mist intent and live Junos output before comparing them.
+
+Current rules:
+
+- fetch intent from `config_cmd`
+- fetch live config with `show configuration | display inheritance | display set`
+- ignore Mist helper `delete ...` lines and comment lines
+- expand array-style Mist `set` commands into explicit per-line commands
+- expand Mist `groups`, `apply-groups`, and `interface-range` intent into explicit inherited switch lines where possible
+- deduplicate canonical lines before comparison
+- keep the effective last value when the Mist payload repeats scalar assignments
+
+This keeps the drift output focused on meaningful intent gaps rather than representation differences between Mist group-based intent and inherited Junos output.
+
 ### Mist config sync behavior
 
 The current known Mist sync pattern for this use case is:
@@ -224,3 +241,8 @@ Mist API usage in this product should be intentional and layered:
 - last-known status and history after identification
 
 This keeps the product understandable, keeps the backend in control of Mist integration, and aligns well with both the current standalone architecture and the long-term Mist-hosted target state.
+
+## Related Documents
+
+- [`docs/ui/LIVE-SESSION-HEADER.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/ui/LIVE-SESSION-HEADER.md)
+- [`docs/ui/config-sync/NOTES.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/ui/config-sync/NOTES.md)
