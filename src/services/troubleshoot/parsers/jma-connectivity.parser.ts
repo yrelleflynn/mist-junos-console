@@ -45,7 +45,9 @@ export function parseJmaConnectivityState(output: string): JmaConnectivityStatus
     };
   }
 
-  const valueLine = lines.slice(headerIndex + 1).find((line) => line.trim().length > 0);
+  const valueLine = lines
+    .slice(headerIndex + 1)
+    .find((line) => /^\s*\d+\s+/.test(line));
   if (!valueLine) {
     return {
       code: null,

@@ -7,7 +7,7 @@
  * local variables.
  */
 
-import type { MistSite } from '../services/mist-api.service';
+import type { MistSite, MistOrg } from '../services/mist-api.service';
 import type { MistCloud } from '../config/mist-clouds.config';
 
 export interface MistContextState {
@@ -21,6 +21,8 @@ export interface MistContextState {
   siteId: string;
   /** Site list loaded from the API, empty until loadSites succeeds. */
   sites: MistSite[];
+  /** Org list loaded from GET /api/v1/self, empty until loadOrgs succeeds. */
+  orgs: MistOrg[];
 }
 
 export const EMPTY_MIST_CONTEXT: MistContextState = {
@@ -29,4 +31,5 @@ export const EMPTY_MIST_CONTEXT: MistContextState = {
   orgId: '',
   siteId: '',
   sites: [],
+  orgs: [],
 };

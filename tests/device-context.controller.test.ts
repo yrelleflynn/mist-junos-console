@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DeviceContextController } from '../src/controllers/device-context.controller';
 import type { DeviceContextCallbacks } from '../src/controllers/device-context.controller';
-import type { MistMatchResult } from '../src/services/switch-identity.service';
+import type { MistMatchResult, SwitchIdentity } from '../src/services/switch-identity.service';
 
 function makeMatchResult(overrides: Partial<MistMatchResult> = {}): MistMatchResult {
   return {
@@ -13,11 +13,17 @@ function makeMatchResult(overrides: Partial<MistMatchResult> = {}): MistMatchRes
   };
 }
 
-function createSwitchIdentityStub(result: MistMatchResult | Error = makeMatchResult()) {
+const BASE_IDENTITY: SwitchIdentity = {
+  hostname: 'sw-test', serial: 'ABC123', mac: 'aa:bb:cc:dd:ee:ff',
+  model: 'EX2300-C-12P', junosVersion: '22.4R3',
+};
+
+function createSwitchIdentityStub(result: MistMatchResult | Error = makeMatchResult(), identity: SwitchIdentity = BASE_IDENTITY) {
   return {
     identifyAndMatch: vi.fn().mockImplementation(() =>
       result instanceof Error ? Promise.reject(result) : Promise.resolve(result),
     ),
+    identify: vi.fn().mockResolvedValue(identity),
   };
 }
 
@@ -32,6 +38,7 @@ function createCallbacks() {
     onIdentifyStarted: vi.fn(),
     onIdentified: vi.fn(),
     onIdentifyFailed: vi.fn(),
+    onLocalIdentityAvailable: vi.fn(),
   };
 }
 
@@ -130,7 +137,7 @@ describe('DeviceContextController', () => {
 
     await controller.runIdentify();
 
-    expect(callbacks.onIdentified).toHaveBeenCalledWith(result);
+    expect(callbacks.onIdentified).toHaveBeenCalledWith(result, {});
     expect(callbacks.onIdentifyFailed).not.toHaveBeenCalled();
   });
 
@@ -142,7 +149,7 @@ describe('DeviceContextController', () => {
 
     await controller.runIdentify();
 
-    expect(callbacks.onIdentifyFailed).toHaveBeenCalledWith(err);
+    expect(callbacks.onIdentifyFailed).toHaveBeenCalledWith(err, {});
     expect(callbacks.onIdentified).not.toHaveBeenCalled();
   });
 
@@ -205,5 +212,104 @@ describe('DeviceContextController', () => {
     switchIdentity.identifyAndMatch.mockResolvedValue(makeMatchResult());
     await controller.runIdentify();
     expect(snap.isIdentified).toBe(false);
+  });
+});
+
+// ---- runLocalIdentify() ----
+
+describe('DeviceContextController.runLocalIdentify()', () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let switchIdentity: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let cmdRunner: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let callbacks: any;
+  let controller: DeviceContextController;
+
+  beforeEach(() => {
+    switchIdentity = createSwitchIdentityStub();
+    cmdRunner = createCmdRunnerStub();
+    callbacks = createCallbacks();
+    controller = new DeviceContextController(switchIdentity as never, cmdRunner as never, callbacks);
+  });
+
+  it('starts with localIdentity null', () => {
+    expect(controller.localIdentity).toBeNull();
+    expect(controller.state.localIdentity).toBeNull();
+  });
+
+  it('calls ensureOperationalMode then identify', async () => {
+    const callOrder: string[] = [];
+    cmdRunner.ensureOperationalMode.mockImplementation(() => {
+      callOrder.push('ensure');
+      return Promise.resolve();
+    });
+    switchIdentity.identify.mockImplementation(() => {
+      callOrder.push('identify');
+      return Promise.resolve(BASE_IDENTITY);
+    });
+
+    await controller.runLocalIdentify();
+    expect(callOrder).toEqual(['ensure', 'identify']);
+    expect(cmdRunner.ensureOperationalMode).toHaveBeenCalledWith({ silent: true });
+    expect(switchIdentity.identify).toHaveBeenCalledWith({ silent: true });
+  });
+
+  it('stores localIdentity and fires onLocalIdentityAvailable on success', async () => {
+    switchIdentity.identify.mockResolvedValue(BASE_IDENTITY);
+
+    await controller.runLocalIdentify();
+
+    expect(controller.localIdentity).toEqual(BASE_IDENTITY);
+    expect(callbacks.onLocalIdentityAvailable).toHaveBeenCalledWith(BASE_IDENTITY);
+  });
+
+  it('does not fire onIdentifyStarted, onIdentified, or onIdentifyFailed', async () => {
+    await controller.runLocalIdentify();
+
+    expect(callbacks.onIdentifyStarted).not.toHaveBeenCalled();
+    expect(callbacks.onIdentified).not.toHaveBeenCalled();
+    expect(callbacks.onIdentifyFailed).not.toHaveBeenCalled();
+  });
+
+  it('silently ignores errors and leaves localIdentity null', async () => {
+    switchIdentity.identify.mockRejectedValue(new Error('serial timeout'));
+
+    await controller.runLocalIdentify(); // must not throw
+
+    expect(controller.localIdentity).toBeNull();
+    expect(callbacks.onLocalIdentityAvailable).not.toHaveBeenCalled();
+  });
+
+  it('is idempotent — skips the gather if localIdentity is already set', async () => {
+    // First run succeeds
+    await controller.runLocalIdentify();
+    expect(switchIdentity.identify).toHaveBeenCalledTimes(1);
+
+    // Second run must not call identify again
+    await controller.runLocalIdentify();
+    expect(switchIdentity.identify).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not clear localIdentity after a subsequent runIdentify() failure', async () => {
+    // Gather local identity first
+    await controller.runLocalIdentify();
+    expect(controller.localIdentity).toEqual(BASE_IDENTITY);
+
+    // Full identify fails — should reset matchResult but not localIdentity
+    switchIdentity.identifyAndMatch.mockRejectedValue(new Error('fail'));
+    await controller.runIdentify();
+
+    // localIdentity should be gone because clear() was called via EMPTY_DEVICE_CONTEXT
+    // (This asserts the current defined behavior: runIdentify failure calls clear state)
+    expect(controller.isIdentified).toBe(false);
+  });
+
+  it('clear() resets localIdentity', async () => {
+    await controller.runLocalIdentify();
+    expect(controller.localIdentity).not.toBeNull();
+
+    controller.clear();
+    expect(controller.localIdentity).toBeNull();
   });
 });

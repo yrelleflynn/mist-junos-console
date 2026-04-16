@@ -14,7 +14,7 @@
  * by the DeviceContextCallbacks object so the controller has no DOM dependency.
  */
 
-import { SwitchIdentityService, MistMatchResult } from '../services/switch-identity.service';
+import { SwitchIdentityService, MistMatchResult, SwitchIdentity } from '../services/switch-identity.service';
 import { CommandRunnerService } from '../services/command-runner.service';
 import { DeviceContextState, EMPTY_DEVICE_CONTEXT } from '../types/device-context.types';
 
@@ -24,11 +24,16 @@ import { DeviceContextState, EMPTY_DEVICE_CONTEXT } from '../types/device-contex
  */
 export interface DeviceContextCallbacks {
   /** Identify run started — show loading indicator. */
-  onIdentifyStarted(): void;
+  onIdentifyStarted(options?: { silent?: boolean }): void;
   /** Identify succeeded — render result HTML and update button states. */
-  onIdentified(result: MistMatchResult): void;
+  onIdentified(result: MistMatchResult, options?: { silent?: boolean }): void;
   /** Identify failed — show error. */
-  onIdentifyFailed(error: Error): void;
+  onIdentifyFailed(error: Error, options?: { silent?: boolean }): void;
+  /**
+   * Background local identity is available (hostname, serial, MAC, model).
+   * Fired by runLocalIdentify() — does not require Mist API to be configured.
+   */
+  onLocalIdentityAvailable(identity: SwitchIdentity): void;
 }
 
 export class DeviceContextController {
@@ -70,29 +75,57 @@ export class DeviceContextController {
     return this._state.hasSiteAssignment;
   }
 
+  /** Local device identity gathered silently from the console, or null if not yet gathered. */
+  get localIdentity(): SwitchIdentity | null {
+    return this._state.localIdentity;
+  }
+
   /**
    * Run the full identify-and-match workflow.
    *
    * Fires onIdentifyStarted, then either onIdentified (success) or
    * onIdentifyFailed (error). Updates internal state in both cases.
    */
-  async runIdentify(): Promise<void> {
-    this.callbacks.onIdentifyStarted();
+  async runIdentify(options: { silent?: boolean } = {}): Promise<void> {
+    this.callbacks.onIdentifyStarted(options);
     try {
-      await this.cmdRunner.ensureOperationalMode();
-      const result = await this.switchIdentity.identifyAndMatch();
+      await this.cmdRunner.ensureOperationalMode({ silent: options.silent });
+      const result = await this.switchIdentity.identifyAndMatch({ silent: options.silent });
       this._state = {
+        ...this._state,
         matchResult: result,
         isIdentified: true,
         hasMistDevice: result.mistDevice !== null,
         hasSiteAssignment: !!result.mistDevice?.site_id,
+        // Promote the match identity to localIdentity if not already set.
+        localIdentity: this._state.localIdentity ?? result.identity,
       };
-      this.callbacks.onIdentified(result);
+      this.callbacks.onIdentified(result, options);
     } catch (err) {
       this._state = { ...EMPTY_DEVICE_CONTEXT };
       this.callbacks.onIdentifyFailed(
         err instanceof Error ? err : new Error(String(err)),
+        options,
       );
+    }
+  }
+
+  /**
+   * Run a silent background identity gather — no Mist lookup, no terminal noise.
+   *
+   * Collects hostname, serial, MAC, model and Junos version from the console and
+   * fires onLocalIdentityAvailable. Safe to call when a CLI prompt is first
+   * detected; does nothing if local identity is already known.
+   */
+  async runLocalIdentify(): Promise<void> {
+    if (this._state.localIdentity !== null) return; // already gathered
+    try {
+      await this.cmdRunner.ensureOperationalMode({ silent: true });
+      const identity = await this.switchIdentity.identify({ silent: true });
+      this._state = { ...this._state, localIdentity: identity };
+      this.callbacks.onLocalIdentityAvailable(identity);
+    } catch {
+      // Silently ignore — this is a best-effort background operation.
     }
   }
 

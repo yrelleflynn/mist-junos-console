@@ -2,15 +2,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MistContextController } from '../src/controllers/mist-context.controller';
 import type { MistContextCallbacks } from '../src/controllers/mist-context.controller';
 import { MIST_CLOUDS } from '../src/config/mist-clouds.config';
-import type { MistSite } from '../src/services/mist-api.service';
+import type { MistSite, MistOrg } from '../src/services/mist-api.service';
 
 const GLOBAL01 = MIST_CLOUDS.find((c) => c.id === 'global01')!;
 const EMEA01 = MIST_CLOUDS.find((c) => c.id === 'emea01')!;
 
-function createApiStub(sites: MistSite[] = []) {
+function createApiStub(sites: MistSite[] = [], orgs: MistOrg[] = []) {
   return {
     configure: vi.fn(),
     listSites: vi.fn().mockResolvedValue(sites),
+    getAccessibleOrgs: vi.fn().mockResolvedValue(orgs),
   };
 }
 
@@ -18,6 +19,7 @@ function createCallbacks() {
   return {
     onStatusChange: vi.fn(),
     onSitesLoaded: vi.fn(),
+    onOrgsLoaded: vi.fn(),
     onLoadingChange: vi.fn(),
   };
 }
@@ -174,11 +176,118 @@ describe('MistContextController', () => {
     expect(controller.siteId).toBe('site-2');
   });
 
+  // ---- selectOrg() ----
+
+  it('selectOrg() updates the orgId in state', () => {
+    controller.selectOrg('org-42');
+    expect(controller.state.orgId).toBe('org-42');
+  });
+
   // ---- state snapshot isolation ----
 
   it('state getter returns a snapshot, not the internal reference', () => {
     const snap1 = controller.state;
     controller.selectSite('site-x');
     expect(snap1.siteId).toBe('');
+  });
+});
+
+// ---- loadOrgs() ----
+
+describe('MistContextController.loadOrgs()', () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let api: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let callbacks: any;
+  let controller: MistContextController;
+
+  beforeEach(() => {
+    api = createApiStub();
+    callbacks = createCallbacks();
+    controller = new MistContextController(api as never, callbacks);
+  });
+
+  it('fires onStatusChange(error) when token is empty', async () => {
+    await controller.loadOrgs('', 'global01');
+    expect(callbacks.onStatusChange).toHaveBeenCalledWith(expect.any(String), 'error');
+    expect(api.getAccessibleOrgs).not.toHaveBeenCalled();
+  });
+
+  it('fires onStatusChange(error) when cloudId is unknown', async () => {
+    await controller.loadOrgs('token-abc', 'not-a-cloud');
+    expect(callbacks.onStatusChange).toHaveBeenCalledWith(expect.any(String), 'error');
+    expect(api.getAccessibleOrgs).not.toHaveBeenCalled();
+  });
+
+  it('calls getAccessibleOrgs with token and cloud apiHost', async () => {
+    const orgs: MistOrg[] = [{ id: 'org-1', name: 'My Org' }];
+    api.getAccessibleOrgs.mockResolvedValue(orgs);
+
+    await controller.loadOrgs('token-abc', 'global01');
+
+    expect(api.getAccessibleOrgs).toHaveBeenCalledWith('token-abc', GLOBAL01.apiHost);
+  });
+
+  it('fires onOrgsLoaded and updates state orgs on success', async () => {
+    const orgs: MistOrg[] = [
+      { id: 'org-1', name: 'Alpha Org' },
+      { id: 'org-2', name: 'Beta Org' },
+    ];
+    api.getAccessibleOrgs.mockResolvedValue(orgs);
+
+    await controller.loadOrgs('token-abc', 'global01');
+
+    expect(callbacks.onOrgsLoaded).toHaveBeenCalledWith(orgs);
+    expect(controller.state.orgs).toEqual(orgs);
+  });
+
+  it('fires onStatusChange(success) when orgs are found', async () => {
+    api.getAccessibleOrgs.mockResolvedValue([{ id: 'o1', name: 'Org 1' }]);
+
+    await controller.loadOrgs('token-abc', 'global01');
+
+    const statusCalls = callbacks.onStatusChange.mock.calls;
+    const [, type] = statusCalls[statusCalls.length - 1];
+    expect(type).toBe('success');
+  });
+
+  it('fires onStatusChange(error) when org list is empty', async () => {
+    api.getAccessibleOrgs.mockResolvedValue([]);
+
+    await controller.loadOrgs('token-abc', 'global01');
+
+    expect(callbacks.onOrgsLoaded).toHaveBeenCalledWith([]);
+    const statusCalls = callbacks.onStatusChange.mock.calls;
+    const [, type] = statusCalls[statusCalls.length - 1];
+    expect(type).toBe('error');
+  });
+
+  it('fires onStatusChange(error) and clears loading when API throws', async () => {
+    api.getAccessibleOrgs.mockRejectedValue(new Error('Auth failure'));
+
+    await controller.loadOrgs('token-abc', 'global01');
+
+    const statusCalls = callbacks.onStatusChange.mock.calls;
+    const [msg, type] = statusCalls[statusCalls.length - 1];
+    expect(type).toBe('error');
+    expect(msg).toContain('Auth failure');
+    expect(callbacks.onLoadingChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it('uses the correct cloud apiHost for non-global01 clouds', async () => {
+    api.getAccessibleOrgs.mockResolvedValue([{ id: 'o-eu', name: 'EU Org' }]);
+
+    await controller.loadOrgs('token-abc', 'emea01');
+
+    expect(api.getAccessibleOrgs).toHaveBeenCalledWith('token-abc', EMEA01.apiHost);
+  });
+
+  it('fires onLoadingChange(true) then (false) around the API call', async () => {
+    api.getAccessibleOrgs.mockResolvedValue([{ id: 'o1', name: 'O' }]);
+
+    await controller.loadOrgs('token-abc', 'global01');
+
+    expect(callbacks.onLoadingChange).toHaveBeenNthCalledWith(1, true);
+    expect(callbacks.onLoadingChange).toHaveBeenNthCalledWith(2, false);
   });
 });

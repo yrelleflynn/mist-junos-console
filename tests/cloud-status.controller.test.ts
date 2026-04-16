@@ -144,6 +144,18 @@ describe('CloudStatusController', () => {
     expect(troubleshooter.getJmaConnectivityState).toHaveBeenCalledTimes(2);
   });
 
+  it('startPolling() still refreshes JMA state when serial is connected but no Mist match exists yet', async () => {
+    vi.useFakeTimers();
+
+    controller.startPolling(() => null, () => true, 1000);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(switchIdentity.refreshMistCloudStatus).not.toHaveBeenCalled();
+    expect(troubleshooter.getJmaConnectivityState).toHaveBeenCalledTimes(1);
+    expect(controller.state.matchResult).toBeNull();
+    expect(controller.state.lastUpdatedUtcIso).toBeTruthy();
+  });
+
   it('pausePolling() suppresses refreshes until resumePolling() is called', async () => {
     vi.useFakeTimers();
     const matchResult = makeMatchResult();

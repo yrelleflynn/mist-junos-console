@@ -34,43 +34,45 @@
             Connection
           </button>
           <div class="accordion-content open" id="accordion-connection">
-            <label for="baud-rate">Baud Rate</label>
-            <select id="baud-rate">
-              <option value="9600" selected>9600</option>
-              <option value="19200">19200</option>
-              <option value="38400">38400</option>
-              <option value="57600">57600</option>
-              <option value="115200">115200</option>
-            </select>
+            <div class="connection-defaults-card">
+              <div class="connection-defaults-header">
+                <span class="connection-defaults-title">Juniper EX Serial Defaults</span>
+                <span class="connection-defaults-note">Fixed for this console</span>
+              </div>
+              <div class="connection-defaults-grid">
+                <div class="connection-defaults-item"><span>Baud</span><strong>9600</strong></div>
+                <div class="connection-defaults-item"><span>Data Bits</span><strong>8</strong></div>
+                <div class="connection-defaults-item"><span>Parity</span><strong>None</strong></div>
+                <div class="connection-defaults-item"><span>Stop Bits</span><strong>1</strong></div>
+                <div class="connection-defaults-item"><span>Flow Control</span><strong>None</strong></div>
+              </div>
+            </div>
 
-            <label for="data-bits">Data Bits</label>
-            <select id="data-bits">
-              <option value="7">7</option>
-              <option value="8" selected>8</option>
-            </select>
+            <div class="serial-defaults-hidden" aria-hidden="true">
+              <label for="baud-rate">Baud Rate</label>
+              <select id="baud-rate" tabindex="-1">
+                <option value="9600" selected>9600</option>
+              </select>
 
-            <label for="parity">Parity</label>
-            <select id="parity">
-              <option value="none" selected>None</option>
-              <option value="even">Even</option>
-              <option value="odd">Odd</option>
-            </select>
+              <label for="data-bits">Data Bits</label>
+              <select id="data-bits" tabindex="-1">
+                <option value="8" selected>8</option>
+              </select>
 
-            <label for="stop-bits">Stop Bits</label>
-            <select id="stop-bits">
-              <option value="1" selected>1</option>
-              <option value="2">2</option>
-            </select>
+              <label for="parity">Parity</label>
+              <select id="parity" tabindex="-1">
+                <option value="none" selected>None</option>
+              </select>
 
-            <label for="flow-control">Flow Control</label>
-            <select id="flow-control">
-              <option value="none" selected>None</option>
-              <option value="hardware">Hardware (RTS/CTS)</option>
-            </select>
+              <label for="stop-bits">Stop Bits</label>
+              <select id="stop-bits" tabindex="-1">
+                <option value="1" selected>1</option>
+              </select>
 
-            <div class="connection-state-card">
-              <div class="connection-state-label">Connection State</div>
-              <span id="connection-state-pill" class="connection-state-pill state-disconnected">Disconnected</span>
+              <label for="flow-control">Flow Control</label>
+              <select id="flow-control" tabindex="-1">
+                <option value="none" selected>None</option>
+              </select>
             </div>
 
             <div class="sidebar-actions">
@@ -81,7 +83,6 @@
             <div class="connection-helper">
               Opens browser port picker (Chrome/Edge only).
             </div>
-            <div id="selected-port" class="connection-selected-port">Selected Port: None selected</div>
             <div class="connection-next-steps">
               <div><strong>01 Login to Switch</strong> — after connecting, authenticate to Junos.</div>
               <div><strong>02 Identify Switch</strong> — confirm hostname/serial before cloud checks.</div>
@@ -118,17 +119,6 @@
           </div>
         </div>
 
-        <!-- Terminal section -->
-        <div class="accordion-section" data-section="terminal">
-          <button class="accordion-trigger" data-target="terminal">
-            <svg class="accordion-chevron" viewBox="0 0 16 16" width="14" height="14"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            Terminal
-          </button>
-          <div class="accordion-content" id="accordion-terminal">
-            <button id="btn-clear" class="btn btn-secondary">Clear Output</button>
-          </div>
-        </div>
-
         <!-- Device Identity & Config section -->
         <div class="accordion-section" data-section="device">
           <button class="accordion-trigger" data-target="device">
@@ -148,24 +138,6 @@
             </div>
 
             <div id="device-identity" class="device-info-panel"></div>
-            <div id="cloud-status-panel" class="cloud-status-panel is-hidden">
-              <div class="cloud-status-panel-header">
-                <span class="cloud-status-panel-title">Cloud Status</span>
-                <span id="cloud-status-last-updated" class="cloud-status-panel-meta">Not yet checked</span>
-              </div>
-              <div class="cloud-status-grid">
-                <div class="cloud-status-card">
-                  <div class="cloud-status-card-label">Mist Status</div>
-                  <span id="mist-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
-                  <div id="mist-monitor-detail" class="cloud-status-card-detail">Identify the switch to compare against Mist state.</div>
-                </div>
-                <div class="cloud-status-card">
-                  <div class="cloud-status-card-label">JMA Connectivity State</div>
-                  <span id="jma-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
-                  <div id="jma-monitor-detail" class="cloud-status-card-detail">Connect and identify the switch to read the switch-reported cloud connectivity state.</div>
-                </div>
-              </div>
-            </div>
 
             <div class="sidebar-actions" style="margin-top:8px;">
               <button id="btn-root-password" class="btn btn-secondary" disabled>Get Root Password</button>
@@ -227,8 +199,74 @@
 
       </aside>
 
-      <!-- Terminal area -->
-      <div id="terminal-container"></div>
+      <section id="workspace">
+        <div id="workspace-top-strip" class="workspace-strip workspace-strip-top">
+          <div class="workspace-card status-header-card">
+            <div class="workspace-card-header">
+              <span class="workspace-card-title">Live Session Header</span>
+              <button id="btn-clear" class="btn btn-secondary btn-sm">Clear Terminal</button>
+            </div>
+            <div class="status-header-grid">
+              <div class="status-header-section">
+                <div class="status-header-section-title">Serial Session</div>
+                <div class="session-overview-grid">
+                  <div class="session-overview-item">
+                    <span class="session-overview-label">Port</span>
+                    <span id="selected-port" class="session-overview-value">Selected Port: None selected</span>
+                  </div>
+                  <div class="session-overview-item">
+                    <span class="session-overview-label">Console</span>
+                    <span class="session-overview-value">Live terminal below. Use the sidebar for login, identify, and recovery actions.</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="status-header-section">
+                <div class="status-header-section-title">Device Identity</div>
+                <div id="device-summary" class="device-summary device-summary-empty">
+                  <span class="device-summary-placeholder">Login or detect a prompt to gather hostname, serial, MAC, and model.</span>
+                </div>
+              </div>
+
+              <div id="cloud-status-panel" class="status-header-section cloud-status-panel">
+                <div class="cloud-status-panel-header">
+                  <span class="status-header-section-title">Cloud Status</span>
+                  <span id="cloud-status-last-updated" class="cloud-status-panel-meta">Not yet checked</span>
+                </div>
+                <div class="cloud-status-grid">
+                  <div class="cloud-status-card">
+                    <div class="cloud-status-card-label">Mist Status</div>
+                    <span id="mist-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
+                    <div id="mist-monitor-detail" class="cloud-status-card-detail">Identify and match the switch in Mist to enable Mist status monitoring.</div>
+                  </div>
+                  <div class="cloud-status-card">
+                    <div class="cloud-status-card-label">JMA Connectivity State</div>
+                    <span id="jma-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
+                    <div id="jma-monitor-detail" class="cloud-status-card-detail">Log in or detect a Junos CLI prompt to start the switch-reported cloud status monitor.</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="terminal-container"></div>
+
+        <div id="workspace-bottom-strip" class="workspace-strip workspace-strip-bottom">
+          <div class="workspace-card workspace-card-inline">
+            <div class="workspace-card-header">
+              <span class="workspace-card-title">Mist API</span>
+            </div>
+            <div id="mist-api-status" class="status-text"></div>
+          </div>
+          <div class="workspace-card workspace-card-inline">
+            <div class="workspace-card-header">
+              <span class="workspace-card-title">Live Monitor</span>
+            </div>
+            <div class="workspace-inline-text">Mist status is last-known cloud state. JMA state is the switch’s current cloud connectivity view.</div>
+          </div>
+        </div>
+      </section>
 
     </div>
 
@@ -246,18 +284,25 @@
         <select id="mist-cloud"></select>
 
         <label for="mist-api-token">API Token</label>
-        <input type="password" id="mist-api-token" placeholder="Enter your Mist API token" autocomplete="off">
+        <div class="input-row">
+          <input type="password" id="mist-api-token" placeholder="Enter your Mist API token" autocomplete="off">
+          <button id="btn-load-orgs" class="btn btn-secondary btn-sm" type="button">Load Orgs</button>
+        </div>
 
-        <label for="mist-org-id">Organization ID</label>
-        <input type="text" id="mist-org-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
+        <label for="mist-org">Organization</label>
+        <select id="mist-org" disabled>
+          <option value="">— Load orgs first —</option>
+        </select>
 
-        <label for="mist-site">Optional: Configure Mist API and Load Sites</label>
+        <label for="mist-site">Site <span class="mist-modal-label-hint">(optional — for root password lookup)</span></label>
         <div class="input-row">
           <select id="mist-site" disabled>
             <option value="">— Load sites first —</option>
           </select>
           <button id="btn-load-sites" class="btn btn-secondary btn-sm">Load Sites</button>
         </div>
+
+        <div id="mist-modal-status" class="status-text mist-modal-status-area"></div>
 
         <div class="mist-modal-actions">
           <button id="btn-cancel-mist-modal" class="btn btn-secondary" type="button">Cancel</button>

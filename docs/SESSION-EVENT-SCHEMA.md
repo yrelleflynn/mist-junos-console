@@ -74,6 +74,12 @@ Each event should contain the following top-level fields.
 - `terminal_rx`
 - `terminal_resize`
 
+Note:
+
+- terminal events should represent what the operator meaningfully sees or types in the live terminal
+- silent background commands should not be mislabeled as normal operator terminal traffic
+- if a background action needs to be captured, prefer a `system_notice`, workflow event, or a terminal event with explicit transcript suppression metadata
+
 ### System and UI
 
 - `system_notice`
@@ -135,6 +141,9 @@ Each event should contain the following top-level fields.
   "render_in_transcript": true
 }
 ```
+
+Visible user-invoked commands should normally use `render_in_transcript: true`.
+Silent background commands should generally use `render_in_transcript: false` and carry tags or payload metadata that make their system-generated nature explicit.
 
 ### `terminal_rx`
 
@@ -244,6 +253,7 @@ Not every backend event must render directly into the downloadable transcript.
 - low-level backend-only metadata
 - routine `mist_api_call` events unless needed for user comprehension
 - purely internal correlation tags
+- silent background polling or bootstrap terminal activity that would distract from the operator narrative
 
 ## Searchable Metadata
 

@@ -74,7 +74,7 @@ export class CloudStatusController {
     this.intervalId = setInterval(() => {
       if (this.paused || !this.pollingGetMatchResult || !this.pollingIsSerialConnected) return;
       const matchResult = this.pollingGetMatchResult();
-      if (!matchResult || !this.pollingIsSerialConnected()) return;
+      if (!this.pollingIsSerialConnected()) return;
       void this.refresh(matchResult, this.pollingIsSerialConnected());
     }, intervalMs);
   }

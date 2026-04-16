@@ -19,6 +19,10 @@ export interface CommandExecutionOptions {
   silent?: boolean;
 }
 
+export interface WaitForOptions {
+  silent?: boolean;
+}
+
 /** Common Junos CLI prompt patterns */
 export const PROMPT_PATTERNS = [
   /[\w\-@.:]+>\s*$/,       // operational mode: user@switch>
@@ -178,6 +182,7 @@ export class CommandRunnerService {
     text: string,
     pattern: RegExp,
     timeoutMs = 10000,
+    options: WaitForOptions = {},
   ): Promise<{ output: string; matched: boolean }> {
     if (!this.serial.isConnected) {
       return { output: '', matched: false };
@@ -199,6 +204,9 @@ export class CommandRunnerService {
         if (settled) return;
         settled = true;
         this.serial.off('data', handler);
+        if (options.silent) {
+          this.serial.endUiDataSuppression();
+        }
         clearTimeout(timeout);
         resolve({ output: buffer, matched });
       };
@@ -207,7 +215,10 @@ export class CommandRunnerService {
 
       const timeout = setTimeout(() => done(false), timeoutMs);
 
-      this.serial.writeString(text).catch(() => done(false));
+      if (options.silent) {
+        this.serial.beginUiDataSuppression();
+      }
+      this.serial.writeString(text, !options.silent).catch(() => done(false));
     });
   }
 
@@ -255,8 +266,8 @@ export class CommandRunnerService {
    * Detect the current CLI mode by sending Enter and examining the prompt.
    * Returns: 'operational' | 'config' | 'shell' | 'login' | 'unknown'
    */
-  async detectMode(): Promise<'operational' | 'config' | 'shell' | 'login' | 'unknown'> {
-    const result = await this.sendAndWaitFor('\n', />\s*$|#\s*$|%\s*$|login:/i, 3000);
+  async detectMode(options: WaitForOptions = {}): Promise<'operational' | 'config' | 'shell' | 'login' | 'unknown'> {
+    const result = await this.sendAndWaitFor('\n', />\s*$|#\s*$|%\s*$|login:/i, 3000, options);
     const output = result.output.trim();
 
     if (/login:\s*$/i.test(output)) return 'login';
@@ -270,28 +281,28 @@ export class CommandRunnerService {
    * Ensure the CLI is in Junos operational mode.
    * Exits config mode or shell if needed.
    */
-  async ensureOperationalMode(): Promise<void> {
-    const mode = await this.detectMode();
+  async ensureOperationalMode(options: CommandExecutionOptions = {}): Promise<void> {
+    const mode = await this.detectMode(options);
 
     if (mode === 'config') {
       // Exit config mode without committing
-      await this.execute('exit', 5000);
+      await this.execute('exit', 5000, 2000, options);
       // Check if we're still in config (nested edit levels)
-      const mode2 = await this.detectMode();
+      const mode2 = await this.detectMode(options);
       if (mode2 === 'config') {
-        await this.execute('top', 3000);
-        await this.execute('exit', 5000);
+        await this.execute('top', 3000, 2000, options);
+        await this.execute('exit', 5000, 2000, options);
       }
     } else if (mode === 'shell') {
       // Exit shell, then enter CLI
-      await this.send('exit\n');
+      await this.sendAndWaitFor('exit\n', />\s*$|#\s*$|login:/i, 3000, options);
       await new Promise((r) => setTimeout(r, 1000));
-      await this.send('cli\n');
+      await this.sendAndWaitFor('cli\n', />\s*$|#\s*$|login:/i, 5000, options);
       await new Promise((r) => setTimeout(r, 1500));
     }
 
     // Disable pagination
-    await this.execute('set cli screen-length 0', 5000);
+    await this.execute('set cli screen-length 0', 5000, 2000, options);
   }
 
   /**

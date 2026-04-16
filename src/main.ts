@@ -47,7 +47,7 @@ function init(): void {
     btnClear: document.getElementById('btn-clear') as HTMLButtonElement,
     terminalContainer: document.getElementById('terminal-container') as HTMLElement,
     connectionBadge: document.getElementById('connection-badge') as HTMLElement,
-    connectionStatePill: document.getElementById('connection-state-pill') as HTMLElement,
+    connectionStatePill: document.getElementById('connection-state-pill') as HTMLElement | null,
     selectedPort: document.getElementById('selected-port') as HTMLElement,
     baudRate: document.getElementById('baud-rate') as HTMLSelectElement,
     dataBits: document.getElementById('data-bits') as HTMLSelectElement,
@@ -62,8 +62,9 @@ function init(): void {
     // Mist API
     mistCloud: document.getElementById('mist-cloud') as HTMLSelectElement,
     mistApiToken: document.getElementById('mist-api-token') as HTMLInputElement,
-    mistOrgId: document.getElementById('mist-org-id') as HTMLInputElement,
+    mistOrg: document.getElementById('mist-org') as HTMLSelectElement,
     mistSite: document.getElementById('mist-site') as HTMLSelectElement,
+    btnLoadOrgs: document.getElementById('btn-load-orgs') as HTMLButtonElement,
     btnLoadSites: document.getElementById('btn-load-sites') as HTMLButtonElement,
     btnOpenMistModal: document.getElementById('btn-open-mist-modal') as HTMLButtonElement,
     btnCloseMistModal: document.getElementById('btn-close-mist-modal') as HTMLButtonElement,
@@ -71,6 +72,7 @@ function init(): void {
     btnSaveMistModal: document.getElementById('btn-save-mist-modal') as HTMLButtonElement,
     mistModalOverlay: document.getElementById('mist-modal-overlay') as HTMLElement,
     mistApiStatus: document.getElementById('mist-api-status') as HTMLElement,
+    mistModalStatus: document.getElementById('mist-modal-status') as HTMLElement,
 
     // Troubleshooting
     tsUplinkPort: document.getElementById('ts-uplink-port') as HTMLInputElement,
@@ -99,6 +101,9 @@ function init(): void {
     btnAdopt: document.getElementById('btn-adopt') as HTMLButtonElement,
     adoptRootPw: document.getElementById('adopt-root-pw') as HTMLInputElement,
     adoptResults: document.getElementById('adopt-results') as HTMLElement,
+
+    // Device summary (workspace top strip)
+    deviceSummary: document.getElementById('device-summary') as HTMLElement,
   };
 
   // ---- Populate Mist cloud dropdown ----
@@ -120,6 +125,15 @@ function init(): void {
   const troubleshooter = new TroubleshootService(cmdRunner, mistApi);
   const switchIdentity = new SwitchIdentityService(cmdRunner, mistApi);
   const configDrift = new ConfigDriftService();
+  const promptDecoder = new TextDecoder();
+  let recentConsoleTail = '';
+  let cloudStatusLoopStarted = false;
+  let localIdentifyInFlight = false;
+  let localIdentifyPromise: Promise<void> | null = null;
+  let loggedInBootstrapPromise: Promise<void> | null = null;
+  let resolvedMatchedSiteName: string | null = null;
+  let identifyInFlight = false;
+  let cloudStatusRefreshInFlight = false;
 
   // ---- Mist context controller ----
   const mistContext = new MistContextController(mistApi, {
@@ -143,19 +157,58 @@ function init(): void {
         });
         ui.mistSite.disabled = false;
       }
+      const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
+      if (identity) renderDeviceSummary(identity);
+    },
+    onOrgsLoaded(orgs) {
+      ui.mistOrg.innerHTML = '';
+      if (orgs.length === 0) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = '— No orgs found —';
+        ui.mistOrg.appendChild(opt);
+      } else {
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = '— Select an org —';
+        ui.mistOrg.appendChild(placeholder);
+        orgs.sort((a, b) => a.name.localeCompare(b.name));
+        orgs.forEach((org) => {
+          const opt = document.createElement('option');
+          opt.value = org.id;
+          opt.textContent = org.name;
+          ui.mistOrg.appendChild(opt);
+        });
+        ui.mistOrg.disabled = false;
+      }
+      const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
+      if (identity) renderDeviceSummary(identity);
     },
     onLoadingChange(loading) {
       ui.btnLoadSites.disabled = loading;
+      ui.btnLoadOrgs.disabled = loading;
     },
   });
 
   // ---- Device context controller ----
   const deviceContext = new DeviceContextController(switchIdentity, cmdRunner, {
-    onIdentifyStarted() {
+    onIdentifyStarted(options) {
+      identifyInFlight = true;
+      const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
+      if (identity) {
+        renderDeviceSummary(identity);
+      } else {
+        renderDeviceSummaryPlaceholder();
+      }
+      if (options?.silent) return;
       // loading state set by caller before runIdentify()
     },
-    onIdentified(result) {
+    onIdentified(result, options) {
+      identifyInFlight = false;
       const { identity, mistDevice, matchedBy } = result;
+      resolvedMatchedSiteName = result.mistSiteName ?? null;
+      // Update the top-strip summary with the freshest identity data.
+      renderDeviceSummary(identity);
       let html = '';
 
       const rows: [string, string | null][] = [
@@ -169,14 +222,18 @@ function init(): void {
       for (const [label, value] of rows) {
         if (value) {
           html += `<div class="device-info-row"><span class="device-info-label">${label}</span><span class="device-info-value">${value}</span></div>`;
-          term.writeSystem(`  ${label}: ${value}`);
+          if (!options?.silent) {
+            term.writeSystem(`  ${label}: ${value}`);
+          }
         }
       }
 
       if (mistDevice) {
-        const siteName = mistDevice.site_id ? 'assigned' : 'unassigned';
+        const siteName = result.mistSiteName ?? (mistDevice.site_id ? 'assigned' : 'unassigned');
         html += `<div class="device-mist-match found">Found in Mist (matched by ${matchedBy}) — ${mistDevice.name || mistDevice.id}<br>Site: ${siteName}</div>`;
-        term.writeSystem(`  Mist: Found (${matchedBy}) — ${mistDevice.name || mistDevice.id}`);
+        if (!options?.silent) {
+          term.writeSystem(`  Mist: Found (${matchedBy}) — ${mistDevice.name || mistDevice.id}`);
+        }
 
         const cloudReachable = result.mistCloudReachableHint === true;
         const cloudDisconnected =
@@ -191,31 +248,45 @@ function init(): void {
             : 'mist-status-pill mist-status-unknown';
         const pillLabel = cloudReachable ? 'Connected' : cloudDisconnected ? 'Disconnected' : 'Unknown';
         html += `<div class="${pillClass}">${pillLabel}</div>`;
-        term.writeSystem(`  Mist cloud state: ${pillLabel}`);
+        if (!options?.silent) {
+          term.writeSystem(`  Mist cloud state: ${pillLabel}`);
+        }
 
         if (result.mistLastSeenUtcIso) {
           html += `<div class="device-info-row"><span class="device-info-label">Last seen (UTC)</span><span class="device-info-value">${result.mistLastSeenUtcIso}</span></div>`;
-          term.writeSystem(`  Last seen (UTC): ${result.mistLastSeenUtcIso}`);
+          if (!options?.silent) {
+            term.writeSystem(`  Last seen (UTC): ${result.mistLastSeenUtcIso}`);
+          }
         }
         if (result.mistLastConfigUtcIso) {
           html += `<div class="device-info-row"><span class="device-info-label">Last config (UTC)</span><span class="device-info-value">${result.mistLastConfigUtcIso}</span></div>`;
-          term.writeSystem(`  Last config (UTC): ${result.mistLastConfigUtcIso}`);
+          if (!options?.silent) {
+            term.writeSystem(`  Last config (UTC): ${result.mistLastConfigUtcIso}`);
+          }
         }
         if (result.mistCloudStatusLine) {
           html += `<div class="device-info-row"><span class="device-info-label">Mist cloud</span><span class="device-info-value">${result.mistCloudStatusLine}</span></div>`;
-          term.writeSystem(`  Mist cloud: ${result.mistCloudStatusLine}`);
+          if (!options?.silent) {
+            term.writeSystem(`  Mist cloud: ${result.mistCloudStatusLine}`);
+          }
         }
         if (result.mistCloudReachableHint) {
           html +=
             '<div class="device-mist-match found" style="margin-top:8px;border-color:var(--accent-green);">' +
             'Mist reports this switch as <strong>reachable</strong> (inventory and/or recent stats). ' +
             'Console troubleshooting may still be useful for local L2/DNS issues, but cloud connectivity may already be OK.</div>';
-          term.writeSystem('  Note: Mist reports switch as cloud-reachable — full cloud check may be optional.');
+          if (!options?.silent) {
+            term.writeSystem('  Note: Mist reports switch as cloud-reachable — full cloud check may be optional.');
+          }
         }
 
         ui.btnConfigDrift.disabled = false;
         ui.btnRootPassword.disabled = !mistDevice.site_id;
         ui.btnOfflineTimeline.disabled = !mistDevice.site_id;
+
+        if (mistDevice.site_id && !result.mistSiteName) {
+          void ensureMatchedSiteName(mistDevice.site_id, identity);
+        }
       } else if (!mistApi.isConfigured) {
         html += '<div class="device-mist-match no-api">Mist API not configured — cannot search inventory</div>';
         term.writeSystem('  Mist: API not configured');
@@ -225,17 +296,27 @@ function init(): void {
       }
 
       ui.deviceIdentity.innerHTML = html;
-      void cloudStatus.refresh(result, serial.isConnected);
-      cloudStatus.startPolling(
-        () => deviceContext.matchResult,
-        () => serial.isConnected,
-        30000,
-      );
+      cloudStatusRefreshInFlight = true;
+      renderDeviceSummary(identity);
+      void startLoggedInCloudStatusLoop(true).finally(() => {
+        cloudStatusRefreshInFlight = false;
+        renderDeviceSummary(identity);
+      });
     },
-    onIdentifyFailed(error) {
-      ui.deviceIdentity.innerHTML = `<div class="status-text error">Error: ${error.message}</div>`;
-      term.writeError(`Identification failed: ${error.message}`);
+    onIdentifyFailed(error, options) {
+      identifyInFlight = false;
+      cloudStatusRefreshInFlight = false;
+      if (!options?.silent) {
+        ui.deviceIdentity.innerHTML = `<div class="status-text error">Error: ${error.message}</div>`;
+        term.writeError(`Identification failed: ${error.message}`);
+      }
       cloudStatus.reset();
+    },
+    onLocalIdentityAvailable(identity) {
+      renderDeviceSummary(identity);
+      if (mistContext.isConfigured) {
+        maybeAutoMatchAfterMistSave();
+      }
     },
   });
 
@@ -300,11 +381,19 @@ function init(): void {
       ui.btnOfflineTimeline.disabled = true;
       deviceContext.clear();
       cloudStatus.reset();
+      cloudStatusLoopStarted = false;
+      localIdentifyInFlight = false;
+      localIdentifyPromise = null;
+      loggedInBootstrapPromise = null;
+      resolvedMatchedSiteName = null;
+      recentConsoleTail = '';
       ui.remoteSessionEnabled.disabled = true;
       ui.remoteSessionEnabled.checked = false;
       remoteSession.tearDown();
       ui.remoteSessionPanel.classList.add('is-hidden');
       ui.remoteSessionId.value = '';
+      // Reset device summary strip
+      renderDeviceSummaryPlaceholder();
     } else {
       ui.remoteSessionEnabled.disabled = false;
     }
@@ -327,11 +416,195 @@ function init(): void {
   function setMistStatus(text: string, type: 'success' | 'error' | 'info' = 'info'): void {
     ui.mistApiStatus.textContent = text;
     ui.mistApiStatus.className = `status-text ${type}`;
+    // Also update inline modal status so feedback is visible while the modal is open.
+    ui.mistModalStatus.textContent = text;
+    ui.mistModalStatus.className = `status-text mist-modal-status-area ${type}`;
+  }
+
+  function getSelectedOrgName(): string | null {
+    const state = mistContext.state;
+    if (!state.orgId) return null;
+    return state.orgs.find((org) => org.id === state.orgId)?.name ?? null;
+  }
+
+  function getSelectedSiteName(): string | null {
+    const matchedSiteName = deviceContext.matchResult?.mistSiteName ?? resolvedMatchedSiteName ?? null;
+    if (matchedSiteName) return matchedSiteName;
+
+    const state = mistContext.state;
+    const siteId = deviceContext.matchResult?.mistDevice?.site_id ?? state.siteId ?? null;
+    if (!siteId) return null;
+    return state.sites.find((site) => site.id === siteId)?.name ?? null;
+  }
+
+  function getDeviceSummaryLoadingMessage(): string | null {
+    if (localIdentifyInFlight) {
+      return 'Reading switch identity from the live console…';
+    }
+    if (identifyInFlight && mistContext.isConfigured) {
+      return 'Matching the switch in Mist and refreshing cloud status…';
+    }
+    if (identifyInFlight) {
+      return 'Refreshing switch identity…';
+    }
+    if (cloudStatusRefreshInFlight) {
+      return 'Refreshing live cloud status…';
+    }
+    return null;
+  }
+
+  function buildDeviceSummaryLoadingMarkup(): string {
+    const message = getDeviceSummaryLoadingMessage();
+    if (!message) return '';
+    return `
+      <div class="device-summary-loading" role="status" aria-live="polite">
+        <div class="device-summary-loading-head">
+          <span class="device-summary-spinner" aria-hidden="true"></span>
+          <span class="device-summary-loading-text">${message}</span>
+        </div>
+        <div class="device-summary-loading-bar" aria-hidden="true">
+          <span class="device-summary-loading-bar-fill"></span>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderDeviceSummaryPlaceholder(): void {
+    const loadingMarkup = buildDeviceSummaryLoadingMarkup();
+    const placeholder = loadingMarkup
+      ? '<span class="device-summary-placeholder">Current session context will appear here as soon as the background checks complete.</span>'
+      : '<span class="device-summary-placeholder">Login or detect a prompt to gather hostname, serial, MAC, and model.</span>';
+    ui.deviceSummary.innerHTML = `${loadingMarkup}${placeholder}`;
+    ui.deviceSummary.classList.add('device-summary-empty');
+  }
+
+  /**
+   * Render the compact device summary strip with local identity fields.
+   * Called when background identify completes.
+   */
+  function renderDeviceSummary(identity: { hostname: string | null; serial: string | null; mac: string | null; model: string | null; junosVersion: string | null }): void {
+    const rows = [
+      ['Hostname', identity.hostname],
+      ['Model', identity.model],
+      ['Serial', identity.serial],
+      ['MAC', identity.mac],
+      ['Mist Org', getSelectedOrgName()],
+      ['Mist Site', getSelectedSiteName()],
+    ].filter(([, value]) => value);
+
+    if (rows.length === 0) {
+      renderDeviceSummaryPlaceholder();
+      return;
+    }
+
+    ui.deviceSummary.innerHTML = `
+      ${buildDeviceSummaryLoadingMarkup()}
+      <div class="device-summary-grid">
+        ${rows
+          .map(
+            ([label, value]) => `
+              <div class="device-summary-row">
+                <span class="device-summary-label">${label}</span>
+                <span class="device-summary-value">${value}</span>
+              </div>`,
+          )
+          .join('')}
+      </div>
+    `;
+    ui.deviceSummary.classList.remove('device-summary-empty');
+  }
+
+  async function ensureMatchedSiteName(siteId: string, identity: { hostname: string | null; serial: string | null; mac: string | null; model: string | null; junosVersion: string | null }): Promise<void> {
+    try {
+      const site = await mistApi.getSite(siteId);
+      if (!site.name) return;
+      resolvedMatchedSiteName = site.name;
+      renderDeviceSummary(identity);
+    } catch {
+      // Keep the current summary if the direct site lookup fails.
+    }
+  }
+
+  /**
+   * Silently gather local device identity in the background after a CLI prompt is detected.
+   * Does nothing if identity is already known or a gather is already in flight.
+   */
+  function backgroundIdentify(): Promise<void> {
+    if (localIdentifyInFlight) return localIdentifyPromise ?? Promise.resolve();
+    if (deviceContext.localIdentity !== null) return Promise.resolve();
+    localIdentifyInFlight = true;
+    const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
+    if (identity) {
+      renderDeviceSummary(identity);
+    } else {
+      renderDeviceSummaryPlaceholder();
+    }
+    localIdentifyPromise = deviceContext.runLocalIdentify().finally(() => {
+      localIdentifyInFlight = false;
+      localIdentifyPromise = null;
+      if (mistContext.isConfigured) {
+        maybeAutoMatchAfterMistSave();
+      }
+      const latestIdentity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
+      if (latestIdentity) {
+        renderDeviceSummary(latestIdentity);
+      } else {
+        renderDeviceSummaryPlaceholder();
+      }
+    });
+    return localIdentifyPromise;
+  }
+
+  async function ensureLoggedInBootstrap(): Promise<void> {
+    if (loggedInBootstrapPromise) {
+      await loggedInBootstrapPromise;
+      return;
+    }
+
+    loggedInBootstrapPromise = (async () => {
+      if (!cloudStatusLoopStarted) {
+        await startLoggedInCloudStatusLoop();
+      }
+      await backgroundIdentify();
+    })().finally(() => {
+      loggedInBootstrapPromise = null;
+    });
+
+    await loggedInBootstrapPromise;
+  }
+
+  function maybeAutoMatchAfterMistSave(): void {
+    if (!serial.isConnected) return;
+    if (localIdentifyInFlight) return;
+    if (deviceContext.localIdentity === null) return;
+    if (deviceContext.matchResult !== null) return;
+    if (identifyInFlight) return;
+    void deviceContext.runIdentify({ silent: true });
   }
 
   function formatUtcDisplay(iso: string | null): string | null {
     if (!iso) return null;
     return `${iso.replace('T', ' ').substring(0, 19)} UTC`;
+  }
+
+  function formatBrowserLocalDisplay(iso: string | null): string | null {
+    if (!iso) return null;
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return formatUtcDisplay(iso);
+
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const formatted = new Intl.DateTimeFormat(undefined, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+      timeZoneName: 'short',
+    }).format(date);
+
+    return timezone ? `${formatted} (${timezone})` : formatted;
   }
 
   function setCloudStatusPill(
@@ -344,23 +617,21 @@ function init(): void {
   }
 
   function renderCloudStatus(state: CloudStatusState): void {
-    if (!state.matchResult) {
-      ui.cloudStatusPanel.classList.add('is-hidden');
+    if (!state.matchResult && !state.lastUpdatedUtcIso) {
       setCloudStatusPill(ui.mistMonitorPill, 'Unknown', 'unknown');
       setCloudStatusPill(ui.jmaMonitorPill, 'Unknown', 'unknown');
-      ui.mistMonitorDetail.textContent = 'Identify the switch to compare against Mist state.';
-      ui.jmaMonitorDetail.textContent = 'Connect and identify the switch to read the switch-reported cloud connectivity state.';
+      ui.mistMonitorDetail.textContent = 'Identify and match the switch in Mist to enable Mist status monitoring.';
+      ui.jmaMonitorDetail.textContent = 'Log in or detect a Junos CLI prompt to start the switch-reported cloud status monitor.';
       ui.cloudStatusLastUpdated.textContent = 'Not yet checked';
       return;
     }
 
-    ui.cloudStatusPanel.classList.remove('is-hidden');
     setCloudStatusPill(ui.mistMonitorPill, state.mist.label, state.mist.pillState);
     setCloudStatusPill(ui.jmaMonitorPill, state.jma.label, state.jma.severity);
 
     const mistParts = [state.mist.detail];
-    const lastSeen = formatUtcDisplay(state.mist.lastSeenUtcIso);
-    const lastConfig = formatUtcDisplay(state.mist.lastConfigUtcIso);
+    const lastSeen = formatBrowserLocalDisplay(state.mist.lastSeenUtcIso);
+    const lastConfig = formatBrowserLocalDisplay(state.mist.lastConfigUtcIso);
     if (lastSeen) mistParts.push(`Last seen: ${lastSeen}`);
     if (lastConfig) mistParts.push(`Last config: ${lastConfig}`);
     ui.mistMonitorDetail.textContent = mistParts.join(' · ');
@@ -384,7 +655,30 @@ function init(): void {
     }
   }
 
+  async function startLoggedInCloudStatusLoop(forceRestart = false): Promise<void> {
+    if (forceRestart) {
+      cloudStatusLoopStarted = false;
+    }
+    if (cloudStatusLoopStarted) return;
+    cloudStatusLoopStarted = true;
+    await cloudStatus.refresh(deviceContext.matchResult, serial.isConnected);
+    cloudStatus.startPolling(
+      () => deviceContext.matchResult,
+      () => serial.isConnected,
+      30000,
+    );
+  }
+
+  function maybeStartCloudStatusFromPrompt(): void {
+    if (!serial.isConnected || serial.isUiDataSuppressed) return;
+    const trimmed = recentConsoleTail.trimEnd();
+    const cliPromptDetected = /(?:\{[^}\n]+\}\s*\n)?[\w\-@.:]+[>#]$/.test(trimmed);
+    if (!cliPromptDetected) return;
+    void ensureLoggedInBootstrap();
+  }
+
   function setConnectionStatePill(state: 'connected' | 'connecting' | 'disconnected'): void {
+    if (!ui.connectionStatePill) return;
     if (state === 'connected') {
       ui.connectionStatePill.textContent = 'Connected';
       ui.connectionStatePill.className = 'connection-state-pill state-connected';
@@ -414,6 +708,8 @@ function init(): void {
     if (!serial.isUiDataSuppressed) {
       term.write(data);
       remoteSession.mirrorSerialRx(data);
+      recentConsoleTail = (recentConsoleTail + promptDecoder.decode(data, { stream: true })).slice(-512);
+      maybeStartCloudStatusFromPrompt();
     }
   });
 
@@ -428,6 +724,7 @@ function init(): void {
     const parity = ui.parity.value[0].toUpperCase();
     const stopBits = ui.stopBits.value;
     term.writeSystem(`— Connected (${baudRate} baud, ${dataBits}${parity}${stopBits}) —`);
+    void serial.writeString('\r').catch(() => {});
   });
 
   serial.on('disconnect', () => {
@@ -529,7 +826,7 @@ function init(): void {
   async function loadSites(): Promise<void> {
     await mistContext.loadSites(
       ui.mistApiToken.value.trim(),
-      ui.mistOrgId.value.trim(),
+      ui.mistOrg.value,
       ui.mistCloud.value,
     );
   }
@@ -1193,6 +1490,7 @@ function init(): void {
       if (/>\s*$|#\s*$/.test(output)) {
         ui.loginResult.innerHTML = '<div class="device-mist-match found">Already logged in to Junos CLI.</div>';
         term.writeSystem('  Already logged in.');
+        await ensureLoggedInBootstrap();
         ui.btnIdentify.disabled = false;
         ui.btnLogin.disabled = false;
         return;
@@ -1205,6 +1503,7 @@ function init(): void {
         await new Promise((r) => setTimeout(r, 1500));
         ui.loginResult.innerHTML = '<div class="device-mist-match found">Logged in (was at shell prompt, entered CLI).</div>';
         term.writeSystem('  Entered Junos CLI.');
+        await ensureLoggedInBootstrap();
         ui.btnIdentify.disabled = false;
         ui.btnLogin.disabled = false;
         return;
@@ -1225,6 +1524,7 @@ function init(): void {
             'A root password must be set before any configuration can be committed.' +
             '</div>';
           term.writeSystem('  Factory default — logged in with no password. Root password required.');
+          await ensureLoggedInBootstrap();
           ui.btnIdentify.disabled = false;
           ui.btnLogin.disabled = false;
           return;
@@ -1240,6 +1540,7 @@ function init(): void {
             'A root password must be set before any configuration can be committed.' +
             '</div>';
           term.writeSystem('  Entered Junos CLI. Root password required.');
+          await ensureLoggedInBootstrap();
           ui.btnIdentify.disabled = false;
           ui.btnLogin.disabled = false;
           return;
@@ -1278,6 +1579,7 @@ function init(): void {
 
             ui.loginResult.innerHTML = '<div class="device-mist-match found">Logged in as root using Mist site password.</div>';
             term.writeSystem('  Login successful.');
+            await ensureLoggedInBootstrap();
             ui.btnIdentify.disabled = false;
             ui.btnLogin.disabled = false;
             return;
@@ -1322,11 +1624,14 @@ function init(): void {
 
   // ---- Device Identification ----
   async function identifySwitch(): Promise<void> {
+    if (localIdentifyPromise) {
+      await localIdentifyPromise;
+    }
     await withCloudStatusPollingPaused(async () => {
       ui.btnIdentify.disabled = true;
       ui.deviceIdentity.innerHTML = '<div class="status-text info">Identifying switch…</div>';
       term.writeSystem('— Identifying connected switch —');
-      await deviceContext.runIdentify();
+      await deviceContext.runIdentify({ silent: false });
       ui.btnIdentify.disabled = false;
       term.writeSystem('— Identification complete —');
     });
@@ -1663,12 +1968,24 @@ function init(): void {
   ui.btnOpenMistModal.addEventListener('click', openMistModal);
   ui.btnCloseMistModal.addEventListener('click', closeMistModal);
   ui.btnCancelMistModal.addEventListener('click', closeMistModal);
-  ui.btnSaveMistModal.addEventListener('click', () => {
+  ui.btnLoadOrgs.addEventListener('click', () => {
+    void mistContext.loadOrgs(ui.mistApiToken.value.trim(), ui.mistCloud.value);
+  });
+  ui.mistOrg.addEventListener('change', () => {
+    mistContext.selectOrg(ui.mistOrg.value);
+    const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
+    if (identity) renderDeviceSummary(identity);
+  });
+  ui.btnSaveMistModal.addEventListener('click', async () => {
     const token = ui.mistApiToken.value.trim();
-    const orgId = ui.mistOrgId.value.trim();
+    const orgId = ui.mistOrg.value;
     const cloud = getCloudById(ui.mistCloud.value);
     const saved = mistContext.save(token, cloud?.apiHost ?? '', orgId, cloud ?? null);
-    if (saved) closeMistModal();
+    if (saved) {
+      closeMistModal();
+      void mistContext.loadSites(token, orgId, ui.mistCloud.value);
+      maybeAutoMatchAfterMistSave();
+    }
   });
   ui.mistModalOverlay.addEventListener('click', (e) => {
     if (e.target === ui.mistModalOverlay) closeMistModal();
@@ -1679,7 +1996,11 @@ function init(): void {
     }
   });
   ui.btnLoadSites.addEventListener('click', loadSites);
-  ui.mistSite.addEventListener('change', () => mistContext.selectSite(ui.mistSite.value));
+  ui.mistSite.addEventListener('change', () => {
+    mistContext.selectSite(ui.mistSite.value);
+    const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
+    if (identity) renderDeviceSummary(identity);
+  });
   ui.btnRunTroubleshoot.addEventListener('click', runTroubleshoot);
   ui.btnMistStatus.addEventListener('click', runMistStatus);
   ui.btnSslCheck.addEventListener('click', runSslCheck);

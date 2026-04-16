@@ -76,6 +76,17 @@ The transcript should:
 - present one chronological narrative
 - use clear markers for non-terminal entries such as system notices and test results
 
+### Visible vs silent actions
+
+The live terminal should prioritize operator comprehension, not raw exhaust from every internal action.
+
+Recommended rule:
+
+- operator-invoked actions should remain visible in the live terminal
+- lightweight background monitoring or bootstrap actions may run silently in the live terminal
+- silent background actions should still be captured in the backend event stream as system or backend events
+- if silent actions are ever exposed in transcript rendering, they should be clearly labeled as system-generated rather than operator-entered terminal traffic
+
 ## What Counts As A Transcript Entry
 
 The transcript should include any event that helps the operator understand the session story.
@@ -86,6 +97,7 @@ This includes:
 - session start and end
 - participant join and leave events
 - key system notices
+- user-invoked workflow commands and their meaningful output
 - troubleshooting workflow start and result entries
 - config sync preview, commit check, and commit result entries
 - meaningful errors and warnings
@@ -99,6 +111,7 @@ This includes:
 - all transcript-visible events
 - Mist API actions relevant to the session
 - structured workflow metadata
+- silent background monitoring and bootstrap actions
 - actor attribution for human support and AI agent participants
 - backend-only metadata needed for support search or future analytics
 

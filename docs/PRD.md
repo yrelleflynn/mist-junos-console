@@ -169,6 +169,8 @@ See [`docs/MIST-API-INTEGRATION.md`](/Users/mdusty/Library/CloudStorage/OneDrive
 - The troubleshooting flow should incorporate high-signal device-native status indicators where available, including the JMA cloud connectivity state reported by the switch.
 - The UI should keep both Mist device connected state and switch-reported JMA connectivity state visible as separate but related indicators.
 - The product should periodically refresh lightweight status indicators such as Mist device status and JMA connectivity state while the session is active.
+- Lightweight background monitoring or bootstrap actions may run silently so they do not pollute the operator terminal.
+- Operator-invoked workflows such as explicit identify, troubleshooting, config comparison, and guided remediation should remain visible in the terminal so the operator can follow what the tool is doing.
 
 ### Config comparison
 

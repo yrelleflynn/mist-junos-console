@@ -7,7 +7,7 @@
  * the ad-hoc `lastMatchResult` variable in main.ts.
  */
 
-import type { MistMatchResult } from '../services/switch-identity.service';
+import type { MistMatchResult, SwitchIdentity } from '../services/switch-identity.service';
 
 export interface DeviceContextState {
   /** Full identify-and-match result, null before a successful identify run. */
@@ -18,6 +18,11 @@ export interface DeviceContextState {
   hasMistDevice: boolean;
   /** True when the matched Mist device has a site assignment. */
   hasSiteAssignment: boolean;
+  /**
+   * Local device identity gathered from the serial console (hostname, serial, MAC, model).
+   * Set by runLocalIdentify() — available before Mist API is configured or matched.
+   */
+  localIdentity: SwitchIdentity | null;
 }
 
 export const EMPTY_DEVICE_CONTEXT: DeviceContextState = {
@@ -25,4 +30,5 @@ export const EMPTY_DEVICE_CONTEXT: DeviceContextState = {
   isIdentified: false,
   hasMistDevice: false,
   hasSiteAssignment: false,
+  localIdentity: null,
 };

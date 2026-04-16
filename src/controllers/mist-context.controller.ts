@@ -14,7 +14,7 @@
  * the controller has no direct DOM dependency.
  */
 
-import { MistApiService, MistSite } from '../services/mist-api.service';
+import { MistApiService, MistSite, MistOrg } from '../services/mist-api.service';
 import { getCloudById, MistCloud } from '../config/mist-clouds.config';
 import { MistContextState, EMPTY_MIST_CONTEXT } from '../types/mist-context.types';
 
@@ -27,7 +27,9 @@ export interface MistContextCallbacks {
   onStatusChange(text: string, type: 'success' | 'error' | 'info'): void;
   /** Site list loaded (may be empty). Caller should repopulate the dropdown. */
   onSitesLoaded(sites: MistSite[]): void;
-  /** Loading state changed — disable/enable the Load Sites button. */
+  /** Org list loaded from GET /api/v1/self. Caller should repopulate the org dropdown. */
+  onOrgsLoaded(orgs: MistOrg[]): void;
+  /** Loading state changed — disable/enable the Load Sites / Load Orgs button. */
   onLoadingChange(loading: boolean): void;
 }
 
@@ -126,5 +128,54 @@ export class MistContextController {
   /** Record the selected site ID in state (called when the site dropdown changes). */
   selectSite(siteId: string): void {
     this._state = { ...this._state, siteId };
+  }
+
+  /** Record the selected org ID in state (called when the org dropdown changes). */
+  selectOrg(orgId: string): void {
+    this._state = { ...this._state, orgId };
+  }
+
+  /**
+   * Load the org list accessible to the supplied token via GET /api/v1/self.
+   *
+   * Uses explicit credentials so it can be called before the API is fully
+   * configured (i.e. before orgId is known). Does not call configure().
+   */
+  async loadOrgs(token: string, cloudId: string): Promise<void> {
+    const cloud = getCloudById(cloudId);
+    if (!token || !cloud) {
+      this.callbacks.onStatusChange(
+        'Please fill in the API token and select a cloud region.',
+        'error',
+      );
+      return;
+    }
+
+    this.callbacks.onStatusChange('Loading organizations…', 'info');
+    this.callbacks.onLoadingChange(true);
+
+    try {
+      const orgs = await this.api.getAccessibleOrgs(token, cloud.apiHost);
+      this._state = { ...this._state, cloud, orgs };
+      this.callbacks.onOrgsLoaded(orgs);
+      if (orgs.length === 0) {
+        this.callbacks.onStatusChange(
+          'No organizations found for this token.',
+          'error',
+        );
+      } else {
+        this.callbacks.onStatusChange(
+          `${orgs.length} org(s) loaded — select one to continue.`,
+          'success',
+        );
+      }
+    } catch (err) {
+      this.callbacks.onStatusChange(
+        `Failed to load orgs: ${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    } finally {
+      this.callbacks.onLoadingChange(false);
+    }
   }
 }
