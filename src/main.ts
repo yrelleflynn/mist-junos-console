@@ -13,7 +13,8 @@ import { MistApiService } from './services/mist-api.service';
 import { TroubleshootService, CheckResult, CheckStatus } from './services/troubleshoot.service';
 import { SwitchIdentityService } from './services/switch-identity.service';
 import { ConfigDriftService, ConfigDiffLine } from './services/config-drift.service';
-import { ConfigSyncService } from './services/config-sync.service';
+import { ConfigSyncService, isConfigSyncStagingWarning } from './services/config-sync.service';
+import type { ConfigSyncActionResult } from './services/config-sync.service';
 import { RemoteSessionController } from './controllers/remote-session.controller';
 import { MistContextController } from './controllers/mist-context.controller';
 import { DeviceContextController } from './controllers/device-context.controller';
@@ -41,6 +42,7 @@ if (!SerialService.isSupported()) {
 function init(): void {
   // ---- DOM refs ----
   const ui = {
+    workspace: document.getElementById('workspace') as HTMLElement,
     // Connection
     btnConnect: document.getElementById('btn-connect') as HTMLButtonElement,
     btnDisconnect: document.getElementById('btn-disconnect') as HTMLButtonElement,
@@ -98,7 +100,12 @@ function init(): void {
     btnConfigDrift: document.getElementById('btn-config-drift') as HTMLButtonElement,
     configDriftResults: document.getElementById('config-drift-results') as HTMLElement,
     btnConfigSyncPreview: document.getElementById('btn-config-sync-preview') as HTMLButtonElement,
-    configSyncResults: document.getElementById('config-sync-results') as HTMLElement,
+    // configSyncResults → dynamic content area inside the results pane
+    configSyncResults: document.getElementById('config-sync-content') as HTMLElement,
+    configSyncActionBar: document.getElementById('config-sync-action-bar') as HTMLElement,
+    btnCommitConfirmed: document.getElementById('btn-commit-confirmed') as HTMLButtonElement,
+    btnCommitSync: document.getElementById('btn-commit-sync') as HTMLButtonElement,
+    btnRollbackSync: document.getElementById('btn-rollback-sync') as HTMLButtonElement,
     btnOfflineTimeline: document.getElementById('btn-offline-timeline') as HTMLButtonElement,
     timelineResults: document.getElementById('timeline-results') as HTMLElement,
     btnAdopt: document.getElementById('btn-adopt') as HTMLButtonElement,
@@ -107,6 +114,12 @@ function init(): void {
 
     // Device summary (workspace top strip)
     deviceSummary: document.getElementById('device-summary') as HTMLElement,
+
+    // Results panel (bottom horizontal panel)
+    resultsPanel: document.getElementById('results-panel') as HTMLElement,
+    resultsResizeHandle: document.getElementById('results-resize-handle') as HTMLElement,
+    resultsTabs: document.querySelectorAll<HTMLButtonElement>('.results-tab'),
+    resultsPanes: document.querySelectorAll<HTMLElement>('.results-pane'),
   };
 
   // ---- Populate Mist cloud dropdown ----
@@ -213,7 +226,6 @@ function init(): void {
       resolvedMatchedSiteName = result.mistSiteName ?? null;
       // Update the top-strip summary with the freshest identity data.
       renderDeviceSummary(identity);
-      let html = '';
 
       const rows: [string, string | null][] = [
         ['Hostname', identity.hostname],
@@ -225,16 +237,19 @@ function init(): void {
 
       for (const [label, value] of rows) {
         if (value) {
-          html += `<div class="device-info-row"><span class="device-info-label">${label}</span><span class="device-info-value">${value}</span></div>`;
           if (!options?.silent) {
             term.writeSystem(`  ${label}: ${value}`);
           }
         }
       }
 
+      ui.btnConfigDrift.disabled = true;
+      ui.btnConfigSyncPreview.disabled = true;
+      ui.btnRootPassword.disabled = true;
+      ui.btnOfflineTimeline.disabled = true;
+
       if (mistDevice) {
         const siteName = result.mistSiteName ?? (mistDevice.site_id ? 'assigned' : 'unassigned');
-        html += `<div class="device-mist-match found">Found in Mist (matched by ${matchedBy}) — ${mistDevice.name || mistDevice.id}<br>Site: ${siteName}</div>`;
         if (!options?.silent) {
           term.writeSystem(`  Mist: Found (${matchedBy}) — ${mistDevice.name || mistDevice.id}`);
         }
@@ -251,34 +266,20 @@ function init(): void {
             ? 'mist-status-pill mist-status-disconnected'
             : 'mist-status-pill mist-status-unknown';
         const pillLabel = cloudReachable ? 'Connected' : cloudDisconnected ? 'Disconnected' : 'Unknown';
-        html += `<div class="${pillClass}">${pillLabel}</div>`;
         if (!options?.silent) {
           term.writeSystem(`  Mist cloud state: ${pillLabel}`);
         }
 
-        if (result.mistLastSeenUtcIso) {
-          html += `<div class="device-info-row"><span class="device-info-label">Last seen (UTC)</span><span class="device-info-value">${result.mistLastSeenUtcIso}</span></div>`;
-          if (!options?.silent) {
-            term.writeSystem(`  Last seen (UTC): ${result.mistLastSeenUtcIso}`);
-          }
+        if (result.mistLastSeenUtcIso && !options?.silent) {
+          term.writeSystem(`  Last seen (UTC): ${result.mistLastSeenUtcIso}`);
         }
-        if (result.mistLastConfigUtcIso) {
-          html += `<div class="device-info-row"><span class="device-info-label">Last config (UTC)</span><span class="device-info-value">${result.mistLastConfigUtcIso}</span></div>`;
-          if (!options?.silent) {
-            term.writeSystem(`  Last config (UTC): ${result.mistLastConfigUtcIso}`);
-          }
+        if (result.mistLastConfigUtcIso && !options?.silent) {
+          term.writeSystem(`  Last config (UTC): ${result.mistLastConfigUtcIso}`);
         }
-        if (result.mistCloudStatusLine) {
-          html += `<div class="device-info-row"><span class="device-info-label">Mist cloud</span><span class="device-info-value">${result.mistCloudStatusLine}</span></div>`;
-          if (!options?.silent) {
-            term.writeSystem(`  Mist cloud: ${result.mistCloudStatusLine}`);
-          }
+        if (result.mistCloudStatusLine && !options?.silent) {
+          term.writeSystem(`  Mist cloud: ${result.mistCloudStatusLine}`);
         }
         if (result.mistCloudReachableHint) {
-          html +=
-            '<div class="device-mist-match found" style="margin-top:8px;border-color:var(--accent-green);">' +
-            'Mist reports this switch as <strong>reachable</strong> (inventory and/or recent stats). ' +
-            'Console troubleshooting may still be useful for local L2/DNS issues, but cloud connectivity may already be OK.</div>';
           if (!options?.silent) {
             term.writeSystem('  Note: Mist reports switch as cloud-reachable — full cloud check may be optional.');
           }
@@ -288,19 +289,19 @@ function init(): void {
         ui.btnConfigSyncPreview.disabled = !mistDevice.site_id;
         ui.btnRootPassword.disabled = !mistDevice.site_id;
         ui.btnOfflineTimeline.disabled = !mistDevice.site_id;
+        // Re-apply staged constraint on top of identification-derived button state
+        updateConfigSyncUIState();
 
         if (mistDevice.site_id && !result.mistSiteName) {
           void ensureMatchedSiteName(mistDevice.site_id, identity);
         }
       } else if (!mistApi.isConfigured) {
-        html += '<div class="device-mist-match no-api">Mist API not configured — cannot search inventory</div>';
-        term.writeSystem('  Mist: API not configured');
+        if (!options?.silent) term.writeSystem('  Mist: API not configured');
       } else {
-        html += '<div class="device-mist-match not-found">Not found in Mist inventory</div>';
-        term.writeSystem('  Mist: Not found in inventory');
+        if (!options?.silent) term.writeSystem('  Mist: Not found in inventory');
       }
 
-      ui.deviceIdentity.innerHTML = html;
+      ui.deviceIdentity.innerHTML = '';
       cloudStatusRefreshInFlight = true;
       renderDeviceSummary(identity);
       void startLoggedInCloudStatusLoop(true).finally(() => {
@@ -312,9 +313,9 @@ function init(): void {
       identifyInFlight = false;
       cloudStatusRefreshInFlight = false;
       if (!options?.silent) {
-        ui.deviceIdentity.innerHTML = `<div class="status-text error">Error: ${error.message}</div>`;
         term.writeError(`Identification failed: ${error.message}`);
       }
+      ui.deviceIdentity.innerHTML = '';
       cloudStatus.reset();
     },
     onLocalIdentityAvailable(identity) {
@@ -350,6 +351,140 @@ function init(): void {
       renderCloudStatus(state);
     },
   });
+
+  // ---- Results panel tab switching ----
+  /**
+   * Activate a named results panel tab and show its pane.
+   * `pane` must match the `data-pane` attribute on the corresponding tab button.
+   */
+  function activateResultsTab(pane: string): void {
+    ui.resultsTabs.forEach((tab) => {
+      tab.classList.toggle('active', tab.dataset.pane === pane);
+    });
+    ui.resultsPanes.forEach((p) => {
+      const isTarget = p.id === `${pane}-results`;
+      p.classList.toggle('results-pane-hidden', !isTarget);
+    });
+  }
+
+  // Wire up tab click handlers
+  ui.resultsTabs.forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const pane = tab.dataset.pane;
+      if (pane) activateResultsTab(pane);
+    });
+  });
+
+  // ---- Results panel vertical resizing ----
+  const RESULTS_HEIGHT_STORAGE_KEY = 'junos-console.results-panel-height';
+  const RESULTS_MIN_HEIGHT = 120;
+  const RESULTS_MAX_RATIO = 0.55;
+
+  function getMaxResultsHeight(): number {
+    return Math.max(RESULTS_MIN_HEIGHT, Math.floor(window.innerHeight * RESULTS_MAX_RATIO));
+  }
+
+  function clampResultsHeight(height: number): number {
+    return Math.max(RESULTS_MIN_HEIGHT, Math.min(getMaxResultsHeight(), Math.round(height)));
+  }
+
+  function applyResultsPanelHeight(height: number, persist = true): void {
+    const clamped = clampResultsHeight(height);
+    ui.resultsPanel.style.height = `${clamped}px`;
+    document.documentElement.style.setProperty('--results-panel-height', `${clamped}px`);
+    if (persist) {
+      window.localStorage.setItem(RESULTS_HEIGHT_STORAGE_KEY, String(clamped));
+    }
+  }
+
+  const savedResultsHeight = Number(window.localStorage.getItem(RESULTS_HEIGHT_STORAGE_KEY));
+  if (Number.isFinite(savedResultsHeight) && savedResultsHeight > 0) {
+    applyResultsPanelHeight(savedResultsHeight, false);
+  }
+
+  window.addEventListener('resize', () => {
+    const current = ui.resultsPanel.getBoundingClientRect().height;
+    applyResultsPanelHeight(current, false);
+  });
+
+  ui.resultsResizeHandle.addEventListener('pointerdown', (event) => {
+    if (window.matchMedia('(max-width: 768px)').matches) return;
+
+    event.preventDefault();
+    const pointerId = event.pointerId;
+    ui.resultsResizeHandle.classList.add('is-dragging');
+    ui.resultsResizeHandle.setPointerCapture(pointerId);
+
+    const move = (moveEvent: PointerEvent) => {
+      const workspaceRect = ui.workspace.getBoundingClientRect();
+      const handleRect = ui.resultsResizeHandle.getBoundingClientRect();
+      const desiredHeight = workspaceRect.bottom - moveEvent.clientY - handleRect.height / 2;
+      applyResultsPanelHeight(desiredHeight, false);
+    };
+
+    const release = () => {
+      ui.resultsResizeHandle.classList.remove('is-dragging');
+      const current = ui.resultsPanel.getBoundingClientRect().height;
+      applyResultsPanelHeight(current, true);
+      ui.resultsResizeHandle.removeEventListener('pointermove', move);
+      ui.resultsResizeHandle.removeEventListener('pointerup', release);
+      ui.resultsResizeHandle.removeEventListener('pointercancel', release);
+    };
+
+    ui.resultsResizeHandle.addEventListener('pointermove', move);
+    ui.resultsResizeHandle.addEventListener('pointerup', release);
+    ui.resultsResizeHandle.addEventListener('pointercancel', release);
+  });
+
+  // ---- Config sync staged-state UI management ----
+
+  /**
+   * Synchronise all UI controls with the current config sync session state.
+   *
+   * Call this after any operation that changes whether a candidate is staged
+   * (previewSync completion, commit, rollback, reset on disconnect).
+   */
+  function updateConfigSyncUIState(): void {
+    const staged = configSync.hasStagedCandidate();
+    const sessionInfo = configSync.sessionInfo;
+    const canCommit = staged && !!sessionInfo?.canCommit;
+
+    // Action bar: visible only while a candidate is staged
+    if (staged) {
+      ui.configSyncActionBar.classList.add('is-visible');
+    } else {
+      ui.configSyncActionBar.classList.remove('is-visible');
+    }
+
+    // Action buttons: commit only enabled after a clean, passing preview.
+    ui.btnCommitConfirmed.disabled = !canCommit;
+    ui.btnCommitSync.disabled = !canCommit;
+    ui.btnRollbackSync.disabled = !staged;
+
+    // Preview button: disabled while staged (can't start a new preview over an existing candidate)
+    const hasMatchedDevice = !!deviceContext.matchResult?.mistDevice?.site_id;
+    ui.btnConfigSyncPreview.disabled = staged || !hasMatchedDevice;
+
+    // Workflows that would conflict with an open config-mode session.
+    // Anything that mutates config must stay disabled for the full staged window.
+    if (staged) {
+      ui.btnConfigDrift.disabled = true;
+      ui.btnRunTroubleshoot.disabled = true;
+      ui.btnSslCheck.disabled = true;
+      ui.btnOfflineTimeline.disabled = true;
+      ui.btnAdopt.disabled = true;
+    } else if (serial.isConnected) {
+      // Restore normal connected-state enabling; identification guards apply separately
+      ui.btnRunTroubleshoot.disabled = false;
+      ui.btnMistStatus.disabled = false;
+      ui.btnSslCheck.disabled = false;
+      // Config drift / offline timeline re-enabled only if device is identified
+      const hasSite = !!deviceContext.matchResult?.mistDevice?.site_id;
+      ui.btnConfigDrift.disabled = !deviceContext.matchResult?.mistDevice;
+      ui.btnOfflineTimeline.disabled = !hasSite;
+      ui.btnAdopt.disabled = !serial.isConnected;
+    }
+  }
 
   // ---- UI state helpers ----
   function formatPortLabel(port: SerialPort): string {
@@ -387,6 +522,10 @@ function init(): void {
       ui.btnOfflineTimeline.disabled = true;
       deviceContext.clear();
       cloudStatus.reset();
+      // If the serial connection drops while a candidate is staged, the switch
+      // will exit config mode on its own — reset our staged state to match.
+      configSync.reset();
+      updateConfigSyncUIState();
       cloudStatusLoopStarted = false;
       localIdentifyInFlight = false;
       localIdentifyPromise = null;
@@ -1635,7 +1774,7 @@ function init(): void {
     }
     await withCloudStatusPollingPaused(async () => {
       ui.btnIdentify.disabled = true;
-      ui.deviceIdentity.innerHTML = '<div class="status-text info">Identifying switch…</div>';
+      ui.deviceIdentity.innerHTML = '';
       term.writeSystem('— Identifying connected switch —');
       await deviceContext.runIdentify({ silent: false });
       ui.btnIdentify.disabled = false;
@@ -1652,6 +1791,7 @@ function init(): void {
       }
 
       ui.btnConfigDrift.disabled = true;
+      activateResultsTab('config-drift');
       ui.configDriftResults.innerHTML = '<div class="status-text info">Pulling running config…</div>';
 
       term.writeSystem('— Checking config drift —');
@@ -1713,6 +1853,7 @@ function init(): void {
       }
 
       ui.btnConfigSyncPreview.disabled = true;
+      activateResultsTab('config-sync');
       ui.configSyncResults.innerHTML = '<div class="status-text info">Fetching Mist intended config…</div>';
 
       const siteId = matchResult.mistDevice.site_id;
@@ -1738,10 +1879,25 @@ function init(): void {
           `${result.mistCliCommandCount} from Mist intent` +
           `</div>`;
 
-        // Staging errors
-        if (result.stagingErrors.length > 0) {
-          html += `<div class="config-sync-section-title">Staging Errors (${result.stagingErrors.length})</div>`;
-          for (const err of result.stagingErrors) {
+        // Classify staging issues: warnings vs errors
+        const stagingWarnings = result.stagingErrors.filter(isConfigSyncStagingWarning);
+        const stagingErrors = result.stagingErrors.filter((e) => !isConfigSyncStagingWarning(e));
+
+        if (stagingWarnings.length > 0) {
+          html += `<div class="config-sync-section-title">Staging Warnings (${stagingWarnings.length})</div>`;
+          for (const w of stagingWarnings) {
+            html +=
+              `<div class="config-sync-warning">` +
+              `<span class="config-sync-warning-cmd">${escapeHtml(w.command)}</span>` +
+              `<span class="config-sync-warning-msg">${escapeHtml(w.error)}</span>` +
+              `</div>`;
+            term.writeSystem(`  Staging warning: ${w.command} — ${w.error}`);
+          }
+        }
+
+        if (stagingErrors.length > 0) {
+          html += `<div class="config-sync-section-title">Staging Errors (${stagingErrors.length})</div>`;
+          for (const err of stagingErrors) {
             html +=
               `<div class="config-sync-error">` +
               `<span class="config-sync-error-cmd">${escapeHtml(err.command)}</span>` +
@@ -1751,34 +1907,43 @@ function init(): void {
           }
         }
 
-        // Compare diff
+        // Compare diff (shown in the live console; bottom panel keeps the summary)
         const checkLabel = result.commitCheckPassed
           ? '<span class="config-sync-check-status pass">✓ Passed</span>'
           : '<span class="config-sync-check-status fail">✗ Failed</span>';
-        html += '<div class="config-sync-section-title">Diff (show | compare)</div>';
         if (result.compareOutput.trim()) {
-          html += `<pre class="config-sync-pre">${escapeHtml(result.compareOutput)}</pre>`;
-          term.writeSystem('  Compare output available — check the sidebar.');
+          html +=
+            '<div class="config-sync-section-title">Diff Review</div>' +
+            '<div class="config-sync-summary">Review the highlighted <code>show | compare</code> output in the main console above.</div>';
+          // Mirror the diff to the live terminal with ANSI colours
+          term.writeSystem('  ── Diff (show | compare) ──');
+          term.writeJunosHighlighted(result.compareOutput);
         } else {
-          html += '<div class="config-sync-summary">No changes detected — config is already aligned with Mist intent.</div>';
-          term.writeSystem('  No diff detected (already aligned).');
+          html +=
+            '<div class="config-sync-section-title">Diff Review</div>' +
+            '<div class="config-sync-summary">No changes detected — config is already aligned with Mist intent.</div>';
+          term.writeSystem('  No diff detected — config already aligned with Mist intent.');
         }
 
-        // Commit check
+        // Commit check (plain — output is already plain text, not a diff)
         html += `<div class="config-sync-section-title">Commit Check ${checkLabel}</div>`;
         if (result.commitCheckOutput.trim()) {
           html += `<pre class="config-sync-pre">${escapeHtml(result.commitCheckOutput)}</pre>`;
         }
         term.writeSystem(`  Commit check: ${result.commitCheckPassed ? 'passed' : 'FAILED'}`);
 
-        // Rollback status
-        if (result.rolledBack) {
-          html += '<div class="config-sync-rollback-notice">✓ Changes rolled back — running config is unchanged.</div>';
-          term.writeSystem('  Rolled back. Running config is unchanged.');
-        } else {
+        if (result.staged) {
+          // Candidate is staged — show decision prompt, enable action buttons
           html +=
-            '<div class="config-sync-error" style="margin-top:8px;">⚠ Rollback may not have completed cleanly — check the terminal.</div>';
-          term.writeError('  Warning: rollback may not have completed cleanly.');
+            '<div class="config-sync-section-title" style="margin-top:12px;">Decision Required</div>' +
+            '<div class="config-sync-summary">Candidate config is staged on the switch. ' +
+            'Review the diff above, then choose an action in the panel below.</div>';
+          term.writeSystem('  Candidate staged — choose Commit Confirmed, Commit, or Rollback below.');
+        } else {
+          // Preview failed to stage (exception was thrown and caught cleanly)
+          html +=
+            '<div class="config-sync-error" style="margin-top:8px;">⚠ Staging did not complete — candidate was not left on the switch.</div>';
+          term.writeError('  Warning: staging did not complete cleanly.');
         }
 
         ui.configSyncResults.innerHTML = html;
@@ -1788,9 +1953,117 @@ function init(): void {
         ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
         term.writeError(`Config sync preview error: ${msg}`);
       } finally {
-        ui.btnConfigSyncPreview.disabled = false;
+        // Update staged state UI regardless of success or failure
+        updateConfigSyncUIState();
       }
     });
+  }
+
+  // ---- Config Sync: Commit Confirmed ----
+  async function doCommitConfirmed(): Promise<void> {
+    await withCloudStatusPollingPaused(async () => {
+      ui.btnCommitConfirmed.disabled = true;
+      ui.btnCommitSync.disabled = true;
+      ui.btnRollbackSync.disabled = true;
+
+      term.writeSystem('— Committing with 5-minute auto-rollback safety window —');
+      ui.configSyncResults.innerHTML = '<div class="status-text info">Running commit confirmed…</div>';
+
+      try {
+        const result = await configSync.commitSyncConfirmed();
+        renderConfigSyncActionOutcome(result, 'commit-confirmed');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
+        term.writeError(`Commit confirmed error: ${msg}`);
+      } finally {
+        updateConfigSyncUIState();
+      }
+    });
+  }
+
+  // ---- Config Sync: Commit ----
+  async function doCommitSync(): Promise<void> {
+    await withCloudStatusPollingPaused(async () => {
+      ui.btnCommitConfirmed.disabled = true;
+      ui.btnCommitSync.disabled = true;
+      ui.btnRollbackSync.disabled = true;
+
+      term.writeSystem('— Committing config sync candidate —');
+      ui.configSyncResults.innerHTML = '<div class="status-text info">Running commit…</div>';
+
+      try {
+        const result = await configSync.commitSync();
+        renderConfigSyncActionOutcome(result, 'commit');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
+        term.writeError(`Commit error: ${msg}`);
+      } finally {
+        updateConfigSyncUIState();
+      }
+    });
+  }
+
+  // ---- Config Sync: Rollback ----
+  async function doRollbackSync(): Promise<void> {
+    await withCloudStatusPollingPaused(async () => {
+      ui.btnCommitConfirmed.disabled = true;
+      ui.btnCommitSync.disabled = true;
+      ui.btnRollbackSync.disabled = true;
+
+      term.writeSystem('— Rolling back config sync candidate —');
+      ui.configSyncResults.innerHTML = '<div class="status-text info">Running rollback 0…</div>';
+
+      try {
+        const result = await configSync.rollbackSync();
+        renderConfigSyncActionOutcome(result, 'rollback');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
+        term.writeError(`Rollback error: ${msg}`);
+      } finally {
+        updateConfigSyncUIState();
+      }
+    });
+  }
+
+  /** Render the final outcome of a commit or rollback action in the results pane. */
+  function renderConfigSyncActionOutcome(
+    result: ConfigSyncActionResult,
+    action: 'commit-confirmed' | 'commit' | 'rollback',
+  ): void {
+    let html = '';
+
+    if (result.success) {
+      if (action === 'commit-confirmed') {
+        html +=
+          '<div class="config-sync-rollback-notice">✓ Commit confirmed — config applied with 5-minute auto-rollback window.</div>' +
+          '<div class="config-sync-summary" style="margin-top:8px;">To permanently keep this config, re-enter configuration mode and run <code>commit</code> within 5 minutes. ' +
+          'If no confirmation is received, Junos will auto-rollback.</div>';
+        term.writeSystem('  Commit confirmed — config applied (confirm within 5 minutes or Junos auto-rolls back).');
+      } else if (action === 'commit') {
+        html += '<div class="config-sync-rollback-notice">✓ Committed — config is now active and permanent.</div>';
+        term.writeSystem('  Committed — config is now active and permanent.');
+      } else {
+        html += '<div class="config-sync-rollback-notice">✓ Rolled back — running config is unchanged.</div>';
+        term.writeSystem('  Rolled back — running config is unchanged.');
+      }
+
+      if (result.output.trim()) {
+        html += `<pre class="config-sync-pre" style="margin-top:8px;">${escapeHtml(result.output)}</pre>`;
+        term.writeSystem(result.output);
+      }
+    } else {
+      const msg = result.error ?? 'Unknown error';
+      html += `<div class="config-sync-error" style="margin-top:8px;">⚠ ${escapeHtml(msg)}</div>`;
+      if (result.output.trim()) {
+        html += `<pre class="config-sync-pre">${escapeHtml(result.output)}</pre>`;
+      }
+      term.writeError(`  ${action} failed: ${msg}`);
+    }
+
+    ui.configSyncResults.innerHTML = html;
   }
 
   // ---- Get Root Password ----
@@ -1844,6 +2117,12 @@ function init(): void {
   // ---- Adopt Switch ----
   async function adoptSwitch(): Promise<void> {
     await withCloudStatusPollingPaused(async () => {
+      if (configSync.hasStagedCandidate()) {
+        ui.adoptResults.innerHTML = '<div class="status-text error">Rollback or commit the staged config sync candidate before starting switch adoption.</div>';
+        term.writeError('Adopt Switch is blocked while a config sync candidate is staged.');
+        return;
+      }
+
       if (!mistApi.isConfigured) {
         ui.adoptResults.innerHTML = '<div class="status-text error">Configure Mist API first (cloud, token, org ID).</div>';
         return;
@@ -2026,6 +2305,7 @@ function init(): void {
       }
 
       ui.btnOfflineTimeline.disabled = true;
+      activateResultsTab('timeline');
       ui.timelineResults.innerHTML = '<div class="status-text info">Checking Mist events and switch logs…</div>';
       term.writeSystem('— Checking offline timeline —');
 
@@ -2106,6 +2386,9 @@ function init(): void {
   ui.btnRootPassword.addEventListener('click', getRootPassword);
   ui.btnConfigDrift.addEventListener('click', checkConfigDrift);
   ui.btnConfigSyncPreview.addEventListener('click', previewConfigSync);
+  ui.btnCommitConfirmed.addEventListener('click', doCommitConfirmed);
+  ui.btnCommitSync.addEventListener('click', doCommitSync);
+  ui.btnRollbackSync.addEventListener('click', doRollbackSync);
   ui.btnOfflineTimeline.addEventListener('click', checkOfflineTimeline);
   ui.btnAdopt.addEventListener('click', adoptSwitch);
 
@@ -2138,6 +2421,7 @@ function init(): void {
   });
 
   // ---- Initial state ----
+  activateResultsTab('config-sync');
   setConnectedState(false);
   term.writeSystem('Junos Console ready. Click "Connect" to select a serial port.');
   term.focus();

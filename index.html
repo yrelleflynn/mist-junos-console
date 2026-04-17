@@ -137,7 +137,7 @@
               <button id="btn-identify" class="btn btn-secondary" disabled>Identify Switch</button>
             </div>
 
-            <div id="device-identity" class="device-info-panel"></div>
+            <div id="device-identity" class="device-info-panel sidebar-device-identity-hidden" aria-hidden="true"></div>
 
             <div class="sidebar-actions" style="margin-top:8px;">
               <button id="btn-root-password" class="btn btn-secondary" disabled>Get Root Password</button>
@@ -149,19 +149,13 @@
               <button id="btn-config-drift" class="btn btn-secondary" disabled>Check Config Drift</button>
             </div>
 
-            <div id="config-drift-results"></div>
-
             <div class="sidebar-actions" style="margin-top:8px;">
               <button id="btn-config-sync-preview" class="btn btn-secondary" disabled>Preview Config Sync</button>
             </div>
 
-            <div id="config-sync-results"></div>
-
             <div class="sidebar-actions" style="margin-top:8px;">
               <button id="btn-offline-timeline" class="btn btn-secondary" disabled>Offline Timeline</button>
             </div>
-
-            <div id="timeline-results"></div>
 
             <div class="sidebar-actions" style="margin-top:8px;">
               <button id="btn-adopt" class="btn btn-secondary" disabled>Adopt Switch</button>
@@ -258,18 +252,49 @@
 
         <div id="terminal-container"></div>
 
-        <div id="workspace-bottom-strip" class="workspace-strip workspace-strip-bottom">
-          <div class="workspace-card workspace-card-inline">
-            <div class="workspace-card-header">
-              <span class="workspace-card-title">Mist API</span>
-            </div>
-            <div id="mist-api-status" class="status-text"></div>
+        <div
+          id="results-resize-handle"
+          class="results-resize-handle"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Resize results panel"
+        >
+          <div class="results-resize-grip" aria-hidden="true"></div>
+        </div>
+
+        <!-- Results panel — detailed workflow output lives here, not in the sidebar -->
+        <div id="results-panel">
+          <div id="results-panel-tabs">
+            <span class="results-panel-label">Results</span>
+            <button class="results-tab" data-pane="config-sync">Config Sync</button>
+            <button class="results-tab" data-pane="config-drift">Config Drift</button>
+            <button class="results-tab" data-pane="timeline">Timeline</button>
+            <div class="results-panel-spacer"></div>
+            <span id="mist-api-status" class="status-text results-api-status"></span>
           </div>
-          <div class="workspace-card workspace-card-inline">
-            <div class="workspace-card-header">
-              <span class="workspace-card-title">Live Monitor</span>
+          <div id="results-panel-body">
+            <div class="results-pane" id="config-sync-results">
+              <div id="config-sync-content">
+                <div class="results-pane-empty">Run <strong>Preview Config Sync</strong> to see the staged diff and commit-check result here.</div>
+              </div>
+              <div id="config-sync-action-bar" aria-label="Config sync pending actions">
+                <div id="config-sync-staged-banner" class="config-sync-staged-banner">
+                  <span class="config-sync-staged-banner-icon" aria-hidden="true">⚠</span>
+                  Candidate config is staged on the switch and <strong>not yet committed</strong>. Choose an action below.
+                </div>
+                <div class="config-sync-action-buttons">
+                  <button id="btn-commit-confirmed" class="btn btn-primary btn-sm" disabled>Commit Confirmed</button>
+                  <button id="btn-commit-sync" class="btn btn-secondary btn-sm" disabled>Commit</button>
+                  <button id="btn-rollback-sync" class="btn btn-danger btn-sm" disabled>Rollback</button>
+                </div>
+              </div>
             </div>
-            <div class="workspace-inline-text">Mist status is last-known cloud state. JMA state is the switch’s current cloud connectivity view.</div>
+            <div class="results-pane results-pane-hidden" id="config-drift-results">
+              <div class="results-pane-empty">Run <strong>Check Config Drift</strong> to see Mist-vs-switch config differences here.</div>
+            </div>
+            <div class="results-pane results-pane-hidden" id="timeline-results">
+              <div class="results-pane-empty">Run <strong>Offline Timeline</strong> to see Mist event history and switch logs here.</div>
+            </div>
           </div>
         </div>
       </section>

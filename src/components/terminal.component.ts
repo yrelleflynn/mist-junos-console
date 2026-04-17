@@ -8,6 +8,7 @@
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
+import { junosLinesToAnsi } from '../services/junos-highlight.service';
 import '@xterm/xterm/css/xterm.css';
 
 export interface TerminalOptions {
@@ -108,6 +109,21 @@ export class TerminalComponent {
   writeSystem(message: string): void {
     // Dim/italic via ANSI
     this.terminal.writeln(`\x1b[2;3m${message}\x1b[0m`);
+  }
+
+  /**
+   * Write a multi-line Junos config or diff block with ANSI colour highlighting.
+   *
+   * Each line is highlighted using the Junos highlighter — diff lines (`+`/`-`)
+   * are visually dominant (green/red), `[edit ...]` headers are bold magenta,
+   * and plain config lines get per-token semantic colours.
+   *
+   * Safe to call with any amount of Junos output.  Empty/whitespace-only input
+   * is silently ignored.
+   */
+  writeJunosHighlighted(text: string): void {
+    const ansi = junosLinesToAnsi(text);
+    if (ansi) this.terminal.writeln(ansi);
   }
 
   /**

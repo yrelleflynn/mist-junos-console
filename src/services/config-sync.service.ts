@@ -1,20 +1,25 @@
 /**
- * config-sync.service.ts — Mist config sync preview workflow
+ * config-sync.service.ts — Mist config sync staged workflow
  *
- * Implements the non-destructive first-pass config sync preview:
+ * Implements a staged, operator-confirmed config sync flow:
  *   1. Fetch Mist intended config via config_cmd
  *   2. Build a candidate command list (cleanup deletes + filtered CLI lines)
- *   3. Stage the candidate visibly in Junos config mode
+ *   3. Stage the candidate in Junos config mode
  *   4. Capture `show | compare` diff output
  *   5. Run `commit check`
- *   6. Always roll back and exit — the running config is NEVER changed
+ *   6. STOP — leave the candidate staged and wait for operator decision
+ *
+ * Explicit operator actions (after preview):
+ *   - commitSyncConfirmed() — commit confirmed 5 + exit
+ *   - commitSync()          — commit + exit
+ *   - rollbackSync()        — rollback 0 + exit
  *
  * Commands remain visible in the terminal because this is an
  * operator-invoked workflow. Silent execution is intentionally avoided.
  */
 
 import { MistApiService } from './mist-api.service';
-import { CommandRunnerService } from './command-runner.service';
+import { CommandRunnerService, stripCommandEcho } from './command-runner.service';
 
 /**
  * Cleanup delete commands Mist prepends before applying intended set commands.
@@ -53,6 +58,15 @@ const JUNOS_ERROR_PATTERNS = [
   /command not found/i,
 ];
 
+const STAGING_WARNING_PATTERNS = [
+  /statement not found/i,
+  /warning:/i,
+  /\bnot found\b/i,
+  /syntax error:.*disable-port/i,
+  /syntax error:.*interactive-commands match/i,
+  /unknown command:.*disable-port/i,
+];
+
 function looksLikeJunosError(output: string): boolean {
   return JUNOS_ERROR_PATTERNS.some((p) => p.test(output));
 }
@@ -76,6 +90,70 @@ export interface ConfigSyncStagingError {
   error: string;
 }
 
+export function isConfigSyncStagingWarning(issue: ConfigSyncStagingError): boolean {
+  return (
+    issue.command === 'load set terminal' &&
+    STAGING_WARNING_PATTERNS.some((pattern) => pattern.test(issue.error))
+  );
+}
+
+/**
+ * Config sync session lifecycle states.
+ *
+ * idle        — no active staged session
+ * staged      — candidate is loaded on the switch, awaiting operator decision
+ * committing  — a commit action is in progress
+ * committed   — commit completed successfully
+ * rolled_back — rollback completed successfully
+ * failed      — commit or rollback encountered an error
+ */
+export type ConfigSyncState =
+  | 'idle'
+  | 'staged'
+  | 'committing'
+  | 'committed'
+  | 'rolled_back'
+  | 'failed';
+
+/**
+ * Summary of the currently staged session.
+ * Available while `hasStagedCandidate()` returns true.
+ */
+export interface ConfigSyncSessionInfo {
+  commitCheckPassed: boolean;
+  candidateCommandCount: number;
+  compareOutput: string;
+  stagingWarningCount: number;
+  blockingStagingErrorCount: number;
+  canCommit: boolean;
+}
+
+/**
+ * Result of a commitSyncConfirmed / commitSync / rollbackSync call.
+ */
+export interface ConfigSyncActionResult {
+  success: boolean;
+  /** Raw Junos output from the commit or rollback command. */
+  output: string;
+  /** Human-readable error if success is false. */
+  error?: string;
+}
+
+/**
+ * Parse raw `commit check` output and return whether the check passed.
+ *
+ * Junos says `configuration check succeeds` on success, even when the output
+ * also contains warnings or informational lines about unchanged stanzas.
+ * Staging errors from the load phase are NOT relevant here — this function
+ * checks only the output of the `commit check` command itself.
+ */
+export function parseCommitCheckPassed(output: string): boolean {
+  return (
+    /configuration check succeeds/i.test(output) ||
+    /commit check succeeds/i.test(output)
+  );
+}
+
 export interface ConfigSyncPreviewResult {
   /** Total commands staged (cleanup + Mist CLI). */
   candidateCommandCount: number;
@@ -91,17 +169,51 @@ export interface ConfigSyncPreviewResult {
   commitCheckPassed: boolean;
   /** Commands that produced Junos error output during staging. */
   stagingErrors: ConfigSyncStagingError[];
-  /** True when `rollback 0` completed and we exited config mode cleanly. */
-  rolledBack: boolean;
+  /**
+   * True when the candidate is now staged on the switch.
+   * The operator must call commitSyncConfirmed / commitSync / rollbackSync.
+   */
+  staged: boolean;
 }
 
 export class ConfigSyncService {
   private readonly cmdRunner: CommandRunnerService;
   private readonly mistApi: MistApiService;
 
+  private _sessionState: ConfigSyncState = 'idle';
+  private _sessionInfo: ConfigSyncSessionInfo | null = null;
+
   constructor(cmdRunner: CommandRunnerService, mistApi: MistApiService) {
     this.cmdRunner = cmdRunner;
     this.mistApi = mistApi;
+  }
+
+  /** Current lifecycle state of the config sync session. */
+  get sessionState(): ConfigSyncState {
+    return this._sessionState;
+  }
+
+  /**
+   * Summary of the staged candidate, or null when no candidate is staged.
+   * Populated by previewSync() and cleared by commit / rollback.
+   */
+  get sessionInfo(): ConfigSyncSessionInfo | null {
+    return this._sessionInfo;
+  }
+
+  /** True when a candidate is currently staged on the switch. */
+  hasStagedCandidate(): boolean {
+    return this._sessionState === 'staged';
+  }
+
+  /**
+   * Reset service state to idle.
+   * Call when the serial connection drops so the service does not retain
+   * stale staged-session state after the switch exits config mode on its own.
+   */
+  reset(): void {
+    this._sessionState = 'idle';
+    this._sessionInfo = null;
   }
 
   /**
@@ -119,11 +231,34 @@ export class ConfigSyncService {
   }
 
   /**
-   * Run the full config sync preview workflow (non-destructive).
+   * Run `commit check` with a longer, result-aware wait than the generic
+   * command executor. Lower-spec switches such as EX2300 can pause for a long
+   * time before printing the final result, and the preview must not proceed
+   * until that result and the config prompt have returned.
+   */
+  private async runCommitCheck(): Promise<{ output: string; passed: boolean }> {
+    const result = await this.cmdRunner.sendAndWaitFor(
+      'commit check\n',
+      /(?:configuration check succeeds|commit check succeeds|commit check failed|error:)[\s\S]*#\s*$/i,
+      120000,
+    );
+
+    const output = stripCommandEcho(result.output, 'commit check').trim();
+    return {
+      output,
+      passed: parseCommitCheckPassed(output),
+    };
+  }
+
+  /**
+   * Stage the Mist intended config on the switch and run commit check.
    *
-   * Fetches the Mist intended config, stages it in Junos config mode,
-   * captures the diff and commit check result, then always rolls back.
-   * The switch's running config is NEVER committed or changed.
+   * The candidate is LEFT STAGED on the switch — the running config is NOT
+   * changed. The operator must then call commitSyncConfirmed(), commitSync(),
+   * or rollbackSync().
+   *
+   * If the preview itself fails (exception thrown before completing), the
+   * method rolls back and exits config mode to leave the switch clean.
    *
    * Commands are executed visibly (operator workflow — not silent).
    */
@@ -132,8 +267,15 @@ export class ConfigSyncService {
     let compareOutput = '';
     let commitCheckOutput = '';
     let commitCheckPassed = false;
-    let rolledBack = false;
     let enteredConfigMode = false;
+    let shouldLeaveStaged = false;
+
+    // Guard: refuse if we already own a staged candidate
+    if (this.hasStagedCandidate()) {
+      throw new Error(
+        'A config sync candidate is already staged on the switch. Commit or roll back before starting a new preview.',
+      );
+    }
 
     // 1. Fetch Mist intended config
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -146,9 +288,9 @@ export class ConfigSyncService {
     const mistCliCount = candidate.length - cleanupCount;
 
     try {
-      // 3. Refuse to run inside an existing config session. `rollback 0`
-      // would clear the operator's uncommitted candidate, which is not safe
-      // for a preview workflow.
+      // 3. Refuse to run inside an existing config session not owned by this
+      //    service. `rollback 0` would clear the operator's uncommitted
+      //    candidate, which is not safe.
       const startingMode = await this.cmdRunner.detectMode();
       if (startingMode === 'config') {
         throw new Error(
@@ -193,27 +335,42 @@ export class ConfigSyncService {
       const compareResult = await this.cmdRunner.execute('show | compare', 60000, 3000);
       compareOutput = compareResult.output.trim();
 
-      // 7. Validate the candidate — must not commit
-      const checkResult = await this.cmdRunner.execute('commit check', 30000, 3000);
-      commitCheckOutput = checkResult.output.trim();
-      commitCheckPassed =
-        /configuration check succeeds/i.test(commitCheckOutput) ||
-        /commit check succeeds/i.test(commitCheckOutput);
+      // 7. Validate the candidate (non-destructive — does not commit)
+      const checkResult = await this.runCommitCheck();
+      commitCheckOutput = checkResult.output;
+      commitCheckPassed = checkResult.passed;
+
+      // All steps completed — mark for staged state rather than rollback
+      shouldLeaveStaged = true;
 
     } finally {
-      // 8. Always roll back and exit config mode — non-destructive guarantee
-      if (enteredConfigMode) {
+      if (enteredConfigMode && !shouldLeaveStaged) {
+        // Something went wrong before the preview completed — clean up
         try {
           await this.cmdRunner.execute('rollback 0', 10000);
           await this.cmdRunner.execute('exit', 5000);
-          rolledBack = true;
         } catch {
-          // If rollback itself fails, at least attempt to leave config mode
           try {
             await this.cmdRunner.execute('exit', 5000);
           } catch { /* ignored */ }
         }
+        this._sessionState = 'idle';
+        this._sessionInfo = null;
       }
+    }
+
+    if (shouldLeaveStaged) {
+      const stagingWarningCount = stagingErrors.filter(isConfigSyncStagingWarning).length;
+      const blockingStagingErrorCount = stagingErrors.length - stagingWarningCount;
+      this._sessionState = 'staged';
+      this._sessionInfo = {
+        commitCheckPassed,
+        candidateCommandCount: candidate.length,
+        compareOutput,
+        stagingWarningCount,
+        blockingStagingErrorCount,
+        canCommit: commitCheckPassed && blockingStagingErrorCount === 0,
+      };
     }
 
     return {
@@ -224,7 +381,125 @@ export class ConfigSyncService {
       commitCheckOutput,
       commitCheckPassed,
       stagingErrors,
-      rolledBack,
+      staged: shouldLeaveStaged,
     };
+  }
+
+  /**
+   * Commit with a 5-minute auto-rollback safety window.
+   *
+   * Sends: `commit confirmed 5 comment "junos console config sync"`
+   * Then:  `exit`
+   *
+   * The config is applied immediately. If `commit` is not run within 5 minutes,
+   * Junos automatically rolls back. The operator can re-enter config mode and
+   * run `commit` from the terminal to permanently lock in the config.
+   */
+  async commitSyncConfirmed(): Promise<ConfigSyncActionResult> {
+    if (!this.hasStagedCandidate()) {
+      return { success: false, output: '', error: 'No staged candidate to commit.' };
+    }
+
+    this._sessionState = 'committing';
+    try {
+      const result = await this.cmdRunner.execute(
+        'commit confirmed 5 comment "junos console config sync"',
+        120000,
+        3000,
+      );
+      await this.cmdRunner.execute('exit', 5000);
+
+      if (result.success) {
+        this._sessionState = 'committed';
+        this._sessionInfo = null;
+        return { success: true, output: result.output };
+      } else {
+        this._sessionState = 'failed';
+        return {
+          success: false,
+          output: result.output,
+          error: result.error ?? 'Commit confirmed command failed.',
+        };
+      }
+    } catch (err) {
+      this._sessionState = 'failed';
+      return {
+        success: false,
+        output: '',
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  /**
+   * Commit the staged candidate permanently.
+   *
+   * Sends: `commit comment "junos console config sync"`
+   * Then:  `exit`
+   */
+  async commitSync(): Promise<ConfigSyncActionResult> {
+    if (!this.hasStagedCandidate()) {
+      return { success: false, output: '', error: 'No staged candidate to commit.' };
+    }
+
+    this._sessionState = 'committing';
+    try {
+      const result = await this.cmdRunner.execute(
+        'commit comment "junos console config sync"',
+        120000,
+        3000,
+      );
+      await this.cmdRunner.execute('exit', 5000);
+
+      if (result.success) {
+        this._sessionState = 'committed';
+        this._sessionInfo = null;
+        return { success: true, output: result.output };
+      } else {
+        this._sessionState = 'failed';
+        return {
+          success: false,
+          output: result.output,
+          error: result.error ?? 'Commit command failed.',
+        };
+      }
+    } catch (err) {
+      this._sessionState = 'failed';
+      return {
+        success: false,
+        output: '',
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  /**
+   * Roll back the staged candidate and exit config mode.
+   *
+   * Sends: `rollback 0`
+   * Then:  `exit`
+   *
+   * The switch returns to its committed running config.
+   */
+  async rollbackSync(): Promise<ConfigSyncActionResult> {
+    if (!this.hasStagedCandidate()) {
+      return { success: false, output: '', error: 'No staged candidate to roll back.' };
+    }
+
+    try {
+      const rbResult = await this.cmdRunner.execute('rollback 0', 10000);
+      await this.cmdRunner.execute('exit', 5000);
+
+      this._sessionState = 'rolled_back';
+      this._sessionInfo = null;
+      return { success: true, output: rbResult.output };
+    } catch (err) {
+      this._sessionState = 'failed';
+      return {
+        success: false,
+        output: '',
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
 }

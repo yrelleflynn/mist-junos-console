@@ -164,14 +164,29 @@ Remediation (if DHCP expected but not working):
   1. Verify the DHCP client is enabled:
        show configuration interfaces irb unit 0
      Should contain "family inet dhcp".
-  2. Check if the DHCP server is providing offers:
+  2. Force the DHCP client to renew its lease:
+       request dhcp client renew irb.0
+     This is the preferred first-step way to reinitialize DHCP lease
+     acquisition on EX switches before changing interface configuration.
+  3. If the DHCP client still appears stuck after a renew:
+     a. During a maintenance window, remove and re-add the DHCP client
+        stanza on the IRB interface to force a deeper reinitialization:
+          delete interfaces irb unit 0 family inet dhcp
+          commit
+          set interfaces irb unit 0 family inet dhcp
+          commit
+     b. Re-check:
+          show dhcp client binding detail
+     c. Use this cautiously — Junos DHCP client behavior can be sticky,
+        and this is a stronger workaround than a normal renew.
+  4. Check if the DHCP server is providing offers:
        monitor traffic interface irb.0 matching "port 67 or port 68"
      Look for DHCP Discover/Offer/Request/Ack.
-  3. Verify the VLAN tagging — DHCP may fail if the switch is on the
+  5. Verify the VLAN tagging — DHCP may fail if the switch is on the
      wrong VLAN or the uplink isn't carrying the management VLAN.
-  4. Check the DHCP scope on the server — ensure it has available
+  6. Check the DHCP scope on the server — ensure it has available
      addresses and the correct subnet/gateway/DNS options.
-  5. If DHCP is working but missing gateway or DNS options, update the
+  7. If DHCP is working but missing gateway or DNS options, update the
      DHCP scope on the server to include:
      - Option 3 (Router/Gateway)
      - Option 6 (DNS Servers)
