@@ -23,6 +23,19 @@ import type { CloudStatusState } from './types/cloud-status.types';
 import { MIST_CLOUDS, getCloudById } from './config/mist-clouds.config';
 import './styles/main.css';
 
+const SERIAL_PREFS_STORAGE_KEY = 'junos-console.serial-prefs';
+const LAST_PORT_LABEL_STORAGE_KEY = 'junos-console.last-port-label';
+const MIST_CLOUD_STORAGE_KEY = 'junos-console.mist-cloud-id';
+const MIST_ORG_STORAGE_KEY = 'junos-console.mist-org-id';
+
+type StoredSerialPrefs = {
+  baudRate: string;
+  dataBits: string;
+  parity: string;
+  stopBits: string;
+  flowControl: string;
+};
+
 // ---- Check Web Serial support ----
 if (!SerialService.isSupported()) {
   const container = document.getElementById('terminal-container');
@@ -103,7 +116,6 @@ function init(): void {
     // configSyncResults → dynamic content area inside the results pane
     configSyncResults: document.getElementById('config-sync-content') as HTMLElement,
     configSyncActionBar: document.getElementById('config-sync-action-bar') as HTMLElement,
-    btnCommitConfirmed: document.getElementById('btn-commit-confirmed') as HTMLButtonElement,
     btnCommitSync: document.getElementById('btn-commit-sync') as HTMLButtonElement,
     btnRollbackSync: document.getElementById('btn-rollback-sync') as HTMLButtonElement,
     btnOfflineTimeline: document.getElementById('btn-offline-timeline') as HTMLButtonElement,
@@ -129,9 +141,83 @@ function init(): void {
     opt.textContent = `${cloud.name} (${cloud.apiHost})`;
     ui.mistCloud.appendChild(opt);
   });
-  // Default to APAC 01
-  const apac01 = MIST_CLOUDS.find((c) => c.id === 'apac01');
-  if (apac01) ui.mistCloud.value = apac01.id;
+  function loadStoredSerialPrefs(): StoredSerialPrefs | null {
+    try {
+      const raw = window.localStorage.getItem(SERIAL_PREFS_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as Partial<StoredSerialPrefs>;
+      if (
+        typeof parsed.baudRate !== 'string' ||
+        typeof parsed.dataBits !== 'string' ||
+        typeof parsed.parity !== 'string' ||
+        typeof parsed.stopBits !== 'string' ||
+        typeof parsed.flowControl !== 'string'
+      ) {
+        return null;
+      }
+      return parsed as StoredSerialPrefs;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveSerialPrefs(): void {
+    const prefs: StoredSerialPrefs = {
+      baudRate: ui.baudRate.value,
+      dataBits: ui.dataBits.value,
+      parity: ui.parity.value,
+      stopBits: ui.stopBits.value,
+      flowControl: ui.flowControl.value,
+    };
+    window.localStorage.setItem(SERIAL_PREFS_STORAGE_KEY, JSON.stringify(prefs));
+  }
+
+  function restoreSerialPrefs(): void {
+    const prefs = loadStoredSerialPrefs();
+    if (!prefs) return;
+    ui.baudRate.value = prefs.baudRate;
+    ui.dataBits.value = prefs.dataBits;
+    ui.parity.value = prefs.parity;
+    ui.stopBits.value = prefs.stopBits;
+    ui.flowControl.value = prefs.flowControl;
+  }
+
+  function saveSelectedMistCloud(): void {
+    if (ui.mistCloud.value) {
+      window.localStorage.setItem(MIST_CLOUD_STORAGE_KEY, ui.mistCloud.value);
+    }
+  }
+
+  function saveSelectedMistOrg(orgId: string): void {
+    if (orgId) {
+      window.localStorage.setItem(MIST_ORG_STORAGE_KEY, orgId);
+    }
+  }
+
+  function getSavedMistOrgId(): string | null {
+    return window.localStorage.getItem(MIST_ORG_STORAGE_KEY);
+  }
+
+  function restoreSelectedMistCloud(): void {
+    const savedCloudId = window.localStorage.getItem(MIST_CLOUD_STORAGE_KEY);
+    if (savedCloudId && getCloudById(savedCloudId)) {
+      ui.mistCloud.value = savedCloudId;
+      return;
+    }
+    const apac01 = MIST_CLOUDS.find((c) => c.id === 'apac01');
+    if (apac01) ui.mistCloud.value = apac01.id;
+  }
+
+  function saveLastPortLabel(label: string): void {
+    window.localStorage.setItem(LAST_PORT_LABEL_STORAGE_KEY, label);
+  }
+
+  function getLastPortLabel(): string | null {
+    return window.localStorage.getItem(LAST_PORT_LABEL_STORAGE_KEY);
+  }
+
+  restoreSerialPrefs();
+  restoreSelectedMistCloud();
 
   // ---- Create instances ----
   const serial = new SerialService();
@@ -185,17 +271,21 @@ function init(): void {
         opt.textContent = '— No orgs found —';
         ui.mistOrg.appendChild(opt);
       } else {
-        const placeholder = document.createElement('option');
-        placeholder.value = '';
-        placeholder.textContent = '— Select an org —';
-        ui.mistOrg.appendChild(placeholder);
-        orgs.sort((a, b) => a.name.localeCompare(b.name));
-        orgs.forEach((org) => {
+        const sortedOrgs = [...orgs].sort((a, b) => a.name.localeCompare(b.name));
+        sortedOrgs.forEach((org) => {
           const opt = document.createElement('option');
           opt.value = org.id;
           opt.textContent = org.name;
           ui.mistOrg.appendChild(opt);
         });
+        const savedOrgId = getSavedMistOrgId();
+        const selectedOrgId =
+          (savedOrgId && sortedOrgs.some((org) => org.id === savedOrgId))
+            ? savedOrgId
+            : sortedOrgs[0].id;
+        ui.mistOrg.value = selectedOrgId;
+        mistContext.selectOrg(selectedOrgId);
+        saveSelectedMistOrg(selectedOrgId);
         ui.mistOrg.disabled = false;
       }
       const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
@@ -449,6 +539,10 @@ function init(): void {
     const sessionInfo = configSync.sessionInfo;
     const canCommit = staged && !!sessionInfo?.canCommit;
 
+    // While a candidate config is staged, background Mist/JMA polling must stay
+    // quiet so the app does not issue unrelated commands into the same session.
+    cloudStatus.setStagedPause(staged);
+
     // Action bar: visible only while a candidate is staged
     if (staged) {
       ui.configSyncActionBar.classList.add('is-visible');
@@ -457,7 +551,6 @@ function init(): void {
     }
 
     // Action buttons: commit only enabled after a clean, passing preview.
-    ui.btnCommitConfirmed.disabled = !canCommit;
     ui.btnCommitSync.disabled = !canCommit;
     ui.btnRollbackSync.disabled = !staged;
 
@@ -554,7 +647,8 @@ function init(): void {
       ui.connectionBadge.textContent = 'Disconnected';
       ui.connectionBadge.className = 'badge badge-disconnected';
       setConnectionStatePill('disconnected');
-      ui.selectedPort.textContent = 'Selected Port: None selected';
+      const lastPortLabel = getLastPortLabel();
+      ui.selectedPort.textContent = `Selected Port: ${lastPortLabel ?? 'None selected'}`;
     }
   }
 
@@ -934,7 +1028,10 @@ function init(): void {
         term.writeError(`Serial picker failed: ${err instanceof Error ? err.message : String(err)}`);
         return;
       }
-      ui.selectedPort.textContent = `Selected Port: ${formatPortLabel(port)}`;
+      const portLabel = formatPortLabel(port);
+      ui.selectedPort.textContent = `Selected Port: ${portLabel}`;
+      saveLastPortLabel(portLabel);
+      saveSerialPrefs();
 
       ui.connectionBadge.textContent = 'Connecting…';
       ui.connectionBadge.className = 'badge badge-connecting';
@@ -1938,7 +2035,7 @@ function init(): void {
             '<div class="config-sync-section-title" style="margin-top:12px;">Decision Required</div>' +
             '<div class="config-sync-summary">Candidate config is staged on the switch. ' +
             'Review the diff above, then choose an action in the panel below.</div>';
-          term.writeSystem('  Candidate staged — choose Commit Confirmed, Commit, or Rollback below.');
+          term.writeSystem('  Candidate staged — choose Commit or Rollback below.');
         } else {
           // Preview failed to stage (exception was thrown and caught cleanly)
           html +=
@@ -1959,33 +2056,9 @@ function init(): void {
     });
   }
 
-  // ---- Config Sync: Commit Confirmed ----
-  async function doCommitConfirmed(): Promise<void> {
-    await withCloudStatusPollingPaused(async () => {
-      ui.btnCommitConfirmed.disabled = true;
-      ui.btnCommitSync.disabled = true;
-      ui.btnRollbackSync.disabled = true;
-
-      term.writeSystem('— Committing with 5-minute auto-rollback safety window —');
-      ui.configSyncResults.innerHTML = '<div class="status-text info">Running commit confirmed…</div>';
-
-      try {
-        const result = await configSync.commitSyncConfirmed();
-        renderConfigSyncActionOutcome(result, 'commit-confirmed');
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
-        term.writeError(`Commit confirmed error: ${msg}`);
-      } finally {
-        updateConfigSyncUIState();
-      }
-    });
-  }
-
   // ---- Config Sync: Commit ----
   async function doCommitSync(): Promise<void> {
     await withCloudStatusPollingPaused(async () => {
-      ui.btnCommitConfirmed.disabled = true;
       ui.btnCommitSync.disabled = true;
       ui.btnRollbackSync.disabled = true;
 
@@ -2008,7 +2081,6 @@ function init(): void {
   // ---- Config Sync: Rollback ----
   async function doRollbackSync(): Promise<void> {
     await withCloudStatusPollingPaused(async () => {
-      ui.btnCommitConfirmed.disabled = true;
       ui.btnCommitSync.disabled = true;
       ui.btnRollbackSync.disabled = true;
 
@@ -2031,28 +2103,19 @@ function init(): void {
   /** Render the final outcome of a commit or rollback action in the results pane. */
   function renderConfigSyncActionOutcome(
     result: ConfigSyncActionResult,
-    action: 'commit-confirmed' | 'commit' | 'rollback',
+    action: 'commit' | 'rollback',
   ): void {
     let html = '';
 
     if (result.success) {
-      if (action === 'commit-confirmed') {
-        html +=
-          '<div class="config-sync-rollback-notice">✓ Commit confirmed — config applied with 5-minute auto-rollback window.</div>' +
-          '<div class="config-sync-summary" style="margin-top:8px;">To permanently keep this config, re-enter configuration mode and run <code>commit</code> within 5 minutes. ' +
-          'If no confirmation is received, Junos will auto-rollback.</div>';
-        term.writeSystem('  Commit confirmed — config applied (confirm within 5 minutes or Junos auto-rolls back).');
-      } else if (action === 'commit') {
+      if (action === 'commit') {
         html += '<div class="config-sync-rollback-notice">✓ Committed — config is now active and permanent.</div>';
-        term.writeSystem('  Committed — config is now active and permanent.');
       } else {
         html += '<div class="config-sync-rollback-notice">✓ Rolled back — running config is unchanged.</div>';
-        term.writeSystem('  Rolled back — running config is unchanged.');
       }
 
       if (result.output.trim()) {
         html += `<pre class="config-sync-pre" style="margin-top:8px;">${escapeHtml(result.output)}</pre>`;
-        term.writeSystem(result.output);
       }
     } else {
       const msg = result.error ?? 'Unknown error';
@@ -2348,8 +2411,15 @@ function init(): void {
   ui.btnLoadOrgs.addEventListener('click', () => {
     void mistContext.loadOrgs(ui.mistApiToken.value.trim(), ui.mistCloud.value);
   });
+  ui.mistCloud.addEventListener('change', () => {
+    saveSelectedMistCloud();
+  });
+  [ui.baudRate, ui.dataBits, ui.parity, ui.stopBits, ui.flowControl].forEach((el) => {
+    el.addEventListener('change', saveSerialPrefs);
+  });
   ui.mistOrg.addEventListener('change', () => {
     mistContext.selectOrg(ui.mistOrg.value);
+    saveSelectedMistOrg(ui.mistOrg.value);
     const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
     if (identity) renderDeviceSummary(identity);
   });
@@ -2359,6 +2429,7 @@ function init(): void {
     const cloud = getCloudById(ui.mistCloud.value);
     const saved = mistContext.save(token, cloud?.apiHost ?? '', orgId, cloud ?? null);
     if (saved) {
+      saveSelectedMistCloud();
       closeMistModal();
       void mistContext.loadSites(token, orgId, ui.mistCloud.value);
       maybeAutoMatchAfterMistSave();
@@ -2386,7 +2457,6 @@ function init(): void {
   ui.btnRootPassword.addEventListener('click', getRootPassword);
   ui.btnConfigDrift.addEventListener('click', checkConfigDrift);
   ui.btnConfigSyncPreview.addEventListener('click', previewConfigSync);
-  ui.btnCommitConfirmed.addEventListener('click', doCommitConfirmed);
   ui.btnCommitSync.addEventListener('click', doCommitSync);
   ui.btnRollbackSync.addEventListener('click', doRollbackSync);
   ui.btnOfflineTimeline.addEventListener('click', checkOfflineTimeline);

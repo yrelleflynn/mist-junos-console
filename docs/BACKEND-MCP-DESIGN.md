@@ -10,8 +10,20 @@ Define a backend MCP server design that exposes:
 
 This server is intended to complement, not replace, the public Mist MCP.
 
+## Implementation Status
+
+A Phase 1 proof-of-concept is implemented in [`mcp/`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/mcp/).
+
+See [`docs/BACKEND-MCP-POC.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/BACKEND-MCP-POC.md) for:
+- which tools are implemented vs stubbed
+- how to run the MCP server
+- what is deferred and why
+
+This design document describes the intended full architecture. The POC covers the Phase 1 read-only observer slice.
+
 Related docs:
 
+- [`docs/BACKEND-MCP-POC.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/BACKEND-MCP-POC.md)
 - [`docs/AI-AGENT-INTEGRATION.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/AI-AGENT-INTEGRATION.md:1)
 - [`docs/MIST-API-INTEGRATION.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/MIST-API-INTEGRATION.md:1)
 - [`docs/SESSION-LOGGING-DESIGN.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/SESSION-LOGGING-DESIGN.md:1)

@@ -1,0 +1,19 @@
+{
+  "name": "junos-console-mcp",
+  "version": "0.1.0",
+  "description": "Backend MCP server — read-only Phase 1 tools for AI agent access to live session and Mist context",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

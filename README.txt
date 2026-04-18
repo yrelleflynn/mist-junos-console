@@ -1,8 +1,150 @@
 ================================================================================
+MIST JUNOS CONSOLE
+================================================================================
+
+Browser-based serial console and guided recovery workspace for
+Juniper Mist-managed switches running Junos.
+
+--------------------------------------------------------------------------------
+WHAT IT IS
+--------------------------------------------------------------------------------
+
+mist-junos-console is a single-page web application that runs in Chrome or Edge
+using the Web Serial API. It gives an operator a complete recovery workspace for
+an offline, unadopted, or misconfigured Mist-managed EX switch — without
+installing any software, opening a separate terminal, or manually cross-referencing
+the Mist dashboard.
+
+Core capabilities:
+  - Web Serial console terminal (xterm, Junos syntax highlighting)
+  - Automatic device identification matched against Mist inventory
+  - JMA Connectivity State monitoring (switch-reported cloud state)
+  - Mist Status monitoring (last-known cloud state from Mist)
+  - 14-check automated cloud connectivity troubleshooting
+  - Config drift comparison (Mist intended vs live running config)
+  - Staged config sync with operator-gated Commit Confirmed, Commit, and Rollback
+  - Remote session mirroring for shared support sessions
+
+--------------------------------------------------------------------------------
+THE PROBLEM IT SOLVES
+--------------------------------------------------------------------------------
+
+When a Mist-managed switch goes offline, the current workflow is slow and
+fragmented: physical console access, a separate terminal application, manual
+Mist context lookup, tribal-knowledge troubleshooting, and manual command
+construction for any remediation. Less experienced operators escalate. Recovery
+takes 30-60 minutes per switch.
+
+This tool collapses that into a single browser tab. The operator connects the
+cable, opens the app, and has structured diagnostics and guided remediation in
+one place — without deep Junos expertise.
+
+--------------------------------------------------------------------------------
+ARCHITECTURE
+--------------------------------------------------------------------------------
+
+Frontend (browser):
+  - src/main.ts         — UI orchestration and workflow wiring
+  - src/components/terminal.component.ts — xterm terminal wrapper and render path
+  - src/services/       — Modular workflow services:
+      troubleshoot.service.ts   — 14-check connectivity diagnostic engine
+      config-sync.service.ts    — Staged config sync with commit/rollback
+      config-drift.service.ts   — Mist intent vs live config comparison
+      switch-identity.service.ts — Switch identification and Mist matching
+      command-runner.service.ts  — Console command execution, prompt, and mode handling
+  - src/controllers/    — Shared session and device workflow controllers:
+      cloud-status.controller.ts — Mist status and JMA state orchestration
+      device-context.controller.ts — Device identity and Mist match state
+  - index.html          — UI layout
+  - src/styles/main.css — Styling
+
+Backend (Node/Express):
+  - server/index.mjs    — Mist API proxy, WebSocket relay for remote sessions
+  - Proxies Mist REST calls (config, stats, events, adoption commands)
+  - Manages session state and remote participant connections
+  - Exposes /mcp/session-state and /mcp/agent-context for MCP POC integration
+
+MCP server (standalone, Phase 1 POC):
+  - mcp/server.ts       — Read-only MCP server for AI agent access
+  - Tools: get_session_summary, get_device_identity, get_jma_connectivity_state,
+            get_check_results, get_device_config (fully wired via Mist proxy)
+  - See docs/BACKEND-MCP-POC.md for setup and current status
+
+--------------------------------------------------------------------------------
+SETUP
+--------------------------------------------------------------------------------
+
+Requirements:
+  - Node.js 18+
+  - Chrome or Edge (Web Serial API required; Firefox not supported)
+  - USB-to-serial cable connected to an EX switch console port
+  - Mist API token with org/site/device read access
+
+Install and run:
+  npm install
+  npm run build
+  npm start
+
+Open http://localhost:3000 in Chrome or Edge.
+
+Configure in the app settings panel:
+  - Mist cloud (api.mist.com or EU/staging equivalent)
+  - API token
+  - Organization
+
+The site and device are discovered automatically after identification.
+
+--------------------------------------------------------------------------------
+EXAMPLE OPERATOR WORKFLOW
+--------------------------------------------------------------------------------
+
+1. Connect USB serial cable to EX switch console port.
+2. Open the app in Chrome, click Connect, select the serial port.
+3. Log in to the switch if prompted (use root password from Mist site settings).
+4. Click Identify Device — the tool matches the switch to Mist inventory.
+5. Observe JMA Connectivity State and Mist Status in the session header.
+6. Click Run Troubleshoot — 14 checks run in sequence.
+   - Gated checks skip automatically if a prerequisite fails.
+   - Each failed check shows what was found, what was expected, and remediation.
+7. Click Config Drift to compare Mist-intended config to live running config.
+8. Click Preview Config Sync to stage the Mist diff as a candidate:
+   - The tool runs show | compare and commit check.
+   - The candidate is left staged on the switch.
+   - Choose Commit Confirmed (5-min auto-rollback), Commit, or Rollback.
+9. Observe the session header — Mist Status updates to connected after a
+   successful commit.
+
+--------------------------------------------------------------------------------
+EXAMPLE OUTPUTS
+--------------------------------------------------------------------------------
+
+Troubleshooting check (failed gateway):
+  [FAIL] Default Gateway
+  Expected: A default route in the routing table.
+  Found: No inet.0 default route.
+  Skipped downstream: DNS Resolution, Route to Mist Endpoints, Firewall Policy
+  Remediation: Verify DHCP lease, check gateway config on uplink, renew DHCP.
+
+Config drift (missing VLAN):
+  Mist intent includes:
+    set vlans MGMT vlan-id 100
+    set interfaces irb unit 100 family inet address 10.1.1.10/24
+  Running config is missing both lines.
+
+Config sync staged:
+  show | compare output:
+    [edit vlans]
+    + MGMT { vlan-id 100; }
+    [edit interfaces irb]
+    + unit 100 { family inet { address 10.1.1.10/24; } }
+  commit check: configuration check succeeds
+  Candidate staged — choose Commit Confirmed, Commit, or Rollback.
+
+================================================================================
 JUNOS CONSOLE — CLOUD CONNECTIVITY CHECK: TEST REFERENCE
 ================================================================================
 
-This document describes each automated test, what it checks, why it
+This section describes each automated test, what it checks, why it
 matters, what pass/fail means, and recommended remediation steps.
 These remediation steps form the basis for future automated fixes.
 

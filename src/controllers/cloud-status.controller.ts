@@ -18,7 +18,8 @@ export class CloudStatusController {
   private readonly callbacks: CloudStatusControllerCallbacks;
   private _state: CloudStatusState = { ...EMPTY_CLOUD_STATUS_STATE };
   private intervalId: ReturnType<typeof setInterval> | null = null;
-  private paused = false;
+  private transientPauseCount = 0;
+  private stagedPause = false;
   private inFlight = false;
   private pollingGetMatchResult: (() => MistMatchResult | null) | null = null;
   private pollingIsSerialConnected: (() => boolean) | null = null;
@@ -72,7 +73,7 @@ export class CloudStatusController {
     this.pollingGetMatchResult = getMatchResult;
     this.pollingIsSerialConnected = isSerialConnected;
     this.intervalId = setInterval(() => {
-      if (this.paused || !this.pollingGetMatchResult || !this.pollingIsSerialConnected) return;
+      if ((this.transientPauseCount > 0 || this.stagedPause) || !this.pollingGetMatchResult || !this.pollingIsSerialConnected) return;
       const matchResult = this.pollingGetMatchResult();
       if (!this.pollingIsSerialConnected()) return;
       void this.refresh(matchResult, this.pollingIsSerialConnected());
@@ -85,16 +86,27 @@ export class CloudStatusController {
   }
 
   pausePolling(): void {
-    this.paused = true;
+    this.transientPauseCount += 1;
   }
 
   resumePolling(): void {
-    this.paused = false;
+    this.transientPauseCount = Math.max(0, this.transientPauseCount - 1);
+  }
+
+  /**
+   * Pause background polling for the full duration of a staged config-sync
+   * session. This is separate from the transient pause/resume wrapper used by
+   * individual workflows so the switch is left quiet while a candidate config
+   * is pending operator action.
+   */
+  setStagedPause(paused: boolean): void {
+    this.stagedPause = paused;
   }
 
   reset(): void {
     this.stopPolling();
-    this.paused = false;
+    this.transientPauseCount = 0;
+    this.stagedPause = false;
     this._state = { ...EMPTY_CLOUD_STATUS_STATE };
     this.callbacks.onStatusUpdated(this.state);
   }

@@ -87,8 +87,39 @@ Based on the current implementation, the product already includes:
 - root password lookup from site settings
 - config drift comparison
 - adoption command retrieval and guided application
-- automated cloud connectivity checks
+- automated cloud connectivity checks (14-check engine with gate logic)
+- JMA Connectivity State monitoring (switch-reported cloud state, parsed from cc-state)
+- staged config sync: fetch Mist diff, stage candidate, show | compare, commit check, then operator-gated Commit Confirmed / Commit / Rollback
 - remote support console mirroring over WebSocket
+
+### Demoable scope as of hackathon (April 2026)
+
+The product demonstrates all three self-driving levels from the hackathon brief:
+
+**Detection (Level 1):**
+The troubleshooting engine runs 14 ordered checks over the live console.
+JMA Connectivity State provides a second signal alongside Mist last-known status.
+Config drift comparison identifies configuration divergence from Mist intent.
+
+**Diagnosis (Level 2):**
+Each check produces a structured result: status, explanation, evidence, and
+remediation guidance. Gate logic prevents downstream false failures when a
+prerequisite has already failed. Config drift output highlights the exact
+`set` commands missing from the running config.
+
+**Autonomous action (Level 3):**
+Staged config sync loads the Mist diff as a candidate, validates it with
+`commit check`, and presents the operator with a Commit Confirmed, Commit, or
+Rollback decision. The operator approves; the tool executes. Commit Confirmed
+uses a 5-minute Junos auto-rollback window for production safety.
+
+**What is not yet implemented (roadmap only):**
+AI agent integration via a backend MCP server is documented in
+[`docs/BACKEND-MCP-DESIGN.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/BACKEND-MCP-DESIGN.md)
+but is not part of the current demo. The product is designed to support this
+workflow — structured check results, JMA state, config sync outcomes — as
+tool-shaped interfaces for a diagnostic agent operating within operator-owned
+sessions. This is a planned phase-2 and phase-3 capability, not a current claim.
 
 ## Key User Journeys
 

@@ -13,6 +13,97 @@ const PORT = Number(process.env.JUNOS_CONSOLE_SERVER_PORT || 3333);
 /** @type {Map<string, { members: { ws: import('ws').WebSocket, role: 'operator' | 'support' }[] }>} */
 const sessions = new Map();
 
+// ---------------------------------------------------------------------------
+// MCP session-state store
+// Receives agent-context pushes from the operator frontend (Phase 2 wiring),
+// and exposes them to the backend MCP server via GET /mcp/session-state.
+// See docs/BACKEND-MCP-POC.md for the full design.
+// ---------------------------------------------------------------------------
+
+/**
+ * In-memory state pushed by the frontend when agent access is enabled.
+ * Key: sessionId (the WebSocket session UUID).
+ * @type {Map<string, Record<string, unknown>>}
+ */
+const mcpSessionStates = new Map();
+
+/**
+ * Handle MCP-oriented read-only and push endpoints under /mcp/.
+ * These are intentionally separate from the Mist proxy and WebSocket paths.
+ * @param {http.IncomingMessage} req
+ * @param {http.ServerResponse} res
+ */
+function mcpHandler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Content-Type', 'application/json');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  // GET /mcp/session-state — return the most recently pushed session context.
+  // The backend MCP server polls this to build tool responses.
+  if (req.method === 'GET' && req.url === '/mcp/session-state') {
+    const states = [...mcpSessionStates.values()];
+    const latest = states.at(-1);
+    if (!latest) {
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        sessionId: null,
+        agentAccessEnabled: false,
+        serialConnected: false,
+        deviceIdentified: false,
+        mistStatus: null,
+        configSyncState: null,
+        identity: null,
+        jma: null,
+        checkResults: null,
+        updatedAt: null,
+        _stub: true,
+      }));
+      return;
+    }
+    res.writeHead(200);
+    res.end(JSON.stringify({ ...latest, _stub: false }));
+    return;
+  }
+
+  // POST /mcp/agent-context — frontend pushes session state when operator
+  // enables agent access. Phase 2: wire this from the operator UI.
+  if (req.method === 'POST' && req.url === '/mcp/agent-context') {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const state = JSON.parse(body);
+        if (!state.sessionId || typeof state.sessionId !== 'string') {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Missing or invalid sessionId' }));
+          return;
+        }
+        mcpSessionStates.set(state.sessionId, {
+          ...state,
+          updatedAt: new Date().toISOString(),
+        });
+        console.log('[mcp] agent-context updated for session', state.sessionId);
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true }));
+      } catch {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404);
+  res.end(JSON.stringify({ error: 'Not found' }));
+}
+
 function mistProxyHandler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -88,6 +179,10 @@ const server = http.createServer((req, res) => {
   }
   if (req.url === '/mist-proxy' || req.url?.startsWith('/mist-proxy?')) {
     mistProxyHandler(req, res);
+    return;
+  }
+  if (req.url?.startsWith('/mcp/')) {
+    mcpHandler(req, res);
     return;
   }
   res.writeHead(404);
@@ -257,4 +352,5 @@ wss.on('connection', (ws) => {
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`[junos-console-server] http://127.0.0.1:${PORT}`);
   console.log(`[junos-console-server] POST /mist-proxy  GET /health  WS /ws`);
+  console.log(`[junos-console-server] GET /mcp/session-state  POST /mcp/agent-context  (MCP POC — see docs/BACKEND-MCP-POC.md)`);
 });

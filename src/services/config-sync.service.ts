@@ -67,6 +67,9 @@ const STAGING_WARNING_PATTERNS = [
   /unknown command:.*disable-port/i,
 ];
 
+const CONFIG_PROMPT_PATTERN = /[\w\-@.:]+#\s*$/i;
+const ANY_CLI_PROMPT_PATTERN = /[\w\-@.:]+[>#%]\s*$/i;
+
 function looksLikeJunosError(output: string): boolean {
   return JUNOS_ERROR_PATTERNS.some((p) => p.test(output));
 }
@@ -186,6 +189,22 @@ export class ConfigSyncService {
   constructor(cmdRunner: CommandRunnerService, mistApi: MistApiService) {
     this.cmdRunner = cmdRunner;
     this.mistApi = mistApi;
+  }
+
+  /**
+   * Junos can be slow to redraw the prompt after commit / exit on lower-spec
+   * switches. Nudge the console once with Enter and wait for the expected
+   * prompt so the operator sees a clean, settled session state.
+   */
+  private async settlePrompt(
+    pattern: RegExp,
+    timeoutMs = 8000,
+    errorMessage = 'Timed out waiting for Junos prompt to settle.',
+  ): Promise<void> {
+    const settle = await this.cmdRunner.sendAndWaitFor('\n', pattern, timeoutMs);
+    if (!settle.matched) {
+      throw new Error(errorMessage);
+    }
   }
 
   /** Current lifecycle state of the config sync session. */
@@ -407,9 +426,19 @@ export class ConfigSyncService {
         120000,
         3000,
       );
-      await this.cmdRunner.execute('exit', 5000);
 
       if (result.success) {
+        await this.settlePrompt(
+          CONFIG_PROMPT_PATTERN,
+          10000,
+          'Commit confirmed completed, but the config prompt did not settle.',
+        );
+        await this.cmdRunner.execute('exit', 10000, 3000);
+        await this.settlePrompt(
+          ANY_CLI_PROMPT_PATTERN,
+          10000,
+          'Commit confirmed completed, but the operational prompt did not settle after exit.',
+        );
         this._sessionState = 'committed';
         this._sessionInfo = null;
         return { success: true, output: result.output };
@@ -449,9 +478,19 @@ export class ConfigSyncService {
         120000,
         3000,
       );
-      await this.cmdRunner.execute('exit', 5000);
 
       if (result.success) {
+        await this.settlePrompt(
+          CONFIG_PROMPT_PATTERN,
+          10000,
+          'Commit completed, but the config prompt did not settle.',
+        );
+        await this.cmdRunner.execute('exit', 10000, 3000);
+        await this.settlePrompt(
+          ANY_CLI_PROMPT_PATTERN,
+          10000,
+          'Commit completed, but the operational prompt did not settle after exit.',
+        );
         this._sessionState = 'committed';
         this._sessionInfo = null;
         return { success: true, output: result.output };
@@ -488,7 +527,17 @@ export class ConfigSyncService {
 
     try {
       const rbResult = await this.cmdRunner.execute('rollback 0', 10000);
-      await this.cmdRunner.execute('exit', 5000);
+      await this.settlePrompt(
+        CONFIG_PROMPT_PATTERN,
+        10000,
+        'Rollback completed, but the config prompt did not settle.',
+      );
+      await this.cmdRunner.execute('exit', 10000, 3000);
+      await this.settlePrompt(
+        ANY_CLI_PROMPT_PATTERN,
+        10000,
+        'Rollback completed, but the operational prompt did not settle after exit.',
+      );
 
       this._sessionState = 'rolled_back';
       this._sessionInfo = null;

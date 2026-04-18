@@ -165,7 +165,7 @@ export class MistContextController {
         );
       } else {
         this.callbacks.onStatusChange(
-          `${orgs.length} org(s) loaded — select one to continue.`,
+          `${orgs.length} org(s) loaded.`,
           'success',
         );
       }

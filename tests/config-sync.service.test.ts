@@ -46,6 +46,14 @@ function makeCmdRunnerStub(overrides: Record<string, CmdOverride> = {}) {
           ...override,
         });
       }
+      if (text === '\n') {
+        const override = overrides.__prompt_settle__ ?? {};
+        return Promise.resolve({
+          output: 'root@switch# ',
+          matched: true,
+          ...override,
+        });
+      }
       return Promise.resolve({ output: '', matched: false });
     }),
     execute: vi.fn().mockImplementation((cmd: string) => {
@@ -656,6 +664,18 @@ describe('ConfigSyncService.commitSyncConfirmed()', () => {
     expect(service.hasStagedCandidate()).toBe(false);
   });
 
+  it('nudges the console and waits for prompts to settle after commit confirmed', async () => {
+    const { cmdRunner, service } = await makeServiceWithStagedCandidate();
+
+    await service.commitSyncConfirmed();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const settleCalls = (cmdRunner.sendAndWaitFor as any).mock.calls
+      .map((call: unknown[]) => call[0])
+      .filter((text: string) => text === '\n');
+    expect(settleCalls).toHaveLength(2);
+  });
+
   it('returns error when no staged candidate exists', async () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const service = new ConfigSyncService({} as any, {} as any);
@@ -701,6 +721,18 @@ describe('ConfigSyncService.commitSync()', () => {
     expect(service.hasStagedCandidate()).toBe(false);
   });
 
+  it('nudges the console and waits for prompts to settle after commit', async () => {
+    const { cmdRunner, service } = await makeServiceWithStagedCandidate();
+
+    await service.commitSync();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const settleCalls = (cmdRunner.sendAndWaitFor as any).mock.calls
+      .map((call: unknown[]) => call[0])
+      .filter((text: string) => text === '\n');
+    expect(settleCalls).toHaveLength(2);
+  });
+
   it('returns error when no staged candidate exists', async () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const service = new ConfigSyncService({} as any, {} as any);
@@ -744,6 +776,18 @@ describe('ConfigSyncService.rollbackSync()', () => {
     await service.rollbackSync();
     expect(service.sessionState).toBe('rolled_back');
     expect(service.hasStagedCandidate()).toBe(false);
+  });
+
+  it('nudges the console and waits for prompts to settle after rollback', async () => {
+    const { cmdRunner, service } = await makeServiceWithStagedCandidate();
+
+    await service.rollbackSync();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const settleCalls = (cmdRunner.sendAndWaitFor as any).mock.calls
+      .map((call: unknown[]) => call[0])
+      .filter((text: string) => text === '\n');
+    expect(settleCalls).toHaveLength(2);
   });
 
   it('returns error when no staged candidate exists', async () => {
