@@ -383,7 +383,7 @@ the hackathon and near-term field use without any of these gaps being closed.
 **What the current product can do for every major JMA failure state:**
 
 - It surfaces the switch's own diagnosis (`cc-state`) as a structured signal
-- It maps that state to the most relevant first-pass checks from the existing 14-check engine
+- It maps that state to the most relevant first-pass checks from the existing troubleshoot engine
 - It provides operator-friendly remediation guidance per state
 - It runs the full check workflow when the state warrants it (`108 CloudUnreachable`)
 - It avoids wasted checks for obvious failure points (`102 NoIPAddress` → don't run DNS checks)

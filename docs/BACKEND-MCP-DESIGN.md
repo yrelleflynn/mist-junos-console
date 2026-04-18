@@ -23,11 +23,11 @@ This design document describes the intended full architecture. The POC covers th
 
 Related docs:
 
-- [`docs/BACKEND-MCP-POC.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/BACKEND-MCP-POC.md)
-- [`docs/AI-AGENT-INTEGRATION.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/AI-AGENT-INTEGRATION.md:1)
-- [`docs/MIST-API-INTEGRATION.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/MIST-API-INTEGRATION.md:1)
-- [`docs/SESSION-LOGGING-DESIGN.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/SESSION-LOGGING-DESIGN.md:1)
-- [`docs/SESSION-EVENT-SCHEMA.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/SESSION-EVENT-SCHEMA.md:1)
+- [`docs/BACKEND-MCP-POC.md`](./BACKEND-MCP-POC.md)
+- [`docs/AI-AGENT-INTEGRATION.md`](./AI-AGENT-INTEGRATION.md)
+- [`docs/MIST-API-INTEGRATION.md`](./MIST-API-INTEGRATION.md)
+- [`docs/SESSION-LOGGING-DESIGN.md`](./SESSION-LOGGING-DESIGN.md)
+- [`docs/SESSION-EVENT-SCHEMA.md`](./SESSION-EVENT-SCHEMA.md)
 
 ## Architectural Model
 

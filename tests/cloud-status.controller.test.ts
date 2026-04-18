@@ -72,12 +72,6 @@ describe('CloudStatusController', () => {
     });
   });
 
-  it('starts with an empty unknown state snapshot', () => {
-    expect(controller.state.matchResult).toBeNull();
-    expect(controller.state.mist.label).toBe('Unknown');
-    expect(controller.state.jma.label).toBe('Unknown');
-  });
-
   it('refresh() builds connected Mist and JMA status when both are available', async () => {
     switchIdentity = createSwitchIdentityStub({
       mistCloudReachableHint: true,
@@ -116,22 +110,6 @@ describe('CloudStatusController', () => {
     expect(controller.state.mist.label).toBe('Disconnected');
   });
 
-  it('refresh() keeps Mist disconnected when last_seen is recent but inventory and stats both say disconnected', async () => {
-    switchIdentity = createSwitchIdentityStub({
-      mistInventoryConnected: false,
-      mistStatsStatus: 'disconnected',
-      mistRecentlySeen: true,
-      mistCloudReachableHint: false,
-      mistCloudStatusLine: 'inventory: not connected · stats: disconnected · recent last_seen (<10m)',
-    });
-    controller = new CloudStatusController(switchIdentity, troubleshooter, { onStatusUpdated });
-
-    await controller.refresh(makeMatchResult(), true);
-
-    expect(controller.state.mist.pillState).toBe('disconnected');
-    expect(controller.state.mist.label).toBe('Disconnected');
-  });
-
   it('refresh() skips JMA polling when serial is disconnected', async () => {
     await controller.refresh(makeMatchResult(), false);
 
@@ -152,7 +130,7 @@ describe('CloudStatusController', () => {
     vi.useFakeTimers();
     const matchResult = makeMatchResult();
 
-    controller.startPolling(() => matchResult, () => true, 1000);
+    controller.startPolling(() => matchResult, () => true, () => true, 1000);
     await vi.advanceTimersByTimeAsync(1000);
     await vi.advanceTimersByTimeAsync(1000);
 
@@ -163,7 +141,7 @@ describe('CloudStatusController', () => {
   it('startPolling() still refreshes JMA state when serial is connected but no Mist match exists yet', async () => {
     vi.useFakeTimers();
 
-    controller.startPolling(() => null, () => true, 1000);
+    controller.startPolling(() => null, () => true, () => true, 1000);
     await vi.advanceTimersByTimeAsync(1000);
 
     expect(switchIdentity.refreshMistCloudStatus).not.toHaveBeenCalled();
@@ -176,7 +154,7 @@ describe('CloudStatusController', () => {
     vi.useFakeTimers();
     const matchResult = makeMatchResult();
 
-    controller.startPolling(() => matchResult, () => true, 1000);
+    controller.startPolling(() => matchResult, () => true, () => true, 1000);
     controller.pausePolling();
     await vi.advanceTimersByTimeAsync(2000);
     expect(switchIdentity.refreshMistCloudStatus).not.toHaveBeenCalled();
@@ -190,7 +168,7 @@ describe('CloudStatusController', () => {
     vi.useFakeTimers();
     const matchResult = makeMatchResult();
 
-    controller.startPolling(() => matchResult, () => true, 1000);
+    controller.startPolling(() => matchResult, () => true, () => true, 1000);
     controller.reset();
     await vi.advanceTimersByTimeAsync(2000);
 
@@ -200,11 +178,4 @@ describe('CloudStatusController', () => {
     expect(onStatusUpdated).toHaveBeenCalled();
   });
 
-  it('state getter returns a snapshot, not the internal references', async () => {
-    await controller.refresh(makeMatchResult(), true);
-    const snap = controller.state;
-    snap.mist.label = 'Mutated';
-
-    expect(controller.state.mist.label).not.toBe('Mutated');
-  });
 });

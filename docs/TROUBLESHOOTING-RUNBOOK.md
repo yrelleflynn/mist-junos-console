@@ -9,13 +9,16 @@ This runbook describes:
 - when it is most useful
 - how those checks map to the switch-reported JMA cloud connectivity state
 
-This document builds on the test-by-test reference in [`README.txt`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/README.txt:1), but reframes the content into an operator and product runbook that matches the current UI and troubleshooting engine.
+This document builds on the check reference in
+[`docs/TROUBLESHOOTING-CHECK-REFERENCE.md`](./TROUBLESHOOTING-CHECK-REFERENCE.md),
+but reframes the content into an operator and product runbook that matches the
+current UI and troubleshooting engine.
 
 Related docs:
 
 - [`docs/JMA-CONNECTIVITY-STATE.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/JMA-CONNECTIVITY-STATE.md:1)
 - [`docs/PRD.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/PRD.md:164)
-- [`README.txt`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/README.txt:1)
+- [`docs/TROUBLESHOOTING-CHECK-REFERENCE.md`](./TROUBLESHOOTING-CHECK-REFERENCE.md)
 
 ## Operating Model
 
@@ -123,14 +126,25 @@ Below is the current check surface exposed by the troubleshooting engine in [`sr
 - Best used when:
   - JMA says `NoDNS`
   - the switch appears to have an IP and route but still cannot reach cloud services by name
+- Product note:
+  - the check reads effective resolver state from `/etc/resolv.conf`
+  - it also inspects static `name-server` configuration
+  - DHCP-learned resolvers can therefore appear alongside statically configured ones
 
 ### DNS Resolution & Reachability
 
-- Purpose: prove that Mist hostnames resolve and are at least network-reachable enough to test
+- Purpose: determine whether configured DNS servers are reachable, whether Mist hostnames resolve, and whether generic public hostnames behave differently
 - Best used when:
   - JMA says `DNSLookupFailed`, `NoDNSResponse`, or `EmptyDNSResponse`
 - Product note:
   - this is a critical gate for endpoint-oriented checks
+  - the check now compares a Mist hostname with a generic public hostname and pings the configured DNS servers
+  - this helps distinguish:
+    - DNS servers unreachable from the switch
+    - DNS servers reachable by ICMP but blocked for actual DNS queries, where Junos reports `no servers could be reached`
+    - DNS servers reachable but all lookups failing
+    - public DNS working while Mist domains fail, which points toward selective upstream filtering or policy
+  - if DHCP-provided resolver IPs may be stale, `request dhcp client renew all` is a reasonable targeted refresh step
 
 ### Route to Mist Endpoints
 
@@ -264,14 +278,19 @@ Run first:
 - `DNS Configuration`
 - `DNS Resolution & Reachability`
 
-Then:
-
-- `Route to Mist Endpoints`
-- `Firewall Policy Check`
-
 Why:
 
 - DNS is configured but not functioning end-to-end
+- the first pass should determine whether:
+  - configured DNS servers are reachable at all
+  - both public and Mist hostnames fail
+  - public hostnames resolve while Mist domains fail
+
+Next actions:
+
+- if configured DNS servers are unreachable, verify path or firewall policy to those resolver IPs
+- if DNS servers are reachable but both public and Mist lookups fail, focus on upstream DNS service or DNS-specific blocking
+- if public hostnames resolve but Mist domains do not, focus on selective filtering, split-DNS, or upstream policy affecting Mist domains
 
 ### `113 NoDNSResponse`
 

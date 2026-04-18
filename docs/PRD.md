@@ -87,10 +87,9 @@ Based on the current implementation, the product already includes:
 - root password lookup from site settings
 - config drift comparison
 - adoption command retrieval and guided application
-- automated cloud connectivity checks (14-check engine with gate logic)
+- automated cloud-connectivity troubleshooting checks with gate logic
 - JMA Connectivity State monitoring (switch-reported cloud state, parsed from cc-state)
 - staged config sync: fetch Mist diff, stage candidate, show | compare, commit check, then operator-gated Commit Confirmed / Commit / Rollback
-- staged config sync: fetch Mist diff, stage candidate, show | compare, commit check, then operator-gated Commit / Rollback
 - remote support console mirroring over WebSocket
 
 ### Demoable scope as of hackathon (April 2026)
@@ -103,7 +102,7 @@ JMA Connectivity State provides a second signal alongside Mist last-known status
 Config drift comparison identifies configuration divergence from Mist intent.
 
 **Diagnosis (Level 2):**
-Each check produces a structured result: status, explanation, evidence, and
+Each troubleshooting check produces a structured result: status, explanation, evidence, and
 remediation guidance. Gate logic prevents downstream false failures when a
 prerequisite has already failed. Config drift output highlights the exact
 `set` commands missing from the running config.
@@ -287,7 +286,7 @@ The current codebase is functionally promising but not yet structured for sustai
 
 - `src/main.ts` is a very large DOM-centric orchestrator
 - `src/services/troubleshoot.service.ts` contains too much workflow and parsing logic in one file
-- there is no automated test suite
+- automated test coverage is still limited and concentrated in manual verification
 - security-sensitive product assumptions are documented but not yet enforced
 - the README is stronger than the engineering process around it
 
@@ -347,7 +346,7 @@ As an operator recovering a disconnected switch, I want to preview and apply the
 6. The user explicitly approves the final apply step.
 7. The tool runs `commit check`.
 8. If `commit check` succeeds, the tool performs the final commit with a clear comment, for example:
-   `commit comment "junos console bridge Mist UI config sync"`
+   `commit comment "junos console config sync"`
 9. The tool shows post-commit verification and rollback guidance.
 
 #### Scope decisions

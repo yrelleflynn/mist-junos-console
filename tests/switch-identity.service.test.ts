@@ -1,6 +1,71 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SwitchIdentityService } from '../src/services/switch-identity.service';
 
+// ---- computeMistReachableHint (via identifyAndMatch) ----
+// The hint is the key input to CloudStatusController.buildMistStatus. Test the
+// cases where signals conflict so the cloud-status controller tests don't need to.
+
+describe('SwitchIdentityService.computeMistReachableHint', () => {
+  function makeService(stats: { status?: string; last_seen?: number } | null, inventoryConnected: boolean | null) {
+    // Runner must return enough to populate identity.serial so findDeviceBySerial is called.
+    const runner = {
+      execute: vi.fn(async (command: string) => {
+        if (command === 'show chassis hardware | match "^Chassis"') {
+          return { command, output: 'Chassis                                ABC123            EX2300-C-12T', success: true };
+        }
+        return { command, output: '', success: false };
+      }),
+      sendAndWaitFor: vi.fn(async () => ({ output: '', matched: false })),
+    };
+    const mistApi = {
+      isConfigured: true,
+      findDeviceBySerial: vi.fn(async () => ({
+        id: 'dev-1', mac: 'aa:bb:cc:dd:ee:ff', serial: 'ABC123',
+        model: 'EX2300-C-12T', type: 'switch', site_id: 'site-1',
+        connected: inventoryConnected,
+      })),
+      findDeviceByMac: vi.fn(async () => null),
+      getDeviceConfig: vi.fn(async () => ({ id: 'dev-1', cli: [] })),
+      getSite: vi.fn(async () => ({ id: 'site-1', name: 'Test' })),
+      getDeviceStats: vi.fn(async () => stats),
+    };
+    return new SwitchIdentityService(runner as never, mistApi as never);
+  }
+
+  it('returns true when inventory says connected', async () => {
+    const service = makeService(null, true);
+    const result = await service.identifyAndMatch();
+    expect(result.mistCloudReachableHint).toBe(true);
+  });
+
+  it('returns true when stats say connected', async () => {
+    const service = makeService({ status: 'connected' }, null);
+    const result = await service.identifyAndMatch();
+    expect(result.mistCloudReachableHint).toBe(true);
+  });
+
+  it('returns true when only recent last_seen is available (no inventory or stats status)', async () => {
+    const recentEpoch = Math.floor(Date.now() / 1000) - 60; // 1 min ago
+    const service = makeService({ last_seen: recentEpoch }, null);
+    const result = await service.identifyAndMatch();
+    expect(result.mistCloudReachableHint).toBe(true);
+  });
+
+  it('returns false when inventory says not connected, even with a recent last_seen', async () => {
+    const recentEpoch = Math.floor(Date.now() / 1000) - 60;
+    const service = makeService({ status: 'disconnected', last_seen: recentEpoch }, false);
+    const result = await service.identifyAndMatch();
+    expect(result.mistCloudReachableHint).toBe(false);
+    expect(result.mistRecentlySeen).toBe(true);
+  });
+
+  it('returns false when all signals are absent', async () => {
+    const service = makeService(null, null);
+    const result = await service.identifyAndMatch();
+    expect(result.mistCloudReachableHint).toBe(false);
+  });
+});
+
 function createRunnerStub() {
   return {
     execute: vi.fn(async (command: string) => {

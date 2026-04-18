@@ -220,7 +220,7 @@ Silent background commands should generally use `render_in_transcript: false` an
 ```json
 {
   "status": "success",
-  "commit_comment": "junos console bridge Mist UI config sync",
+  "commit_comment": "junos console config sync",
   "commit_reference": "0",
   "mist_config_timestamp": 1776214677,
   "render_in_transcript": true

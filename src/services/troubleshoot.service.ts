@@ -69,6 +69,28 @@ export interface RecommendedChecksOptions extends TroubleshootOptions {
   checkIds: string[];
 }
 
+type DnsServerSource = 'static' | 'dhcp' | 'runtime';
+
+interface DnsServerEntry {
+  ip: string;
+  source: DnsServerSource;
+}
+
+interface DnsServerSnapshot {
+  servers: string[];
+  entries: DnsServerEntry[];
+  raw: string;
+  expiresAt: number;
+}
+
+interface DnsReachabilitySnapshot {
+  result: CheckResult;
+  reachableServers: string[];
+  checkedServers: string[];
+  raw: string;
+  expiresAt: number;
+}
+
 /** Mutable context for the modular troubleshoot step queue (Juniper EX). */
 export interface TroubleshootContext {
   cloud: MistCloud;
@@ -97,6 +119,8 @@ export interface TroubleshootStep {
 export class TroubleshootService {
   private runner: CommandRunnerService;
   private mistApi: MistApiService | null;
+  private dnsServerCache: DnsServerSnapshot | null = null;
+  private dnsReachabilityCache: DnsReachabilitySnapshot | null = null;
 
   constructor(runner: CommandRunnerService, mistApi?: MistApiService) {
     this.runner = runner;
@@ -176,6 +200,8 @@ export class TroubleshootService {
    * Returns the final array of results.
    */
   async runAll(options: TroubleshootOptions): Promise<CheckResult[]> {
+    this.dnsServerCache = null;
+    this.dnsReachabilityCache = null;
     const results: CheckResult[] = [];
     const { cloud, onProgress } = options;
 
@@ -227,7 +253,7 @@ export class TroubleshootService {
     if (ipResult.result.status === 'fail') {
       skipRemaining('no management IP address', [
         'DHCP Lease Details', 'ARP Table', 'Default Gateway',
-        'DNS Configuration', 'DNS Resolution & Reachability',
+        'DNS Configuration', 'DNS Server Reachability', 'DNS Resolution',
         'Route to Mist Endpoints',
         'Mist Agent Version', 'Mist Agent Processes', 'Outbound SSH Config', 'Active Cloud Connections',
       ]);
@@ -248,7 +274,7 @@ export class TroubleshootService {
 
     if (routeResult.status === 'fail') {
       skipRemaining('no default route', [
-        'DNS Configuration', 'DNS Resolution & Reachability',
+        'DNS Configuration', 'DNS Server Reachability', 'DNS Resolution',
         'Route to Mist Endpoints',
         'Mist Agent Version', 'Mist Agent Processes', 'Outbound SSH Config', 'Active Cloud Connections',
       ]);
@@ -259,11 +285,15 @@ export class TroubleshootService {
     const dnsConfigResult = await this.checkDnsConfig();
     report(dnsConfigResult);
 
-    // 8. DNS Resolution — CRITICAL: if DNS doesn't resolve, skip endpoint checks
-    const dnsResolveResult = await this.checkDnsResolution(cloud);
+    // 8. DNS server reachability
+    const dnsReachabilityResult = await this.checkDnsServerReachability();
+    report(dnsReachabilityResult.result);
+
+    // 9. DNS Resolution — CRITICAL: if DNS doesn't resolve, skip endpoint checks
+    const dnsResolveResult = await this.checkDnsResolution(cloud, dnsReachabilityResult);
     report(dnsResolveResult);
 
-    if (dnsResolveResult.status === 'fail') {
+    if (dnsReachabilityResult.reachableServers.length === 0 || dnsResolveResult.status === 'fail') {
       skipRemaining('DNS resolution failed', [
         'Route to Mist Endpoints',
         'Mist Agent Version', 'Mist Agent Processes', 'Outbound SSH Config', 'Active Cloud Connections',
@@ -289,6 +319,8 @@ export class TroubleshootService {
    * Used by the JMA recommendation UI to keep the first-pass workflow focused.
    */
   async runRecommendedChecks(options: RecommendedChecksOptions): Promise<CheckResult[]> {
+    this.dnsServerCache = null;
+    this.dnsReachabilityCache = null;
     const results: CheckResult[] = [];
     const reportedIds = new Set<string>();
     const requested = [...new Set(options.checkIds)];
@@ -447,6 +479,10 @@ export class TroubleshootService {
         }
         case 'dns-config': {
           report(await this.checkDnsConfig());
+          break;
+        }
+        case 'dns-server-reachability': {
+          report((await this.checkDnsServerReachability()).result);
           break;
         }
         case 'dns-resolution': {
@@ -1570,118 +1606,225 @@ export class TroubleshootService {
   private async checkDnsConfig(): Promise<CheckResult> {
     const id = 'dns-config';
     const name = 'DNS Configuration';
-    const allOutputs: string[] = [];
-    let servers: string[] = [];
-
-    // 1. Direct system name-server config
-    const cmd1 = await this.runner.execute('show configuration system name-server');
-    if (cmd1.success) {
-      allOutputs.push(cmd1.output);
-      const found = cmd1.output.match(/(\d+\.\d+\.\d+\.\d+)/g);
-      if (found) servers.push(...found);
-    }
-
-    // 2. Check inside configuration groups (Mist pushes config via groups)
-    if (servers.length === 0) {
-      const cmd2 = await this.runner.execute('show configuration groups | display set | match name-server');
-      if (cmd2.success) {
-        allOutputs.push(cmd2.output);
-        const found = cmd2.output.match(/(\d+\.\d+\.\d+\.\d+)/g);
-        if (found) servers.push(...found);
-      }
-    }
-
-    // 3. Show the effective/inherited config (resolves groups)
-    if (servers.length === 0) {
-      const cmd3 = await this.runner.execute('show configuration system name-server | display inheritance');
-      if (cmd3.success) {
-        allOutputs.push(cmd3.output);
-        const found = cmd3.output.match(/(\d+\.\d+\.\d+\.\d+)/g);
-        if (found) servers.push(...found);
-      }
-    }
-
-    // 4. Operational command — show what the system is actually using
-    if (servers.length === 0) {
-      const cmd4 = await this.runner.execute('show system name-server');
-      if (cmd4.success) {
-        allOutputs.push(cmd4.output);
-        const found = cmd4.output.match(/(\d+\.\d+\.\d+\.\d+)/g);
-        if (found) servers.push(...found);
-      }
-    }
-
-    // 5. Last resort — check resolve.conf from shell
-    if (servers.length === 0) {
-      const cmd5 = await this.runner.execute('file show /etc/resolv.conf');
-      if (cmd5.success) {
-        allOutputs.push(cmd5.output);
-        const nameserverLines = cmd5.output.split('\n').filter((l) => l.trim().startsWith('nameserver'));
-        const found = nameserverLines.map((l) => l.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1]).filter(Boolean) as string[];
-        if (found.length > 0) servers.push(...found);
-      }
-    }
-
-    // Deduplicate
-    servers = [...new Set(servers)];
-    const raw = allOutputs.join('\n---\n');
+    const { servers, entries, raw } = await this.getConfiguredDnsServers();
 
     if (servers.length === 0) {
       return { id, name, status: 'fail', detail: 'No DNS servers found in config or resolve.conf', raw };
     }
 
-    return { id, name, status: 'pass', detail: `DNS servers: ${servers.join(', ')}`, raw };
+    const detailServers = entries.length > 0
+      ? entries.map((entry) => `${entry.ip} (${entry.source})`).join(', ')
+      : servers.join(', ');
+
+    return { id, name, status: 'pass', detail: `DNS servers: ${detailServers}`, raw };
   }
 
-  private async checkDnsResolution(cloud: MistCloud): Promise<CheckResult> {
-    const id = 'dns-resolution';
-    const name = 'DNS Resolution & Reachability';
+  private async checkDnsServerReachability(): Promise<{ result: CheckResult; reachableServers: string[]; checkedServers: string[]; raw: string }> {
+    if (this.dnsReachabilityCache && this.dnsReachabilityCache.expiresAt > Date.now()) {
+      return {
+        result: { ...this.dnsReachabilityCache.result },
+        reachableServers: [...this.dnsReachabilityCache.reachableServers],
+        checkedServers: [...this.dnsReachabilityCache.checkedServers],
+        raw: this.dnsReachabilityCache.raw,
+      };
+    }
 
-    // Pick the oc-term host as the test target
+    const id = 'dns-server-reachability';
+    const name = 'DNS Server Reachability';
+    const { servers, entries, raw: dnsServerRaw } = await this.getConfiguredDnsServers();
+
+    if (servers.length === 0) {
+      const result: CheckResult = {
+        id,
+        name,
+        status: 'skip',
+        detail: 'Skipped — no DNS servers were available to test',
+        raw: dnsServerRaw,
+      };
+      const snapshot: DnsReachabilitySnapshot = {
+        result,
+        reachableServers: [],
+        checkedServers: [],
+        raw: dnsServerRaw,
+        expiresAt: Date.now() + 5000,
+      };
+      this.dnsReachabilityCache = snapshot;
+      return { result: { ...result }, reachableServers: [], checkedServers: [], raw: dnsServerRaw };
+    }
+
+    const checks: string[] = [];
+    const reachableServers: string[] = [];
+    const checkedServers: string[] = [];
+
+    for (const entry of entries.slice(0, 4)) {
+      checkedServers.push(entry.ip);
+      const ping = await this.runner.execute(`ping inet ${entry.ip} count 1 rapid`, 10000, 1500);
+      checks.push(`DNS server ${entry.ip} (${entry.source})\n${ping.output || ping.error || ''}`.trim());
+      const receivedMatch = ping.output.match(/(\d+) packets received/);
+      const received = receivedMatch ? parseInt(receivedMatch[1], 10) : 0;
+      const hasSuccess = received > 0 || ping.output.includes('!');
+      if (hasSuccess) reachableServers.push(entry.ip);
+    }
+
+    const raw = [
+      `Configured DNS servers:\n${dnsServerRaw || '(none found)'}`,
+      ...checks,
+    ].join('\n\n---\n\n');
+
+    const result: CheckResult = reachableServers.length > 0
+      ? {
+          id,
+          name,
+          status: 'pass',
+          detail: `Reachable DNS servers: ${reachableServers.join(', ')}`,
+          raw,
+        }
+      : {
+          id,
+          name,
+          status: 'fail',
+          detail: `Configured DNS server(s) ${checkedServers.join(', ')} are not reachable from the switch`,
+          raw,
+        };
+
+    const snapshot: DnsReachabilitySnapshot = {
+      result,
+      reachableServers: [...reachableServers],
+      checkedServers: [...checkedServers],
+      raw,
+      expiresAt: Date.now() + 5000,
+    };
+    this.dnsReachabilityCache = snapshot;
+    return {
+      result: { ...result },
+      reachableServers: [...reachableServers],
+      checkedServers: [...checkedServers],
+      raw,
+    };
+  }
+
+  private async checkDnsResolution(
+    cloud: MistCloud,
+    reachability?: { reachableServers: string[]; checkedServers: string[]; raw: string },
+  ): Promise<CheckResult> {
+    const id = 'dns-resolution';
+    const name = 'DNS Resolution';
+
+    const dnsReachability = reachability || await this.checkDnsServerReachability();
+
+    if (dnsReachability.checkedServers.length === 0) {
+      return {
+        id,
+        name,
+        status: 'skip',
+        detail: 'Skipped — no DNS servers were available to test',
+        raw: dnsReachability.raw,
+      };
+    }
+
+    if (dnsReachability.reachableServers.length === 0) {
+      return {
+        id,
+        name,
+        status: 'skip',
+        detail: 'Skipped — hostname resolution was not tested because no DNS servers were reachable',
+        raw: dnsReachability.raw,
+      };
+    }
+
+    // Pick the oc-term host as the primary Mist test target
     const ocTerm = cloud.switchEndpoints.find((e) => e.description.includes('oc-term'));
     const testHost = ocTerm?.host || cloud.switchEndpoints[0]?.host || 'redirect.juniper.net';
+    const publicHost = 'google.com';
 
-    // Use 'ping inet' to force IPv4 — avoids IPv6 AAAA resolution with no route
-    const cmd = await this.runner.execute(`ping inet ${testHost} count 3 rapid`, 15000);
-    if (!cmd.success) {
-      // Check if it's a DNS failure vs routing failure
-      if (cmd.output.includes('unknown host') || cmd.output.includes('not known') ||
-          cmd.output.includes('Name or service not known')) {
-        return { id, name, status: 'fail', detail: `Cannot resolve ${testHost} — DNS failure`, raw: cmd.output };
+    const extractResolvedIp = (output: string): string | null => {
+      const match = output.match(/has address\s+(\d+\.\d+\.\d+\.\d+)/i);
+      return match ? match[1] : null;
+    };
+
+    const isResolveFailure = (text: string): boolean => {
+      return /host name lookup failure|unknown host|not known|couldn't get address|no servers could be reached|timed out/i.test(text);
+    };
+
+    const indicatesDnsTransportFailure = (text: string): boolean => {
+      return /no servers could be reached|connection timed out/i.test(text);
+    };
+
+    const mistResolve = await this.runner.execute(`show host ${testHost}`, 35000, 3000);
+    const publicResolve = await this.runner.execute(`show host ${publicHost}`, 35000, 3000);
+
+    const mistResolveText = `${mistResolve.output}\n${mistResolve.error || ''}`.trim();
+    const publicResolveText = `${publicResolve.output}\n${publicResolve.error || ''}`.trim();
+
+    const raw = [
+      dnsReachability.raw,
+      `show host ${testHost}\n${mistResolveText}`.trim(),
+      `show host ${publicHost}\n${publicResolveText}`.trim(),
+    ].join('\n\n---\n\n');
+
+    const mistIp = extractResolvedIp(mistResolve.output);
+    const publicIp = extractResolvedIp(publicResolve.output);
+
+    if (mistIp) {
+      if (publicIp) {
+        return {
+          id,
+          name,
+          status: 'pass',
+          detail: `${testHost} resolved to ${mistIp}; generic DNS resolution also works`,
+          raw,
+        };
       }
-      return { id, name, status: 'fail', detail: `Ping failed: ${cmd.error}`, raw: cmd.output };
+      return {
+        id,
+        name,
+        status: 'pass',
+        detail: `${testHost} resolved to ${mistIp}`,
+        raw,
+      };
     }
 
-    // Check for DNS failure in output
-    if (cmd.output.includes('unknown host') || cmd.output.includes('not known')) {
-      return { id, name, status: 'fail', detail: `Cannot resolve ${testHost} — DNS failure`, raw: cmd.output };
+    if (publicIp && !mistIp) {
+      return {
+        id,
+        name,
+        status: 'warn',
+        detail: 'Hostname resolution failed for Mist domains only',
+        raw,
+      };
     }
 
-    // Check for no route
-    if (cmd.output.includes('No route to host') || cmd.output.includes('Network is unreachable')) {
-      return { id, name, status: 'warn', detail: `Resolved ${testHost} but no route to host`, raw: cmd.output };
+    if (indicatesDnsTransportFailure(mistResolveText) && indicatesDnsTransportFailure(publicResolveText)) {
+      return {
+        id,
+        name,
+        status: 'fail',
+        detail: 'Hostname resolution failed',
+        raw,
+      };
     }
 
-    // Check for ping success — look for "X packets received" or "!!" (rapid ping success)
-    const receivedMatch = cmd.output.match(/(\d+) packets received/);
-    const received = receivedMatch ? parseInt(receivedMatch[1], 10) : 0;
-    const hasRapidSuccess = cmd.output.includes('!!') || cmd.output.includes('!');
-
-    if (received > 0 || hasRapidSuccess) {
-      // Extract resolved IP from ping output
-      const ipMatch = cmd.output.match(/PING\s+\S+\s+\((\d+\.\d+\.\d+\.\d+)\)/);
-      const resolvedIp = ipMatch ? ` → ${ipMatch[1]}` : '';
-      return { id, name, status: 'pass', detail: `${testHost}${resolvedIp} — reachable`, raw: cmd.output };
+    if (isResolveFailure(mistResolveText) && isResolveFailure(publicResolveText)) {
+      return {
+        id,
+        name,
+        status: 'fail',
+        detail: 'Hostname resolution failed',
+        raw,
+      };
     }
 
-    // Ping sent but 0 received — host resolved but unreachable
-    if (cmd.output.includes('0 packets received') || cmd.output.includes('100% packet loss')) {
-      const ipMatch = cmd.output.match(/PING\s+\S+\s+\((\d+\.\d+\.\d+\.\d+)\)/);
-      const resolvedIp = ipMatch ? ` (${ipMatch[1]})` : '';
-      return { id, name, status: 'warn', detail: `Resolved ${testHost}${resolvedIp} but 0 replies — ICMP may be blocked`, raw: cmd.output };
+    if (isResolveFailure(mistResolveText)) {
+      return {
+        id,
+        name,
+        status: 'fail',
+        detail: 'Mist hostname resolution failed',
+        raw,
+      };
     }
 
-    return { id, name, status: 'warn', detail: `Uncertain result for ${testHost}`, raw: cmd.output };
+    return { id, name, status: 'warn', detail: `Uncertain DNS result for ${testHost}`, raw };
   }
 
   private async checkRouteToMistEndpoints(cloud: MistCloud): Promise<CheckResult> {
@@ -1771,9 +1914,17 @@ export class TroubleshootService {
     const id = `cert-${endpoint.host.replace(/\./g, '-')}`;
     const name = `SSL Cert: ${endpoint.host}`;
 
-    // Enter shell mode (Junos drops to csh)
-    await this.runner.send('start shell\n');
-    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      await this.runner.ensureShellMode();
+    } catch (err) {
+      return {
+        id,
+        name,
+        status: 'warn',
+        detail: 'Could not enter shell mode to inspect certificates',
+        raw: err instanceof Error ? err.message : String(err),
+      };
+    }
 
     // csh doesn't support 2>&1 or > redirect properly
     // Wrap in /bin/sh -c to get proper shell redirects
@@ -1791,10 +1942,7 @@ export class TroubleshootService {
     await this.runner.execute('rm -f /tmp/certcheck.txt', 5000, 1000);
 
     // Exit shell back to Junos CLI
-    await this.runner.send('exit\n');
-    await new Promise((r) => setTimeout(r, 1000));
-    await this.runner.send('cli\n');
-    await new Promise((r) => setTimeout(r, 1500));
+    await this.runner.ensureOperationalMode();
 
     if (!output || output.includes('command not found') || output.includes('No such file')) {
       return { id, name, status: 'warn', detail: 'curl not available on this switch', raw: output };
@@ -1997,22 +2145,101 @@ export class TroubleshootService {
 
     // Check for mcd (Mist Cloud Daemon) and jmd (Junos Mist Daemon)
     // Use interactive shell to avoid pipe/redirect issues with 'start shell command'
-    await this.runner.send('start shell\n');
-    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      await this.runner.ensureShellMode();
+    } catch (err) {
+      return {
+        id,
+        name,
+        status: 'warn',
+        detail: 'Could not check processes — shell access may be restricted',
+        raw: err instanceof Error ? err.message : String(err),
+      };
+    }
 
     const cmd = await this.runner.execute('/bin/sh -c \'ps aux | grep -E "mcd|jmd" | grep -v grep\'', 15000, 2000);
 
     // Exit shell back to Junos CLI
-    await this.runner.send('exit\n');
-    await new Promise((r) => setTimeout(r, 1000));
-    await this.runner.send('cli\n');
-    await new Promise((r) => setTimeout(r, 1500));
+    await this.runner.ensureOperationalMode();
 
     if (!cmd.success) {
       return { id, name, status: 'warn', detail: 'Could not check processes — shell access may be restricted', raw: cmd.output };
     }
 
     return this.parseMistProcesses(cmd.output);
+  }
+
+  private async getConfiguredDnsServers(): Promise<{ servers: string[]; entries: DnsServerEntry[]; raw: string }> {
+    if (this.dnsServerCache && this.dnsServerCache.expiresAt > Date.now()) {
+      return {
+        servers: [...this.dnsServerCache.servers],
+        entries: this.dnsServerCache.entries.map((entry) => ({ ...entry })),
+        raw: this.dnsServerCache.raw,
+      };
+    }
+
+    const allOutputs: string[] = [];
+    const staticServers: string[] = [];
+    const entries: DnsServerEntry[] = [];
+    const seen = new Set<string>();
+
+    const addEntry = (ip: string, source: DnsServerSource) => {
+      if (seen.has(ip)) return;
+      seen.add(ip);
+      entries.push({ ip, source });
+    };
+
+    const cmd1 = await this.runner.execute('show configuration groups | display set | match name-server');
+    if (cmd1.success) {
+      allOutputs.push(`show configuration groups | display set | match name-server\n${cmd1.output}`.trim());
+      const found = cmd1.output.match(/(\d+\.\d+\.\d+\.\d+)/g) || [];
+      staticServers.push(...found);
+    }
+
+    try {
+      await this.runner.ensureShellMode();
+      const cmd2 = await this.runner.execute('cat /etc/resolv.conf', 10000, 1500);
+      if (cmd2.success) {
+        allOutputs.push(`cat /etc/resolv.conf\n${cmd2.output}`.trim());
+        let inDhcpBlock = false;
+        for (const line of cmd2.output.split('\n')) {
+          const trimmed = line.trim();
+          if (/^#jdhcpd\b/i.test(trimmed)) {
+            inDhcpBlock = !/^#jdhcpd end\b/i.test(trimmed);
+            continue;
+          }
+          const ip = trimmed.match(/^nameserver\s+(\d+\.\d+\.\d+\.\d+)/i)?.[1];
+          if (!ip) continue;
+          const source: DnsServerSource = staticServers.includes(ip)
+            ? 'static'
+            : inDhcpBlock
+              ? 'dhcp'
+              : 'runtime';
+          addEntry(ip, source);
+        }
+      }
+    } catch (err) {
+      allOutputs.push(`cat /etc/resolv.conf\n${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      await this.runner.ensureOperationalMode();
+    }
+
+    for (const ip of staticServers) {
+      addEntry(ip, 'static');
+    }
+
+    const snapshot = {
+      servers: entries.map((entry) => entry.ip),
+      entries: entries.map((entry) => ({ ...entry })),
+      raw: allOutputs.join('\n---\n'),
+      expiresAt: Date.now() + 5000,
+    };
+    this.dnsServerCache = snapshot;
+    return {
+      servers: [...snapshot.servers],
+      entries: snapshot.entries.map((entry) => ({ ...entry })),
+      raw: snapshot.raw,
+    };
   }
 
   private parseMistProcesses(output: string): CheckResult {
@@ -2802,10 +3029,36 @@ export class TroubleshootService {
         };
       }
 
+      case 'dns-server-reachability': {
+        if (failed('dns-config')) return { text: 'DNS servers not configured — fix DNS Config first.' };
+        return { text: 'Configured DNS server IPs are not reachable from the switch. Fix the upstream path or replace them with reachable resolvers.' };
+      }
+
+      case 'dns-resolution':
       case 'dns-resolve': {
         if (failed('dns-config')) return { text: 'DNS servers not configured — fix DNS Config first.' };
-        if (result.detail.includes('DNS failure') || result.detail.includes('unknown host'))
-          return { text: 'DNS configured but resolution failing. Check DNS server reachability and firewall (UDP 53).' };
+        if (failed('dns-server-reachability')) return { text: 'Resolution was skipped because no DNS servers were reachable. Fix DNS Server Reachability first.' };
+        const rawText = `${result.raw || ''}\n${result.detail}`.toLowerCase();
+        const reachableServers = detail('dns-server-reachability').replace(/^Reachable DNS servers:\s*/i, '');
+
+        if (rawText.includes('no servers could be reached') || rawText.includes('connection timed out')) {
+          return {
+            text: `${reachableServers ? `Reachable DNS servers: ${reachableServers}\n` : ''}Ping to the DNS servers succeeded, but Junos reported "no servers could be reached" for hostname lookups.\nThis usually points to upstream DNS transport being blocked, for example firewall policy on UDP/TCP 53.\nIf any resolver IPs come from DHCP, consider refreshing them.`,
+            commands: ['request dhcp client renew all'],
+          };
+        }
+        if (rawText.includes('generic dns works') || rawText.includes('mist domains only'))
+          return {
+            text: 'Generic public hostname resolution works, but Mist domains do not.\nFocus on selective filtering, split-DNS, or upstream policy affecting Mist hostnames.',
+            commands: ['request dhcp client renew all'],
+          };
+        if (rawText.includes('hostname lookups still fail') || rawText.includes('dns lookup failure') || rawText.includes('mist hostname resolution failed'))
+          return {
+            text: `${reachableServers ? `Reachable DNS servers: ${reachableServers}\n` : ''}DNS is configured but hostname lookups are still failing.\nVerify the resolver IPs in use and confirm the upstream DNS service or policy allows DNS queries from this subnet.`,
+            commands: ['request dhcp client renew all'],
+          };
+        if (result.detail.includes('not reachable from the switch'))
+          return { text: 'The configured DNS server IPs are not reachable from the switch. Fix the upstream path or replace them with reachable resolvers.' };
         if (result.detail.includes('0 replies'))
           return { text: 'ICMP blocked — may be OK. Run Firewall Policy Check to verify TCP.' };
         return {};

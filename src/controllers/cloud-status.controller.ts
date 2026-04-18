@@ -67,6 +67,7 @@ export class CloudStatusController {
   startPolling(
     getMatchResult: () => MistMatchResult | null,
     isSerialConnected: () => boolean,
+    canRunBackgroundTask: () => boolean,
     intervalMs = 30000,
   ): void {
     this.stopPolling();
@@ -74,6 +75,7 @@ export class CloudStatusController {
     this.pollingIsSerialConnected = isSerialConnected;
     this.intervalId = setInterval(() => {
       if ((this.transientPauseCount > 0 || this.stagedPause) || !this.pollingGetMatchResult || !this.pollingIsSerialConnected) return;
+      if (!canRunBackgroundTask()) return;
       const matchResult = this.pollingGetMatchResult();
       if (!this.pollingIsSerialConnected()) return;
       void this.refresh(matchResult, this.pollingIsSerialConnected());

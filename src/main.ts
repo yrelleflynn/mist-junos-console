@@ -12,9 +12,10 @@ import { CommandRunnerService } from './services/command-runner.service';
 import { MistApiService } from './services/mist-api.service';
 import { TroubleshootService, CheckResult, CheckStatus } from './services/troubleshoot.service';
 import { SwitchIdentityService } from './services/switch-identity.service';
-import { ConfigDriftService, ConfigDiffLine } from './services/config-drift.service';
 import { ConfigSyncService, isConfigSyncStagingWarning } from './services/config-sync.service';
 import type { ConfigSyncActionResult } from './services/config-sync.service';
+import { DhcpRefreshService } from './services/dhcp-refresh.service';
+import type { DhcpRefreshResult, DhcpBindingChange } from './services/dhcp-refresh.service';
 import { RemoteSessionController } from './controllers/remote-session.controller';
 import { MistContextController } from './controllers/mist-context.controller';
 import { DeviceContextController } from './controllers/device-context.controller';
@@ -28,6 +29,7 @@ const SERIAL_PREFS_STORAGE_KEY = 'junos-console.serial-prefs';
 const LAST_PORT_LABEL_STORAGE_KEY = 'junos-console.last-port-label';
 const MIST_CLOUD_STORAGE_KEY = 'junos-console.mist-cloud-id';
 const MIST_ORG_STORAGE_KEY = 'junos-console.mist-org-id';
+const BACKGROUND_CONSOLE_IDLE_MS = 5000;
 
 type StoredSerialPrefs = {
   baudRate: string;
@@ -96,6 +98,7 @@ function init(): void {
     btnRunTroubleshoot: document.getElementById('btn-run-troubleshoot') as HTMLButtonElement,
     btnMistStatus: document.getElementById('btn-mist-status') as HTMLButtonElement,
     btnSslCheck: document.getElementById('btn-ssl-check') as HTMLButtonElement,
+    btnDhcpRefresh: document.getElementById('btn-dhcp-refresh') as HTMLButtonElement,
     tsResults: document.getElementById('ts-results') as HTMLElement,
 
     // Device Identity & Config
@@ -112,8 +115,6 @@ function init(): void {
     jmaRecommendation: document.getElementById('jma-recommendation') as HTMLElement,
     btnRootPassword: document.getElementById('btn-root-password') as HTMLButtonElement,
     rootPasswordResult: document.getElementById('root-password-result') as HTMLElement,
-    btnConfigDrift: document.getElementById('btn-config-drift') as HTMLButtonElement,
-    configDriftResults: document.getElementById('config-drift-results') as HTMLElement,
     btnConfigSyncPreview: document.getElementById('btn-config-sync-preview') as HTMLButtonElement,
     // configSyncResults → dynamic content area inside the results pane
     configSyncResults: document.getElementById('config-sync-content') as HTMLElement,
@@ -132,6 +133,8 @@ function init(): void {
     // Results panel (bottom horizontal panel)
     resultsPanel: document.getElementById('results-panel') as HTMLElement,
     resultsResizeHandle: document.getElementById('results-resize-handle') as HTMLElement,
+    guidancePanel: document.getElementById('guidance-panel') as HTMLElement,
+    guidanceResizeHandle: document.getElementById('guidance-resize-handle') as HTMLElement,
     resultsTabs: document.querySelectorAll<HTMLButtonElement>('.results-tab'),
     resultsPanes: document.querySelectorAll<HTMLElement>('.results-pane'),
   };
@@ -228,8 +231,8 @@ function init(): void {
   const mistApi = new MistApiService();
   const troubleshooter = new TroubleshootService(cmdRunner, mistApi);
   const switchIdentity = new SwitchIdentityService(cmdRunner, mistApi);
-  const configDrift = new ConfigDriftService();
   const configSync = new ConfigSyncService(cmdRunner, mistApi);
+  const dhcpRefresh = new DhcpRefreshService(cmdRunner);
   const promptDecoder = new TextDecoder();
   let recentConsoleTail = '';
   let cloudStatusLoopStarted = false;
@@ -240,6 +243,7 @@ function init(): void {
   let identifyInFlight = false;
   let cloudStatusRefreshInFlight = false;
   let latestJmaCode: number | null = null;
+  let lastUserConsoleInputAt = 0;
 
   // ---- Mist context controller ----
   const mistContext = new MistContextController(mistApi, {
@@ -304,6 +308,7 @@ function init(): void {
   const deviceContext = new DeviceContextController(switchIdentity, cmdRunner, {
     onIdentifyStarted(options) {
       identifyInFlight = true;
+      renderJmaRecommendation(latestJmaCode);
       const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
       if (identity) {
         renderDeviceSummary(identity);
@@ -315,6 +320,7 @@ function init(): void {
     },
     onIdentified(result, options) {
       identifyInFlight = false;
+      renderJmaRecommendation(latestJmaCode);
       const { identity, mistDevice, matchedBy } = result;
       resolvedMatchedSiteName = result.mistSiteName ?? null;
       // Update the top-strip summary with the freshest identity data.
@@ -336,7 +342,6 @@ function init(): void {
         }
       }
 
-      ui.btnConfigDrift.disabled = true;
       ui.btnConfigSyncPreview.disabled = true;
       ui.btnRootPassword.disabled = true;
       ui.btnOfflineTimeline.disabled = true;
@@ -378,7 +383,6 @@ function init(): void {
           }
         }
 
-        ui.btnConfigDrift.disabled = false;
         ui.btnConfigSyncPreview.disabled = !mistDevice.site_id;
         ui.btnRootPassword.disabled = !mistDevice.site_id;
         ui.btnOfflineTimeline.disabled = !mistDevice.site_id;
@@ -396,15 +400,18 @@ function init(): void {
 
       ui.deviceIdentity.innerHTML = '';
       cloudStatusRefreshInFlight = true;
+      renderJmaRecommendation(latestJmaCode);
       renderDeviceSummary(identity);
       void startLoggedInCloudStatusLoop(true).finally(() => {
         cloudStatusRefreshInFlight = false;
+        renderJmaRecommendation(latestJmaCode);
         renderDeviceSummary(identity);
       });
     },
     onIdentifyFailed(error, options) {
       identifyInFlight = false;
       cloudStatusRefreshInFlight = false;
+      renderJmaRecommendation(latestJmaCode);
       if (!options?.silent) {
         term.writeError(`Identification failed: ${error.message}`);
       }
@@ -529,6 +536,58 @@ function init(): void {
     ui.resultsResizeHandle.addEventListener('pointercancel', release);
   });
 
+  // ---- Guidance panel horizontal resizing ----
+  // The guidance panel is a grid column on #main. Resizing it means updating
+  // the grid-template-columns inline style on #main, not the panel width directly.
+  const GUIDANCE_WIDTH_STORAGE_KEY = 'junos-console.guidance-panel-width';
+  const GUIDANCE_MIN_WIDTH = 220;
+  const GUIDANCE_MAX_WIDTH = 520;
+
+  function clampGuidanceWidth(width: number): number {
+    return Math.max(GUIDANCE_MIN_WIDTH, Math.min(GUIDANCE_MAX_WIDTH, Math.round(width)));
+  }
+
+  function applyGuidanceWidth(width: number, persist = true): void {
+    const clamped = clampGuidanceWidth(width);
+    // Update the CSS variable used in the grid template
+    document.documentElement.style.setProperty('--guidance-panel-width', `${clamped}px`);
+    if (persist) {
+      window.localStorage.setItem(GUIDANCE_WIDTH_STORAGE_KEY, String(clamped));
+    }
+  }
+
+  const savedGuidanceWidth = Number(window.localStorage.getItem(GUIDANCE_WIDTH_STORAGE_KEY));
+  if (Number.isFinite(savedGuidanceWidth) && savedGuidanceWidth > 0) {
+    applyGuidanceWidth(savedGuidanceWidth, false);
+  }
+
+  ui.guidanceResizeHandle.addEventListener('pointerdown', (event) => {
+    event.preventDefault();
+    const pointerId = event.pointerId;
+    ui.guidanceResizeHandle.classList.add('is-dragging');
+    ui.guidanceResizeHandle.setPointerCapture(pointerId);
+
+    const move = (moveEvent: PointerEvent) => {
+      const mainRect = document.getElementById('main')!.getBoundingClientRect();
+      // Width = distance from the pointer to the right edge of #main
+      const desiredWidth = mainRect.right - moveEvent.clientX;
+      applyGuidanceWidth(desiredWidth, false);
+    };
+
+    const release = () => {
+      ui.guidanceResizeHandle.classList.remove('is-dragging');
+      const current = ui.guidancePanel.getBoundingClientRect().width;
+      applyGuidanceWidth(current, true);
+      ui.guidanceResizeHandle.removeEventListener('pointermove', move);
+      ui.guidanceResizeHandle.removeEventListener('pointerup', release);
+      ui.guidanceResizeHandle.removeEventListener('pointercancel', release);
+    };
+
+    ui.guidanceResizeHandle.addEventListener('pointermove', move);
+    ui.guidanceResizeHandle.addEventListener('pointerup', release);
+    ui.guidanceResizeHandle.addEventListener('pointercancel', release);
+  });
+
   // ---- Config sync staged-state UI management ----
 
   /**
@@ -564,9 +623,9 @@ function init(): void {
     // Workflows that would conflict with an open config-mode session.
     // Anything that mutates config must stay disabled for the full staged window.
     if (staged) {
-      ui.btnConfigDrift.disabled = true;
       ui.btnRunTroubleshoot.disabled = true;
       ui.btnSslCheck.disabled = true;
+      ui.btnDhcpRefresh.disabled = true;
       ui.btnOfflineTimeline.disabled = true;
       ui.btnAdopt.disabled = true;
     } else if (serial.isConnected) {
@@ -574,9 +633,9 @@ function init(): void {
       ui.btnRunTroubleshoot.disabled = false;
       ui.btnMistStatus.disabled = false;
       ui.btnSslCheck.disabled = false;
-      // Config drift / offline timeline re-enabled only if device is identified
+      ui.btnDhcpRefresh.disabled = false;
+      // Offline timeline re-enabled only if device is identified with a site
       const hasSite = !!deviceContext.matchResult?.mistDevice?.site_id;
-      ui.btnConfigDrift.disabled = !deviceContext.matchResult?.mistDevice;
       ui.btnOfflineTimeline.disabled = !hasSite;
       ui.btnAdopt.disabled = !serial.isConnected;
     }
@@ -609,12 +668,12 @@ function init(): void {
     ui.btnRunTroubleshoot.disabled = !connected;
     ui.btnMistStatus.disabled = !connected;
     ui.btnSslCheck.disabled = !connected;
+    ui.btnDhcpRefresh.disabled = !connected;
     ui.btnIdentify.disabled = !connected;
     ui.btnLogin.disabled = !connected;
     ui.btnAdopt.disabled = !connected;
-    // Config drift and sync only enabled after identification succeeds
+    // Config sync only enabled after identification succeeds
     if (!connected) {
-      ui.btnConfigDrift.disabled = true;
       ui.btnConfigSyncPreview.disabled = true;
       ui.btnRootPassword.disabled = true;
       ui.btnOfflineTimeline.disabled = true;
@@ -700,61 +759,44 @@ function init(): void {
   function buildDeviceSummaryLoadingMarkup(): string {
     const message = getDeviceSummaryLoadingMessage();
     if (!message) return '';
-    return `
-      <div class="device-summary-loading" role="status" aria-live="polite">
-        <div class="device-summary-loading-head">
-          <span class="device-summary-spinner" aria-hidden="true"></span>
-          <span class="device-summary-loading-text">${message}</span>
-        </div>
-        <div class="device-summary-loading-bar" aria-hidden="true">
-          <span class="device-summary-loading-bar-fill"></span>
-        </div>
-      </div>
-    `;
+    // Inline: spinner + short status text, rendered as a chip-like element
+    return `<span class="device-summary-loading-inline" role="status" aria-live="polite"><span class="device-summary-spinner" aria-hidden="true"></span><span class="device-summary-loading-text">${message}</span></span>`;
   }
 
   function renderDeviceSummaryPlaceholder(): void {
     const loadingMarkup = buildDeviceSummaryLoadingMarkup();
-    const placeholder = loadingMarkup
-      ? '<span class="device-summary-placeholder">Current session context will appear here as soon as the background checks complete.</span>'
-      : '<span class="device-summary-placeholder">Login or detect a prompt to gather hostname, serial, MAC, and model.</span>';
-    ui.deviceSummary.innerHTML = `${loadingMarkup}${placeholder}`;
+    ui.deviceSummary.innerHTML = loadingMarkup
+      ? loadingMarkup
+      : '<span class="device-summary-placeholder">Log in to identify the switch.</span>';
     ui.deviceSummary.classList.add('device-summary-empty');
   }
 
   /**
-   * Render the compact device summary strip with local identity fields.
+   * Render the session bar device summary as inline chips.
    * Called when background identify completes.
    */
   function renderDeviceSummary(identity: { hostname: string | null; serial: string | null; mac: string | null; model: string | null; junosVersion: string | null }): void {
-    const rows = [
-      ['Hostname', identity.hostname],
-      ['Model', identity.model],
-      ['Serial', identity.serial],
-      ['MAC', identity.mac],
-      ['Mist Org', getSelectedOrgName()],
-      ['Mist Site', getSelectedSiteName()],
-    ].filter(([, value]) => value);
+    const values = [
+      identity.hostname,
+      identity.model,
+      identity.serial,
+      identity.junosVersion,
+      getSelectedSiteName(),
+    ].filter(Boolean) as string[];
 
-    if (rows.length === 0) {
+    if (values.length === 0) {
       renderDeviceSummaryPlaceholder();
       return;
     }
 
-    ui.deviceSummary.innerHTML = `
-      ${buildDeviceSummaryLoadingMarkup()}
-      <div class="device-summary-grid">
-        ${rows
-          .map(
-            ([label, value]) => `
-              <div class="device-summary-row">
-                <span class="device-summary-label">${label}</span>
-                <span class="device-summary-value">${value}</span>
-              </div>`,
-          )
-          .join('')}
-      </div>
-    `;
+    const sep = '<span class="device-summary-sep" aria-hidden="true">·</span>';
+    const chips = values
+      .map((v) => `<span class="device-summary-item">${v}</span>`)
+      .join(sep);
+    const loading = buildDeviceSummaryLoadingMarkup();
+    ui.deviceSummary.innerHTML = loading
+      ? `${chips}${sep}${loading}`
+      : chips;
     ui.deviceSummary.classList.remove('device-summary-empty');
   }
 
@@ -777,14 +819,20 @@ function init(): void {
     if (localIdentifyInFlight) return localIdentifyPromise ?? Promise.resolve();
     if (deviceContext.localIdentity !== null) return Promise.resolve();
     localIdentifyInFlight = true;
+    renderJmaRecommendation(latestJmaCode);
     const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
     if (identity) {
       renderDeviceSummary(identity);
     } else {
       renderDeviceSummaryPlaceholder();
     }
-    localIdentifyPromise = deviceContext.runLocalIdentify().finally(() => {
+    localIdentifyPromise = (async () => {
+      await waitForConsoleIdle();
+      if (!serial.isConnected || configSync.hasStagedCandidate()) return;
+      await deviceContext.runLocalIdentify();
+    })().finally(() => {
       localIdentifyInFlight = false;
+      renderJmaRecommendation(latestJmaCode);
       localIdentifyPromise = null;
       if (mistContext.isConfigured) {
         maybeAutoMatchAfterMistSave();
@@ -806,12 +854,14 @@ function init(): void {
     }
 
     loggedInBootstrapPromise = (async () => {
+      renderJmaRecommendation(latestJmaCode);
       if (!cloudStatusLoopStarted) {
         await startLoggedInCloudStatusLoop();
       }
       await backgroundIdentify();
     })().finally(() => {
       loggedInBootstrapPromise = null;
+      renderJmaRecommendation(latestJmaCode);
     });
 
     await loggedInBootstrapPromise;
@@ -823,7 +873,31 @@ function init(): void {
     if (deviceContext.localIdentity === null) return;
     if (deviceContext.matchResult !== null) return;
     if (identifyInFlight) return;
-    void deviceContext.runIdentify({ silent: true });
+    void waitForConsoleIdle()
+      .then(() => {
+        if (!serial.isConnected) return;
+        if (configSync.hasStagedCandidate()) return;
+        if (identifyInFlight) return;
+        return deviceContext.runIdentify({ silent: true });
+      })
+      .catch(() => {});
+  }
+
+  function msSinceLastUserConsoleInput(): number {
+    if (!lastUserConsoleInputAt) return Number.POSITIVE_INFINITY;
+    return Date.now() - lastUserConsoleInputAt;
+  }
+
+  function isConsoleIdle(minIdleMs = BACKGROUND_CONSOLE_IDLE_MS): boolean {
+    return msSinceLastUserConsoleInput() >= minIdleMs;
+  }
+
+  async function waitForConsoleIdle(minIdleMs = BACKGROUND_CONSOLE_IDLE_MS, maxWaitMs = 15000): Promise<void> {
+    const startedAt = Date.now();
+    while (!isConsoleIdle(minIdleMs)) {
+      if (Date.now() - startedAt >= maxWaitMs) return;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
   }
 
   function formatUtcDisplay(iso: string | null): string | null {
@@ -890,7 +964,7 @@ function init(): void {
     renderJmaRecommendation(state.jma.code);
 
     ui.cloudStatusLastUpdated.textContent = state.lastUpdatedUtcIso
-      ? `Refreshed ${formatUtcDisplay(state.lastUpdatedUtcIso)}`
+      ? `Refreshed ${formatBrowserLocalDisplay(state.lastUpdatedUtcIso)}`
       : 'Not yet checked';
   }
 
@@ -911,6 +985,10 @@ function init(): void {
     }
   }
 
+  function isConsoleBackgroundWorkInFlight(): boolean {
+    return localIdentifyInFlight || identifyInFlight || cloudStatusRefreshInFlight || Boolean(loggedInBootstrapPromise);
+  }
+
   function renderJmaRecommendation(code: number | null): void {
     const recommendation = getJmaRecommendation(code);
     if (!recommendation) {
@@ -922,30 +1000,30 @@ function init(): void {
     const buttonLabel = recommendation.workflowRecommendation === 'skip'
       ? 'Run Checks Anyway'
       : 'Run Recommended Checks';
-    const buttonDisabled = !serial.isConnected || configSync.hasStagedCandidate();
+    const buttonDisabled = !serial.isConnected || configSync.hasStagedCandidate() || isConsoleBackgroundWorkInFlight();
 
     ui.jmaRecommendation.className = `jma-recommendation-card severity-${recommendation.severity}`;
     ui.jmaRecommendation.innerHTML = `
       <div class="jma-recommendation-header">
         <div>
-          <div class="jma-recommendation-eyebrow">JMA Guidance</div>
+          <div class="jma-recommendation-eyebrow">Cloud Connectivity Guidance</div>
           <div class="jma-recommendation-title">${escapeHtml(recommendation.title)}</div>
         </div>
         <span class="jma-recommendation-workflow">${escapeHtml(workflowRecommendationLabel(recommendation.workflowRecommendation))}</span>
       </div>
       <div class="jma-recommendation-sections">
         <div class="jma-recommendation-section">
-          <div class="jma-recommendation-section-title">What?</div>
+          <div class="jma-recommendation-section-title">What this state means</div>
           <div class="jma-recommendation-copy">${escapeHtml(recommendation.summary)}</div>
         </div>
         <div class="jma-recommendation-section">
-          <div class="jma-recommendation-section-title">So what?</div>
+          <div class="jma-recommendation-section-title">Why it matters</div>
           <div class="jma-recommendation-copy">${escapeHtml(recommendation.implication)}</div>
         </div>
         <div class="jma-recommendation-section">
-          <div class="jma-recommendation-section-title">What next?</div>
+          <div class="jma-recommendation-section-title">Recommended next steps</div>
           <div class="jma-recommendation-copy">${escapeHtml(recommendation.workflowNote)}</div>
-          <div class="jma-recommendation-subtitle">Recommended first checks</div>
+          <div class="jma-recommendation-subtitle">${recommendation.workflowRecommendation === 'skip' ? 'Optional checks if symptoms persist' : 'Recommended first checks'}</div>
           <ul class="jma-recommendation-list">
             ${recommendation.checks
               .map(
@@ -1002,11 +1080,13 @@ function init(): void {
       cloudStatusLoopStarted = false;
     }
     if (cloudStatusLoopStarted) return;
+    await waitForConsoleIdle();
     cloudStatusLoopStarted = true;
     await cloudStatus.refresh(deviceContext.matchResult, serial.isConnected);
     cloudStatus.startPolling(
       () => deviceContext.matchResult,
       () => serial.isConnected,
+      () => isConsoleIdle() && !configSync.hasStagedCandidate(),
       30000,
     );
   }
@@ -1081,6 +1161,7 @@ function init(): void {
   // ---- Terminal user input → serial ----
   term.onInput = async (data: string) => {
     if (serial.isConnected) {
+      lastUserConsoleInputAt = Date.now();
       try {
         await serial.writeString(data);
       } catch (err) {
@@ -1714,6 +1795,7 @@ function init(): void {
       const siteId = ui.mistSite.value;
       const uplinkPort = ui.tsUplinkPort.value.trim();
 
+      activateResultsTab('checks');
       ui.tsResults.innerHTML = '';
       ui.btnRunTroubleshoot.disabled = true;
 
@@ -1774,7 +1856,7 @@ function init(): void {
         return;
       }
 
-      openAccordionSection('troubleshooting');
+      activateResultsTab('checks');
       ui.tsResults.innerHTML = '';
 
       const title = `Recommended Checks — ${recommendation.title}`;
@@ -1819,6 +1901,7 @@ function init(): void {
   // ---- Mist Status (standalone) ----
   async function runMistStatus(): Promise<void> {
     await withCloudStatusPollingPaused(async () => {
+      activateResultsTab('checks');
       ui.tsResults.innerHTML = '';
       ui.btnMistStatus.disabled = true;
 
@@ -1853,6 +1936,7 @@ function init(): void {
         return;
       }
 
+      activateResultsTab('checks');
       ui.tsResults.innerHTML = '';
       ui.btnSslCheck.disabled = true;
 
@@ -1871,6 +1955,114 @@ function init(): void {
       term.writeSystem('— Firewall policy check complete —');
       ui.btnSslCheck.disabled = false;
     });
+  }
+
+  // ---- DHCP Refresh ----
+  async function runDhcpRefresh(): Promise<void> {
+    await withCloudStatusPollingPaused(async () => {
+      ui.tsResults.innerHTML = '';
+      ui.btnDhcpRefresh.disabled = true;
+
+      term.writeSystem('— Starting DHCP refresh (disable → commit → rollback → commit) —');
+
+      let result: DhcpRefreshResult;
+      try {
+        result = await dhcpRefresh.refresh();
+      } catch (err) {
+        ui.tsResults.innerHTML = `<div class="check-result-item check-status-fail"><span class="check-result-name">DHCP Refresh</span><span class="check-result-detail">${err instanceof Error ? err.message : String(err)}</span></div>`;
+        // Switch to Checks pane so the error is visible
+        activateResultsTab('checks');
+        ui.btnDhcpRefresh.disabled = false;
+        return;
+      }
+
+      ui.tsResults.innerHTML = renderDhcpRefreshResult(result);
+      // Switch to Checks pane *after* results are rendered so the tab
+      // highlights at the moment the user can actually see the content.
+      activateResultsTab('checks');
+      const summary = result.errors.length > 0
+        ? `completed with errors: ${result.errors[0]}`
+        : `completed — ${result.changes.filter((c) => c.outcome === 'renewed' || c.outcome === 'acquired').length}/${result.targetInterfaces.length} interface(s) refreshed`;
+      term.writeSystem(`— DHCP refresh ${summary} —`);
+      ui.btnDhcpRefresh.disabled = false;
+    });
+  }
+
+  function renderDhcpRefreshResult(result: DhcpRefreshResult): string {
+    if (result.errors.length > 0 && result.targetInterfaces.length === 0) {
+      return `<div class="check-result-item check-status-info"><span class="check-result-name">DHCP Refresh</span><span class="check-result-detail">${result.errors[0]}</span></div>`;
+    }
+
+    const outcomeLabel: Record<string, { label: string; status: string }> = {
+      renewed:     { label: 'Renewed',      status: 'pass' },
+      acquired:    { label: 'Acquired',      status: 'pass' },
+      unchanged:   { label: 'No change',     status: 'warn' },
+      'no-response': { label: 'No response', status: 'fail' },
+      lost:        { label: 'Lost',          status: 'fail' },
+      unknown:     { label: 'Unknown',       status: 'info' },
+    };
+
+    let html = '<div class="dhcp-refresh-result">';
+
+    // Commit status pills
+    html += '<div class="dhcp-refresh-commits">';
+    html += `<span class="dhcp-commit-pill ${result.commitDisableSuccess ? 'pill-pass' : 'pill-fail'}">Disable commit ${result.commitDisableSuccess ? '✓' : '✗'}</span>`;
+    html += `<span class="dhcp-commit-pill ${result.commitRestoreSuccess ? 'pill-pass' : 'pill-fail'}">Restore commit ${result.commitRestoreSuccess ? '✓' : '✗'}</span>`;
+    html += '</div>';
+
+    // Per-interface comparison table
+    html += '<table class="dhcp-refresh-table">';
+    html += '<thead><tr><th>Interface</th><th>Before</th><th>After</th><th>Result</th></tr></thead>';
+    html += '<tbody>';
+
+    for (const change of result.changes) {
+      const oc = outcomeLabel[change.outcome] ?? { label: change.outcome, status: 'info' };
+      const beforeIp = change.before?.ipAddress ?? '—';
+      const afterIp = change.after?.ipAddress ?? '—';
+      const beforeState = change.before?.state ?? '—';
+      const afterState = change.after?.state ?? '—';
+      const beforeLease = change.before?.leaseStart ? formatDhcpTime(change.before.leaseStart) : '—';
+      const afterLease = change.after?.leaseStart ? formatDhcpTime(change.after.leaseStart) : '—';
+
+      html += `<tr>
+        <td class="dhcp-iface"><code>${change.interface}</code></td>
+        <td class="dhcp-binding-cell">
+          <span class="dhcp-ip">${beforeIp}</span>
+          <span class="dhcp-state ${beforeState.toLowerCase()}">${beforeState}</span>
+          ${change.before?.leaseStart ? `<span class="dhcp-lease-time">lease ${beforeLease}</span>` : ''}
+        </td>
+        <td class="dhcp-binding-cell">
+          <span class="dhcp-ip">${afterIp}</span>
+          <span class="dhcp-state ${afterState.toLowerCase()}">${afterState}</span>
+          ${change.after?.leaseStart ? `<span class="dhcp-lease-time">lease ${afterLease}</span>` : ''}
+        </td>
+        <td><span class="dhcp-outcome dhcp-outcome-${oc.status}">${oc.label}</span></td>
+      </tr>`;
+    }
+
+    html += '</tbody></table>';
+
+    // Errors
+    for (const err of result.errors) {
+      html += `<div class="check-result-remediation">${err}</div>`;
+    }
+
+    html += '</div>';
+    return html;
+  }
+
+  function formatDhcpTime(utcString: string): string {
+    // Input: "2026-04-18 11:17:13 UTC" — convert to browser local timezone
+    // Normalise to an ISO-8601 string the Date constructor understands
+    const normalized = utcString.replace(/\s+UTC\s*$/, 'Z').replace(' ', 'T');
+    const date = new Date(normalized);
+    if (Number.isNaN(date.getTime())) return utcString;
+    return new Intl.DateTimeFormat(undefined, {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      timeZoneName: 'short',
+    }).format(date);
   }
 
   // ---- Login to Switch ----
@@ -2036,66 +2228,6 @@ function init(): void {
     });
   }
 
-  // ---- Config Drift Detection ----
-  async function checkConfigDrift(): Promise<void> {
-    await withCloudStatusPollingPaused(async () => {
-      if (!deviceContext.matchResult?.mistDevice || !deviceContext.matchResult?.mistConfig) {
-        ui.configDriftResults.innerHTML = '<div class="status-text error">Identify the switch first and ensure it is found in Mist.</div>';
-        return;
-      }
-
-      ui.btnConfigDrift.disabled = true;
-      activateResultsTab('config-drift');
-      ui.configDriftResults.innerHTML = '<div class="status-text info">Pulling running config…</div>';
-
-      term.writeSystem('— Checking config drift —');
-
-      try {
-      // Pull running config from the switch
-      term.writeSystem('  Pulling running config (this may take a moment)…');
-      const runningConfig = await switchIdentity.getRunningConfig();
-      term.writeSystem(`  Got ${runningConfig.split('\\n').length} config lines.`);
-
-      // Compare
-      const result = configDrift.compare(deviceContext.matchResult!.mistConfig, runningConfig);
-
-      // Render results
-      let html = '';
-
-      // Summary
-      const summaryClass = (result.mistOnlyLines.length + result.switchOnlyLines.length) === 0 ? 'clean' : 'drifted';
-      html += `<div class="drift-summary ${summaryClass}">${result.summary}<br>Mist: ${result.totalMistLines} lines | Switch: ${result.totalSwitchLines} lines | Matched: ${result.matchedLines}</div>`;
-      term.writeSystem(`  ${result.summary}`);
-
-      // Mist-only lines (in Mist config but not on switch)
-      if (result.mistOnlyLines.length > 0) {
-        html += '<div class="drift-section-title">In Mist but not on switch</div>';
-        for (const diff of result.mistOnlyLines) {
-          html += `<div class="drift-line mist-only"><span class="drift-category">${diff.category}</span>${escapeHtml(diff.line)}</div>`;
-        }
-      }
-
-      // Switch-only lines (on switch but not in Mist config)
-      if (result.switchOnlyLines.length > 0) {
-        html += '<div class="drift-section-title">On switch but not in Mist</div>';
-        for (const diff of result.switchOnlyLines) {
-          html += `<div class="drift-line switch-only"><span class="drift-category">${diff.category}</span>${escapeHtml(diff.line)}</div>`;
-        }
-      }
-
-      ui.configDriftResults.innerHTML = html;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ui.configDriftResults.innerHTML = `<div class="status-text error">Error: ${msg}</div>`;
-        term.writeError(`Config drift check failed: ${msg}`);
-      } finally {
-        ui.btnConfigDrift.disabled = false;
-      }
-
-      term.writeSystem('— Config drift check complete —');
-    });
-  }
-
   // ---- Config Sync Preview ----
   async function previewConfigSync(): Promise<void> {
     await withCloudStatusPollingPaused(async () => {
@@ -2126,7 +2258,7 @@ function init(): void {
         let html = '';
 
         // Candidate summary
-        html += '<div class="config-sync-section-title">Candidate</div>';
+        html += '<div class="config-sync-section-title">Config to Apply</div>';
         html += `<div class="config-sync-summary">` +
           `${result.candidateCommandCount} total commands — ` +
           `${result.cleanupCommandCount} cleanup deletes + ` +
@@ -2138,7 +2270,7 @@ function init(): void {
         const stagingErrors = result.stagingErrors.filter((e) => !isConfigSyncStagingWarning(e));
 
         if (stagingWarnings.length > 0) {
-          html += `<div class="config-sync-section-title">Staging Warnings (${stagingWarnings.length})</div>`;
+          html += `<div class="config-sync-section-title">Load Warnings (${stagingWarnings.length})</div>`;
           for (const w of stagingWarnings) {
             html +=
               `<div class="config-sync-warning">` +
@@ -2150,7 +2282,7 @@ function init(): void {
         }
 
         if (stagingErrors.length > 0) {
-          html += `<div class="config-sync-section-title">Staging Errors (${stagingErrors.length})</div>`;
+          html += `<div class="config-sync-section-title">Load Errors (${stagingErrors.length})</div>`;
           for (const err of stagingErrors) {
             html +=
               `<div class="config-sync-error">` +
@@ -2180,7 +2312,7 @@ function init(): void {
         }
 
         // Commit check (plain — output is already plain text, not a diff)
-        html += `<div class="config-sync-section-title">Commit Check ${checkLabel}</div>`;
+        html += `<div class="config-sync-section-title">Pre-commit Validation ${checkLabel}</div>`;
         if (result.commitCheckOutput.trim()) {
           html += `<pre class="config-sync-pre">${escapeHtml(result.commitCheckOutput)}</pre>`;
         }
@@ -2609,10 +2741,10 @@ function init(): void {
   ui.btnRunTroubleshoot.addEventListener('click', runTroubleshoot);
   ui.btnMistStatus.addEventListener('click', runMistStatus);
   ui.btnSslCheck.addEventListener('click', runSslCheck);
+  ui.btnDhcpRefresh.addEventListener('click', runDhcpRefresh);
   ui.btnIdentify.addEventListener('click', identifySwitch);
   ui.btnLogin.addEventListener('click', loginToSwitch);
   ui.btnRootPassword.addEventListener('click', getRootPassword);
-  ui.btnConfigDrift.addEventListener('click', checkConfigDrift);
   ui.btnConfigSyncPreview.addEventListener('click', previewConfigSync);
   ui.btnCommitSync.addEventListener('click', doCommitSync);
   ui.btnRollbackSync.addEventListener('click', doRollbackSync);
@@ -2655,7 +2787,7 @@ function init(): void {
   });
 
   // ---- Initial state ----
-  activateResultsTab('config-sync');
+  activateResultsTab('checks');
   setConnectedState(false);
   term.writeSystem('Junos Console ready. Click "Connect" to select a serial port.');
   term.focus();

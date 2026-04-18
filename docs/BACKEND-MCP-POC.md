@@ -69,7 +69,7 @@ Returns the JMA Connectivity State as self-reported by the switch — the switch
 
 ### `get_check_results`
 
-Returns structured results from the last 14-check cloud connectivity troubleshoot workflow run in the current session. Each check includes status, summary, remediation guidance, and raw evidence excerpt.
+Returns structured results from the last cloud-connectivity troubleshoot workflow run in the current session. Each check includes status, summary, remediation guidance, and raw evidence excerpt.
 
 - **Source**: `live_console` (via backend session state)
 - **Status**: Tool shape complete. Returns stub until frontend wires up the push.

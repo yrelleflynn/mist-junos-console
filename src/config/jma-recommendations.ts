@@ -107,21 +107,22 @@ const RECOMMENDATIONS: Record<number, JmaRecommendation> = {
     label: 'DNSLookupFailed',
     title: 'DNS lookup failed',
     summary: 'DNS servers are configured, but Mist hostnames are not resolving successfully.',
-    implication: 'The DNS servers may be wrong, unreachable, or returning failures. The cloud path itself may still be fine once name resolution is fixed.',
+    implication: 'The DNS servers may be wrong, unreachable, or blocked for DNS queries. The cloud path itself may still be fine once name resolution is fixed.',
     severity: 'fail',
     checks: [
       { id: 'dns-config', label: 'DNS Configuration', why: 'Check whether the configured DNS server IPs look correct.' },
-      { id: 'dns-resolution', label: 'DNS Resolution & Reachability', why: 'Test whether resolution fails outright or the servers are unreachable.' },
-      { id: 'route-to-mist', label: 'Route to Mist Endpoints', why: 'Confirm the switch has a route toward the DNS and cloud path.' },
-      { id: 'fw-check', label: 'Firewall Policy Check', why: 'Check whether DNS or outbound cloud traffic is being blocked or intercepted.' },
+      { id: 'dns-server-reachability', label: 'DNS Server Reachability', why: 'Verify that at least one configured DNS server is reachable from the switch before attempting lookups.' },
+      { id: 'dns-resolution', label: 'DNS Resolution', why: 'Test whether lookups fail generally or only for Mist domains once reachable DNS servers are confirmed.' },
     ],
     remediation: [
       'If the configured DNS servers are wrong or unreachable, correct them or add a known-good fallback.',
-      'If DNS reachability fails, verify the route and firewall policy to the DNS server IPs.',
-      'If resolution works only intermittently, compare with a public resolver to isolate whether the issue is local or upstream.',
+      'If DHCP supplies resolver IPs, consider `request dhcp client renew all` to refresh any stale leased DNS servers before troubleshooting further.',
+      'If the DNS server IPs are reachable but Junos says "no servers could be reached", focus on upstream DNS transport blocking such as firewall policy on UDP/TCP 53.',
+      'If the DNS server IPs are reachable but both Mist and public lookups still fail without that transport error, focus on the upstream DNS service or DNS-specific policy to those resolvers.',
+      'If public lookups work but Mist domains do not, focus on selective filtering, split-DNS, or upstream policy affecting Mist hostnames.',
     ],
     workflowRecommendation: 'targeted',
-    workflowNote: 'Target the DNS path first. Full workflow is optional if the targeted checks leave the issue ambiguous.',
+    workflowNote: 'Target the DNS path first. Do not run endpoint or certificate checks until name resolution is working again.',
   },
   108: {
     code: 108,
@@ -317,4 +318,3 @@ export function getJmaRecommendation(code: number | null): JmaRecommendation | n
   if (code == null) return null;
   return RECOMMENDATIONS[code] ?? null;
 }
-

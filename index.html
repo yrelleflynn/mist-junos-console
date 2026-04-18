@@ -34,18 +34,9 @@
             Connection
           </button>
           <div class="accordion-content open" id="accordion-connection">
-            <div class="connection-defaults-card">
-              <div class="connection-defaults-header">
-                <span class="connection-defaults-title">Juniper EX Serial Defaults</span>
-                <span class="connection-defaults-note">Fixed for this console</span>
-              </div>
-              <div class="connection-defaults-grid">
-                <div class="connection-defaults-item"><span>Baud</span><strong>9600</strong></div>
-                <div class="connection-defaults-item"><span>Data Bits</span><strong>8</strong></div>
-                <div class="connection-defaults-item"><span>Parity</span><strong>None</strong></div>
-                <div class="connection-defaults-item"><span>Stop Bits</span><strong>1</strong></div>
-                <div class="connection-defaults-item"><span>Flow Control</span><strong>None</strong></div>
-              </div>
+            <div class="connection-defaults-inline">
+              <span class="connection-defaults-label">EX Serial Defaults</span>
+              <code class="connection-defaults-value">9600 · 8N1 · No flow</code>
             </div>
 
             <div class="serial-defaults-hidden" aria-hidden="true">
@@ -146,10 +137,6 @@
             <div id="root-password-result"></div>
 
             <div class="sidebar-actions" style="margin-top:8px;">
-              <button id="btn-config-drift" class="btn btn-secondary" disabled>Check Config Drift</button>
-            </div>
-
-            <div class="sidebar-actions" style="margin-top:8px;">
               <button id="btn-config-sync-preview" class="btn btn-secondary" disabled>Preview Config Sync</button>
             </div>
 
@@ -179,7 +166,7 @@
             <input type="text" id="ts-uplink-port" placeholder="e.g. ge-0/0/0" autocomplete="off">
 
             <div class="sidebar-actions" style="margin-top:10px;">
-              <button id="btn-run-troubleshoot" class="btn btn-primary" disabled>Run Cloud Check</button>
+              <button id="btn-run-troubleshoot" class="btn btn-primary" disabled>Run Diagnostics</button>
             </div>
             <div class="sidebar-actions" style="margin-top:6px;">
               <button id="btn-mist-status" class="btn btn-secondary" disabled>Mist Status</button>
@@ -187,8 +174,9 @@
             <div class="sidebar-actions" style="margin-top:6px;">
               <button id="btn-ssl-check" class="btn btn-secondary" disabled>Firewall Policy Check</button>
             </div>
-
-            <div id="ts-results"></div>
+            <div class="sidebar-actions" style="margin-top:6px;">
+              <button id="btn-dhcp-refresh" class="btn btn-secondary" disabled>DHCP Refresh</button>
+            </div>
           </div>
         </div>
 
@@ -201,53 +189,14 @@
 
       <section id="workspace">
         <div id="workspace-top-strip" class="workspace-strip workspace-strip-top">
-          <div class="workspace-card status-header-card">
-            <div class="workspace-card-header">
-              <span class="workspace-card-title">Live Session Header</span>
-              <button id="btn-clear" class="btn btn-secondary btn-sm">Clear Terminal</button>
+          <div class="session-bar">
+            <span class="session-bar-label">Port</span>
+            <span id="selected-port" class="session-bar-port-value">None selected</span>
+            <span class="session-bar-divider" aria-hidden="true"></span>
+            <div id="device-summary" class="device-summary device-summary-empty">
+              <span class="device-summary-placeholder">Log in to identify the switch.</span>
             </div>
-            <div class="status-header-grid">
-              <div class="status-header-section">
-                <div class="status-header-section-title">Serial Session</div>
-                <div class="session-overview-grid">
-                  <div class="session-overview-item">
-                    <span class="session-overview-label">Port</span>
-                    <span id="selected-port" class="session-overview-value">Selected Port: None selected</span>
-                  </div>
-                  <div class="session-overview-item">
-                    <span class="session-overview-label">Console</span>
-                    <span class="session-overview-value">Live terminal below. Use the sidebar for login, identify, and recovery actions.</span>
-                  </div>
-                </div>
-              </div>
-
-              <div class="status-header-section">
-                <div class="status-header-section-title">Device Identity</div>
-                <div id="device-summary" class="device-summary device-summary-empty">
-                  <span class="device-summary-placeholder">Login or detect a prompt to gather hostname, serial, MAC, and model.</span>
-                </div>
-              </div>
-
-              <div id="cloud-status-panel" class="status-header-section cloud-status-panel">
-                <div class="cloud-status-panel-header">
-                  <span class="status-header-section-title">Cloud Status</span>
-                  <span id="cloud-status-last-updated" class="cloud-status-panel-meta">Not yet checked</span>
-                </div>
-                <div class="cloud-status-grid">
-                  <div class="cloud-status-card">
-                    <div class="cloud-status-card-label">Mist Status</div>
-                    <span id="mist-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
-                    <div id="mist-monitor-detail" class="cloud-status-card-detail">Identify and match the switch in Mist to enable Mist status monitoring.</div>
-                  </div>
-                  <div class="cloud-status-card">
-                    <div class="cloud-status-card-label">JMA Connectivity State</div>
-                    <span id="jma-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
-                    <div id="jma-monitor-detail" class="cloud-status-card-detail">Log in or detect a Junos CLI prompt to start the switch-reported cloud status monitor.</div>
-                  </div>
-                </div>
-                <div id="jma-recommendation" class="jma-recommendation-card jma-recommendation-hidden" aria-live="polite"></div>
-              </div>
-            </div>
+            <button id="btn-clear" class="btn btn-secondary btn-sm session-bar-clear-btn">Clear Terminal</button>
           </div>
         </div>
 
@@ -267,13 +216,19 @@
         <div id="results-panel">
           <div id="results-panel-tabs">
             <span class="results-panel-label">Results</span>
+            <button class="results-tab" data-pane="checks">Checks</button>
             <button class="results-tab" data-pane="config-sync">Config Sync</button>
-            <button class="results-tab" data-pane="config-drift">Config Drift</button>
-            <button class="results-tab" data-pane="timeline">Timeline</button>
+<button class="results-tab" data-pane="timeline">Timeline</button>
             <div class="results-panel-spacer"></div>
             <span id="mist-api-status" class="status-text results-api-status"></span>
           </div>
           <div id="results-panel-body">
+            <!-- Checks pane: diagnostic check results live here, not in the sidebar -->
+            <div class="results-pane results-pane-hidden" id="checks-results">
+              <div id="ts-results">
+                <div class="results-pane-empty">Run <strong>Diagnostics</strong> to see check results here.</div>
+              </div>
+            </div>
             <div class="results-pane" id="config-sync-results">
               <div id="config-sync-content">
                 <div class="results-pane-empty">Run <strong>Preview Config Sync</strong> to see the staged diff and commit-check result here.</div>
@@ -289,15 +244,43 @@
                 </div>
               </div>
             </div>
-            <div class="results-pane results-pane-hidden" id="config-drift-results">
-              <div class="results-pane-empty">Run <strong>Check Config Drift</strong> to see Mist-vs-switch config differences here.</div>
-            </div>
-            <div class="results-pane results-pane-hidden" id="timeline-results">
+<div class="results-pane results-pane-hidden" id="timeline-results">
               <div class="results-pane-empty">Run <strong>Offline Timeline</strong> to see Mist event history and switch logs here.</div>
             </div>
           </div>
         </div>
       </section>
+
+      <!-- Right guidance panel: cloud status pills + JMA recommendation card -->
+      <!-- Moved out of session header so it has a fixed column and doesn't compress the terminal -->
+      <aside id="guidance-panel">
+        <div
+          id="guidance-resize-handle"
+          class="guidance-resize-handle"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize guidance panel"
+        ></div>
+        <div id="cloud-status-panel" class="guidance-cloud-status">
+          <div class="cloud-status-panel-header">
+            <span class="guidance-panel-title">Cloud Status</span>
+            <span id="cloud-status-last-updated" class="cloud-status-panel-meta">Not yet checked</span>
+          </div>
+          <div class="cloud-status-grid">
+            <div class="cloud-status-card">
+              <div class="cloud-status-card-label">Mist Status</div>
+              <span id="mist-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
+              <div id="mist-monitor-detail" class="cloud-status-card-detail">Identify and match the switch in Mist to enable Mist status monitoring.</div>
+            </div>
+            <div class="cloud-status-card">
+              <div class="cloud-status-card-label">Switch Cloud State</div>
+              <span id="jma-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
+              <div id="jma-monitor-detail" class="cloud-status-card-detail">Log in to start the switch-reported cloud status monitor.</div>
+            </div>
+          </div>
+        </div>
+        <div id="jma-recommendation" class="jma-recommendation-card jma-recommendation-hidden" aria-live="polite"></div>
+      </aside>
 
     </div>
 

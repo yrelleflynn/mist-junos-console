@@ -227,21 +227,26 @@ these first and treat failures here as blocking.
 | Severity | `fail` (red) |
 | Top check (P1) | `dns-config` — DNS Configuration |
 | Top check (P2) | `dns-resolution` — DNS Resolution & Reachability |
-| Top check (P3) | `route-to-mist` — Route to Mist Endpoints |
-| Further checks | `fw-check` |
-| Remediation themes | DNS server reachability, alternate DNS fallback, firewall path to DNS |
+| Top check (P3) | — |
+| Further checks | None by default — stay on DNS-specific evidence first |
+| Remediation themes | DNS server reachability, both-public-and-Mist failure, public-DNS-works-but-Mist-fails, alternate DNS fallback |
 | Workflow | `targeted` |
 
 **Should be visible:**
 - `fail` severity indicator
 - `dns-config` and `dns-resolution` as top two checks
 - Remediation mentions trying an alternate DNS server to isolate the problem
+- DNS interpretation distinguishes:
+  - configured DNS servers unreachable
+  - DNS servers reachable but all lookups fail
+  - public DNS works while Mist domains fail
 - Note distinguishing this from `113 NoDNSResponse` if both are present
 
 **Should NOT appear:**
 - `mist-processes` or `mist-agent` as primary suggestions — the switch has not reached the cloud layer yet
 - Full workflow as the primary recommendation
 - Any claim that the switch is close to connecting
+- `route-to-mist`, `fw-check`, or certificate checks as default first-pass actions for this state
 
 ---
 
@@ -552,7 +557,7 @@ turns green and no remediation or workflow buttons are prominently displayed.
 Troubleshoot" as the primary or only CTA.
 
 **Why it matters:** These states have specific, narrow failure modes. The full
-14-check workflow is premature and adds 2–3 minutes of unnecessary checks.
+full troubleshoot workflow is premature and adds 2–3 minutes of unnecessary checks.
 The operator looks at a wall of results when only 2–3 checks matter.
 
 **Correct:** These states have `workflowRecommendation: 'targeted'`. The UI
@@ -698,7 +703,7 @@ recommendation data accidentally uses `dns-resolve` instead of `dns-resolution`,
 check dispatch will fail silently. Verify the exact string against the service.
 
 **Risk 2 — 106 vs 113 differentiation**
-Both states start with `dns-config` → `dns-resolution` → `route-to-mist`. If
+Both states start with `dns-config` → `dns-resolution`. If
 the recommendation rendering logic shares a template for these two states without
 state-specific summary text, they will appear identical. The differentiation only
 matters in the summary text and secondary remediation guidance — confirm those

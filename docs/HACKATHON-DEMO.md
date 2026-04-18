@@ -144,7 +144,7 @@ The detection and diagnosis portions (Steps 1–4) do not require the switch to 
 | Connect | No install, no SSH, browser-native Web Serial |
 | Identify | Device auto-matched to Mist inventory |
 | JMA state | Switch's own cloud view, not just Mist's guess |
-| Troubleshoot | 14 checks, gated, structured, with remediation |
+| Troubleshoot | Structured cloud-connectivity checks, gated with remediation |
 | Config drift | Mist intent vs live switch, inline in the console workflow |
 | Staged sync | Candidate staged, operator approves commit — not auto-applied |
 | Commit | Operator-approved application after staged diff + commit check |
@@ -156,7 +156,7 @@ The detection and diagnosis portions (Steps 1–4) do not require the switch to 
 
 **Q: How is this different from just using a terminal and the Mist UI?**
 
-A: The Mist UI and a terminal are two separate tools with no shared state. This tool brings Mist context — inventory, intended config, device status, cloud connectivity — directly into the console session. The 14-check troubleshoot workflow runs structured diagnostics that would take an experienced engineer 10–15 minutes to run manually. Config sync stages the exact Mist diff, runs commit check, and gives the operator a structured approve/rollback choice rather than asking them to copy-paste commands.
+A: The Mist UI and a terminal are two separate tools with no shared state. This tool brings Mist context — inventory, intended config, device status, cloud connectivity — directly into the console session. The cloud-connectivity troubleshoot workflow runs structured diagnostics that would take an experienced engineer 10–15 minutes to run manually. Config sync stages the exact Mist diff, runs commit check, and gives the operator a structured approve/rollback choice rather than asking them to copy-paste commands.
 
 **Q: Why does the operator still need to approve the commit? Could this be fully automated?**
 

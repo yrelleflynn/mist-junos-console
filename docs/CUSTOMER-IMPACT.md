@@ -110,7 +110,7 @@ The tool is deployed today as an internal-facing application and can be used imm
 - Web Serial terminal
 - Device identification
 - JMA Connectivity State and Mist Status monitoring
-- 14-check automated troubleshooting
+- structured cloud-connectivity troubleshooting workflow
 - Config drift comparison
 - Staged config sync with Commit Confirmed, Commit, and Rollback
 - Remote session mirroring

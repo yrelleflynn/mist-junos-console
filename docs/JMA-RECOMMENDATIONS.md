@@ -7,7 +7,7 @@ This document provides a structured per-state recommendation mapping for the UI 
 - what the state usually means in operator terms
 - which checks to surface first (using canonical check IDs from `troubleshoot.service.ts`)
 - what remediation guidance to show
-- whether running the full 14-check troubleshoot workflow is recommended, optional, or usually unnecessary
+- whether running the full troubleshoot workflow is recommended, optional, or usually unnecessary
 
 This is intended as an implementation reference — the frontend can consume the data shape in the [Frontend Data Shape](#frontend-data-shape) section directly.
 
@@ -153,23 +153,23 @@ This is a simple configuration gap. Full workflow is not needed unless DNS is re
 ### 106 — DNSLookupFailed
 
 **What it usually means:**
-DNS servers are configured, but the switch cannot resolve Mist hostnames. The DNS servers are present in config but are not answering or are returning failures.
+DNS servers are configured, but the switch cannot resolve Mist hostnames. The DNS servers may be wrong, unreachable, or blocked for actual DNS queries even if they still answer pings.
 
 **First checks (in order):**
 1. `dns-config` — confirm the configured DNS server IPs look correct
-2. `dns-resolution` — test resolution of Mist hostnames and confirm whether the servers are network-reachable
-
-**Then if DNS path is suspected:**
-3. `route-to-mist` — verify a route exists toward the DNS server IPs and Mist destination IPs
-4. `fw-check` — test if outbound UDP/53 or TCP/53 is being blocked
+2. `dns-resolution` — confirm whether Junos can reach and query configured DNS servers
+3. `dns-resolution` — test whether public lookups work, whether Mist domains are selectively failing, or whether Junos reports that no DNS servers can be reached
 
 **Remediation guidance:**
-- If DNS server is reachable but resolution fails: try an alternate DNS server (e.g. 8.8.8.8) to isolate whether the issue is with the configured server or DNS zone behavior
-- If DNS server is not reachable: check the route and firewall path to the DNS server IP
-- If SSL inspection is detected by `fw-check`: check whether the DNS-over-HTTPS path is affected
+- If the configured DNS servers are unreachable: verify the route or firewall path to those resolver IPs
+- If resolver IPs were learned from DHCP and may be stale: refresh them with `request dhcp client renew all`
+- If the configured DNS servers are reachable but Junos says `no servers could be reached`: focus on upstream DNS transport blocking such as firewall policy on UDP/TCP 53
+- If the configured DNS servers are reachable but both public and Mist lookups still fail without that transport error: focus on the upstream DNS service or DNS-specific blocking
+- If public lookups work but Mist domains do not: focus on selective filtering, split-DNS, or upstream policy affecting Mist hostnames
+- If needed, test with an alternate DNS server (for example 8.8.8.8) to isolate whether the issue is local to the configured resolvers
 
 **Workflow recommendation:** `targeted`
-Usually resolved by DNS check and route check. Full workflow is optional but useful if the failure is ambiguous.
+Usually resolved by DNS-specific checks. Do not move to endpoint or certificate checks until name resolution is working again.
 
 ---
 
@@ -393,7 +393,7 @@ The following TypeScript interface describes the recommended data structure for 
 /**
  * Workflow recommendation levels for a given JMA state.
  *
- *  full           — Run the complete 14-check troubleshoot workflow.
+ *  full           — Run the complete troubleshoot workflow.
  *                   Useful when the state is high in the connectivity chain
  *                   and lower layers need confirming first.
  *
@@ -536,7 +536,7 @@ This table summarizes first-pass check ordering per state for easy reference dur
 | 103 NoDefaultGateway | `default-route` | `dhcp-lease` | `mgmt-ip` | targeted |
 | 104 DefaultGatewayUnreachable | `arp` | `port-status` | `interface-errors` | targeted→full |
 | 105 NoDNS | `dns-config` | `dhcp-lease` | — | targeted |
-| 106 DNSLookupFailed | `dns-config` | `dns-resolution` | `route-to-mist` | targeted |
+| 106 DNSLookupFailed | `dns-config` | `dns-resolution` | — | targeted |
 | 108 CloudUnreachable | `route-to-mist` | `cloud-connections` | `fw-check` | **full** |
 | 109 CloudAuthFailure | `mist-processes` | `mist-agent` | `outbound-ssh-config` | targeted |
 | 110 ServiceDown | `mist-processes` | `mist-agent` | `switch-logs` | targeted |

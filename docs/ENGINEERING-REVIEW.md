@@ -28,9 +28,9 @@ Impact:
 - difficult to evolve per-check behavior without regressions
 - hard to support multiple device families or troubleshooting modes later
 
-### 3. No automated tests
+### 3. Automated tests are still limited
 
-- no test files were found in `src/` or `server/`
+- the current suite still has major gaps in parser and workflow coverage
 
 Impact:
 

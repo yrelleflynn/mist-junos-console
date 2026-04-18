@@ -62,6 +62,7 @@ Work is done when:
 - acceptance criteria are met
 - code paths are verified manually or automatically
 - docs are updated if behavior or architecture changed
+- terminology stays aligned across docs (for example avoid hardcoded check counts unless the count itself is the subject)
 - follow-up debt is captured explicitly instead of left implicit
 
 ## PR Structure

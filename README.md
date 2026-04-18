@@ -317,7 +317,7 @@ Ideas and follow-ups (not committed work). Add or tick items as you go.
 - Modular troubleshoot: first segment (**LLDP → upstream → port → errors**) driven by **`TroubleshootStep`** queue
 - Node backend (`server/index.mjs`): Mist **`/mist-proxy`**, **`/health`**, WebSocket **`/ws`** for shared console sessions
 - Operator **remote session** checkbox + **`support.html`** for remote view/type (session ID acts as shared secret; add auth before wider rollout)
-- Vite proxies `/mist-proxy` and `/ws` to the backend; `npm run dev` starts both processes
+- Vite proxies `/mist-proxy` to the backend; console WebSocket uses direct `ws://127.0.0.1:<port>/ws` in dev; `npm run dev` starts both processes
 - Serial **`tx`** events for mirroring operator-originated bytes without echoing support-injected bytes back as operator traffic
 
 ### v0.6.0

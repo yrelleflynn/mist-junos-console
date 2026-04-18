@@ -294,11 +294,14 @@ export class CommandRunnerService {
         await this.execute('exit', 5000, 2000, options);
       }
     } else if (mode === 'shell') {
-      // Exit shell, then enter CLI
-      await this.sendAndWaitFor('exit\n', />\s*$|#\s*$|login:/i, 3000, options);
+      // On EX, `exit` from `start shell` usually returns straight to CLI.
+      await this.sendAndWaitFor('exit\n', />\s*$|#\s*$|%\s*$|login:/i, 3000, options);
       await new Promise((r) => setTimeout(r, 1000));
-      await this.sendAndWaitFor('cli\n', />\s*$|#\s*$|login:/i, 5000, options);
-      await new Promise((r) => setTimeout(r, 1500));
+      const modeAfterExit = await this.detectMode(options);
+      if (modeAfterExit === 'shell') {
+        await this.sendAndWaitFor('cli\n', />\s*$|#\s*$|login:/i, 5000, options);
+        await new Promise((r) => setTimeout(r, 1500));
+      }
     }
 
     // Disable pagination
@@ -327,5 +330,26 @@ export class CommandRunnerService {
 
     // Now in operational mode — enter config
     await this.execute('configure', 5000);
+  }
+
+  /**
+   * Ensure the CLI is in the shell prompt (`%`).
+   * Exits config mode if needed, then enters shell from operational mode.
+   */
+  async ensureShellMode(options: CommandExecutionOptions = {}): Promise<void> {
+    const mode = await this.detectMode(options);
+
+    if (mode === 'shell') return;
+
+    if (mode === 'config') {
+      await this.ensureOperationalMode(options);
+    } else if (mode === 'login') {
+      throw new Error('Cannot enter shell while at the login prompt');
+    }
+
+    const shellResult = await this.sendAndWaitFor('start shell\n', /%\s*$|login:/i, 5000, options);
+    if (!shellResult.matched || !/%\s*$/.test(shellResult.output.trimEnd())) {
+      throw new Error('Could not enter shell mode');
+    }
   }
 }
