@@ -1544,6 +1544,162 @@ html, body {
   border-color: rgba(139, 148, 158, 0.3);
 }
 
+.jma-recommendation-card {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: var(--radius);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.015)),
+    rgba(255, 255, 255, 0.02);
+}
+
+.jma-recommendation-hidden {
+  display: none;
+}
+
+.jma-recommendation-card.severity-fail {
+  border-color: rgba(218, 54, 51, 0.35);
+  background:
+    linear-gradient(180deg, rgba(218, 54, 51, 0.08), rgba(218, 54, 51, 0.03)),
+    rgba(255, 255, 255, 0.02);
+}
+
+.jma-recommendation-card.severity-warn {
+  border-color: rgba(227, 179, 65, 0.35);
+  background:
+    linear-gradient(180deg, rgba(227, 179, 65, 0.1), rgba(227, 179, 65, 0.03)),
+    rgba(255, 255, 255, 0.02);
+}
+
+.jma-recommendation-card.severity-pass {
+  border-color: rgba(35, 134, 54, 0.35);
+  background:
+    linear-gradient(180deg, rgba(35, 134, 54, 0.08), rgba(35, 134, 54, 0.03)),
+    rgba(255, 255, 255, 0.02);
+}
+
+.jma-recommendation-card.severity-info {
+  border-color: rgba(139, 148, 158, 0.3);
+}
+
+.jma-recommendation-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.jma-recommendation-eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.jma-recommendation-title {
+  margin-top: 4px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.jma-recommendation-workflow {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(139, 148, 158, 0.28);
+  background: rgba(139, 148, 158, 0.12);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.jma-recommendation-sections {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.jma-recommendation-section {
+  min-width: 0;
+  padding: 10px;
+  border-radius: var(--radius);
+  background: rgba(15, 19, 26, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.jma-recommendation-section-title,
+.jma-recommendation-subtitle {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.jma-recommendation-copy {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+
+.jma-recommendation-subtitle {
+  margin-top: 12px;
+}
+
+.jma-recommendation-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 8px;
+  color: var(--text-primary);
+}
+
+.jma-recommendation-list li {
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.jma-recommendation-list li strong {
+  display: block;
+  color: var(--text-primary);
+}
+
+.jma-recommendation-list li span {
+  color: var(--text-secondary);
+}
+
+.jma-recommendation-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+}
+
+@media (max-width: 1200px) {
+  .jma-recommendation-sections {
+    grid-template-columns: 1fr;
+  }
+
+  .jma-recommendation-header {
+    flex-direction: column;
+  }
+
+  .jma-recommendation-workflow {
+    align-self: flex-start;
+  }
+}
+
 /* ---- Config Drift Results ---- */
 #config-drift-results {
   margin-top: 10px;

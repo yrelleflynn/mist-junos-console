@@ -65,6 +65,10 @@ export interface TroubleshootOptions {
   onProgress: CheckProgressCallback;
 }
 
+export interface RecommendedChecksOptions extends TroubleshootOptions {
+  checkIds: string[];
+}
+
 /** Mutable context for the modular troubleshoot step queue (Juniper EX). */
 export interface TroubleshootContext {
   cloud: MistCloud;
@@ -275,6 +279,240 @@ export class TroubleshootService {
     const mistResults = await this.checkMistCloudStatus(ipResult.mgmtIp, cloud, options.siteId, options.deviceId);
     for (const r of mistResults) {
       report(r);
+    }
+
+    return results;
+  }
+
+  /**
+   * Run a targeted subset of troubleshooting checks in a caller-specified order.
+   * Used by the JMA recommendation UI to keep the first-pass workflow focused.
+   */
+  async runRecommendedChecks(options: RecommendedChecksOptions): Promise<CheckResult[]> {
+    const results: CheckResult[] = [];
+    const reportedIds = new Set<string>();
+    const requested = [...new Set(options.checkIds)];
+    const ctx: TroubleshootContext = {
+      cloud: options.cloud,
+      uplinkPort: options.uplinkPort || '',
+      uplinkNeighbor: null,
+      upstreamConfig: null,
+      siteId: options.siteId,
+      deviceId: options.deviceId,
+    };
+
+    let mgmtIp: string | null | undefined;
+    let timelineCache: CheckResult[] | null = null;
+
+    const report = (result: CheckResult) => {
+      results.push(result);
+      options.onProgress(result);
+      reportedIds.add(result.id);
+    };
+
+    const ensureMgmtIp = async (): Promise<string | null> => {
+      if (mgmtIp !== undefined) return mgmtIp;
+      const ipResult = await this.checkInterfaceIp();
+      mgmtIp = ipResult.mgmtIp;
+      if (!reportedIds.has(ipResult.result.id)) {
+        report(ipResult.result);
+      }
+      return mgmtIp;
+    };
+
+    const ensureUplink = async (): Promise<void> => {
+      if (ctx.uplinkPort) return;
+      const lldpResult = await this.checkLldp(ctx.uplinkPort);
+      if (!ctx.uplinkPort && lldpResult.detectedPort) {
+        ctx.uplinkPort = lldpResult.detectedPort;
+      }
+      ctx.uplinkNeighbor = lldpResult.uplinkNeighbor;
+      if (!reportedIds.has('lldp')) {
+        report(lldpResult.result);
+      }
+    };
+
+    const ensureUpstreamConfig = async (): Promise<void> => {
+      if (ctx.upstreamConfig || !ctx.uplinkNeighbor) return;
+      const upstreamResult = await this.lookupUpstreamPortConfig(ctx.uplinkNeighbor);
+      ctx.upstreamConfig = upstreamResult.config;
+      if (!reportedIds.has(upstreamResult.result.id)) {
+        report(upstreamResult.result);
+      }
+    };
+
+    const ensureTimeline = async (): Promise<CheckResult[]> => {
+      if (timelineCache) return timelineCache;
+      timelineCache = await this.checkOfflineTimeline(options.siteId, options.deviceId);
+      return timelineCache;
+    };
+
+    const reportMissingUplink = (id: string, name: string): void => {
+      report({
+        id,
+        name,
+        status: 'skip',
+        detail: 'Skipped — no uplink port was supplied or auto-detected from LLDP.',
+      });
+    };
+
+    await this.runner.ensureOperationalMode();
+
+    for (const checkId of requested) {
+      if (reportedIds.has(checkId) && checkId !== 'fw-check') continue;
+
+      switch (checkId) {
+        case 'lldp': {
+          await ensureUplink();
+          break;
+        }
+        case 'upstream-port-config': {
+          await ensureUplink();
+          if (!ctx.uplinkNeighbor) {
+            report({
+              id: 'upstream-port-config',
+              name: 'Upstream Switch Port Config',
+              status: 'skip',
+              detail: 'Skipped — no LLDP uplink neighbor was detected.',
+            });
+            break;
+          }
+          await ensureUpstreamConfig();
+          break;
+        }
+        case 'port-status': {
+          if (!ctx.uplinkPort) await ensureUplink();
+          if (!ctx.uplinkPort) {
+            reportMissingUplink('port-status', 'Uplink Port Status');
+            break;
+          }
+          report(await this.checkPortStatus(ctx.uplinkPort));
+          break;
+        }
+        case 'interface-errors': {
+          if (!ctx.uplinkPort) await ensureUplink();
+          if (!ctx.uplinkPort) {
+            reportMissingUplink('interface-errors', 'Uplink Interface Errors');
+            break;
+          }
+          report(await this.checkInterfaceErrors(ctx.uplinkPort));
+          break;
+        }
+        case 'vlan-config': {
+          if (!ctx.uplinkPort) await ensureUplink();
+          if (!ctx.uplinkPort) {
+            reportMissingUplink('vlan-config', 'VLAN Configuration');
+            break;
+          }
+          report(await this.checkVlanConfig(ctx.uplinkPort));
+          break;
+        }
+        case 'uplink-config-compare': {
+          if (!ctx.uplinkPort) await ensureUplink();
+          if (!ctx.uplinkNeighbor) await ensureUplink();
+          await ensureUpstreamConfig();
+          if (!ctx.uplinkPort || !ctx.upstreamConfig) {
+            report({
+              id: 'uplink-config-compare',
+              name: 'Uplink Config Match',
+              status: 'skip',
+              detail: 'Skipped — local uplink or upstream switch config could not be determined.',
+            });
+            break;
+          }
+          const compResults = await this.compareUplinkConfig(
+            ctx.uplinkPort,
+            ctx.upstreamConfig,
+            options.siteId,
+            options.deviceId,
+          );
+          for (const result of compResults) report(result);
+          break;
+        }
+        case 'mgmt-ip': {
+          await ensureMgmtIp();
+          break;
+        }
+        case 'dhcp-lease': {
+          report(await this.checkDhcpLease());
+          break;
+        }
+        case 'arp': {
+          report(await this.checkArp());
+          break;
+        }
+        case 'default-route': {
+          report(await this.checkDefaultRoute());
+          break;
+        }
+        case 'dns-config': {
+          report(await this.checkDnsConfig());
+          break;
+        }
+        case 'dns-resolution': {
+          report(await this.checkDnsResolution(options.cloud));
+          break;
+        }
+        case 'route-to-mist': {
+          report(await this.checkRouteToMistEndpoints(options.cloud));
+          break;
+        }
+        case 'fw-check': {
+          const fwResults = await this.checkFirewallPolicy(options.cloud);
+          for (const result of fwResults) report(result);
+          break;
+        }
+        case 'mist-agent': {
+          report(await this.checkMistAgentVersion());
+          break;
+        }
+        case 'mist-processes': {
+          report(await this.checkMistAgentProcesses());
+          break;
+        }
+        case 'outbound-ssh-config': {
+          const sshResult = await this.checkOutboundSshConfig();
+          report(sshResult.result);
+          break;
+        }
+        case 'cloud-connections': {
+          report(await this.checkActiveCloudConnections(await ensureMgmtIp(), options.cloud));
+          break;
+        }
+        case 'mist-last-seen':
+        case 'mist-events':
+        case 'switch-uptime':
+        case 'mist-audit-logs':
+        case 'switch-logs': {
+          const timelineResults = await ensureTimeline();
+          const matches = timelineResults.filter((result) => {
+            if (checkId === 'switch-logs') return result.id.startsWith('switch-logs');
+            return result.id === checkId;
+          });
+          if (matches.length === 0) {
+            report({
+              id: checkId,
+              name: checkId,
+              status: 'skip',
+              detail: 'Skipped — this evidence was not available for the current session context.',
+            });
+            break;
+          }
+          for (const result of matches) {
+            if (!reportedIds.has(result.id)) report(result);
+          }
+          break;
+        }
+        default: {
+          report({
+            id: checkId,
+            name: checkId,
+            status: 'skip',
+            detail: 'Skipped — this recommended check is not wired into the targeted runner yet.',
+          });
+          break;
+        }
+      }
     }
 
     return results;

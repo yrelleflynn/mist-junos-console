@@ -36,7 +36,7 @@ Check results include a structured interpretation: not just pass/fail output, bu
 
 **Level 3 — Autonomous Action**
 
-Staged config sync fetches the Mist-intended config diff, loads it as a candidate on the switch, runs `commit check`, shows the operator a clear diff and check result, and then waits for an explicit operator action: **Commit Confirmed** (with a 5-minute auto-rollback safety window), **Commit** (permanent), or **Rollback** (discard). The operator approves; the tool executes.
+Staged config sync fetches the Mist-intended config diff, loads it as a candidate on the switch, runs `commit check`, shows the operator a clear diff and check result, and then waits for an explicit operator action: **Commit** (apply) or **Rollback** (discard). The operator approves; the tool executes.
 
 ---
 
@@ -97,13 +97,13 @@ Click **Preview Config Sync**. Walk through what happens:
 4. Runs `commit check` to validate the candidate
 5. Leaves the candidate staged — does not commit automatically
 
-The action bar appears with three buttons: **Commit Confirmed**, **Commit**, **Rollback**.
+The action bar appears with two buttons: **Commit** and **Rollback**.
 
 **Talking point:** The tool will not commit without the operator's explicit approval. The operator sees the diff, sees the commit-check result, and decides.
 
-Click **Commit Confirmed**. The tool sends `commit confirmed 5 comment "junos console config sync"` — a 5-minute auto-rollback window in case something goes wrong. Walk through the terminal output and explain that this is the point where the operator has approved the change.
+Click **Commit**. The tool sends `commit comment "junos console config sync"` and exits config mode cleanly. Walk through the terminal output and explain that this is the point where the operator has approved the change.
 
-**Talking point:** If the commit caused an outage, the switch rolls back automatically in 5 minutes. The operator does not need to be standing by with a rollback plan.
+**Talking point:** The important safety boundary is that the tool stages the candidate, validates it, and then waits for operator approval before applying anything.
 
 ### Step 6 — Reconnect or verification outcome (1 min)
 
@@ -131,7 +131,7 @@ If the serial device is unavailable or the live sync is too risky for a demo swi
 
 - Run **Config Drift** against a pre-staged switch with known drift and walk through the diff comparison
 - Show a pre-recorded terminal output of the **Preview Config Sync** flow including the `show | compare` diff and commit check result
-- Show the action bar with the three buttons and explain the commit confirmed / commit / rollback model without completing the commit
+- Show the action bar with the two decision buttons and explain the commit / rollback model without completing the commit
 
 The detection and diagnosis portions (Steps 1–4) do not require the switch to be offline and can be run against any reachable Mist-managed switch with a console cable attached.
 
@@ -147,7 +147,7 @@ The detection and diagnosis portions (Steps 1–4) do not require the switch to 
 | Troubleshoot | 14 checks, gated, structured, with remediation |
 | Config drift | Mist intent vs live switch, inline in the console workflow |
 | Staged sync | Candidate staged, operator approves commit — not auto-applied |
-| Commit confirmed | 5-minute rollback window — safe for production |
+| Commit | Operator-approved application after staged diff + commit check |
 | Reconnect | Guided recovery loop: detect → diagnose → stage → operator-approved act |
 
 ---
@@ -160,7 +160,7 @@ A: The Mist UI and a terminal are two separate tools with no shared state. This 
 
 **Q: Why does the operator still need to approve the commit? Could this be fully automated?**
 
-A: It could be, and that is a deliberate design choice rather than a limitation. Production switches serving real users are not safe targets for fully autonomous config commits without human confirmation. Commit Confirmed gives the operator a 5-minute rollback window for safety. The self-driving value here is removing all the manual discovery, comparison, and staging work — not removing the operator from the risk decision.
+A: It could be, and that is a deliberate design choice rather than a limitation. Production switches serving real users are not safe targets for fully autonomous config commits without human confirmation. The self-driving value here is removing the manual discovery, comparison, and staging work while still leaving the operator in control of the final risk decision.
 
 **Q: How broadly does this apply across Mist-managed EX switches?**
 
@@ -172,4 +172,4 @@ A: The backend MCP design is documented as a roadmap item. The current product e
 
 **Q: What happens if the commit makes things worse?**
 
-A: Commit Confirmed sends `commit confirmed 5` — if the operator does not run a second commit within 5 minutes to confirm, Junos rolls the config back automatically. The tool is also in the same serial session, so the operator can run Rollback immediately if they see a problem. The diff is shown before any commit happens so the operator knows exactly what is being applied.
+A: The tool stages the candidate and shows the exact `show | compare` diff before any commit happens, so the operator knows exactly what is about to change. If they decide not to proceed, they can choose Rollback instead of Commit. The serial console remains available throughout the workflow, so recovery is still local and visible even if the resulting config is not what the operator expected.

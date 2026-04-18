@@ -21,6 +21,7 @@ import { DeviceContextController } from './controllers/device-context.controller
 import { CloudStatusController } from './controllers/cloud-status.controller';
 import type { CloudStatusState } from './types/cloud-status.types';
 import { MIST_CLOUDS, getCloudById } from './config/mist-clouds.config';
+import { getJmaRecommendation } from './config/jma-recommendations';
 import './styles/main.css';
 
 const SERIAL_PREFS_STORAGE_KEY = 'junos-console.serial-prefs';
@@ -108,6 +109,7 @@ function init(): void {
     mistMonitorDetail: document.getElementById('mist-monitor-detail') as HTMLElement,
     jmaMonitorPill: document.getElementById('jma-monitor-pill') as HTMLElement,
     jmaMonitorDetail: document.getElementById('jma-monitor-detail') as HTMLElement,
+    jmaRecommendation: document.getElementById('jma-recommendation') as HTMLElement,
     btnRootPassword: document.getElementById('btn-root-password') as HTMLButtonElement,
     rootPasswordResult: document.getElementById('root-password-result') as HTMLElement,
     btnConfigDrift: document.getElementById('btn-config-drift') as HTMLButtonElement,
@@ -237,6 +239,7 @@ function init(): void {
   let resolvedMatchedSiteName: string | null = null;
   let identifyInFlight = false;
   let cloudStatusRefreshInFlight = false;
+  let latestJmaCode: number | null = null;
 
   // ---- Mist context controller ----
   const mistContext = new MistContextController(mistApi, {
@@ -577,6 +580,8 @@ function init(): void {
       ui.btnOfflineTimeline.disabled = !hasSite;
       ui.btnAdopt.disabled = !serial.isConnected;
     }
+
+    renderJmaRecommendation(latestJmaCode);
   }
 
   // ---- UI state helpers ----
@@ -857,16 +862,19 @@ function init(): void {
 
   function renderCloudStatus(state: CloudStatusState): void {
     if (!state.matchResult && !state.lastUpdatedUtcIso) {
+      latestJmaCode = null;
       setCloudStatusPill(ui.mistMonitorPill, 'Unknown', 'unknown');
       setCloudStatusPill(ui.jmaMonitorPill, 'Unknown', 'unknown');
       ui.mistMonitorDetail.textContent = 'Identify and match the switch in Mist to enable Mist status monitoring.';
       ui.jmaMonitorDetail.textContent = 'Log in or detect a Junos CLI prompt to start the switch-reported cloud status monitor.';
       ui.cloudStatusLastUpdated.textContent = 'Not yet checked';
+      renderJmaRecommendation(null);
       return;
     }
 
     setCloudStatusPill(ui.mistMonitorPill, state.mist.label, state.mist.pillState);
     setCloudStatusPill(ui.jmaMonitorPill, state.jma.label, state.jma.severity);
+    latestJmaCode = state.jma.code;
 
     const mistParts = [state.mist.detail];
     const lastSeen = formatBrowserLocalDisplay(state.mist.lastSeenUtcIso);
@@ -879,10 +887,105 @@ function init(): void {
     if (state.jma.message) jmaParts.push(`Message: ${state.jma.message}`);
     if (state.jma.errno != null) jmaParts.push(`Errno: ${state.jma.errno}`);
     ui.jmaMonitorDetail.textContent = jmaParts.join(' · ');
+    renderJmaRecommendation(state.jma.code);
 
     ui.cloudStatusLastUpdated.textContent = state.lastUpdatedUtcIso
       ? `Refreshed ${formatUtcDisplay(state.lastUpdatedUtcIso)}`
       : 'Not yet checked';
+  }
+
+  function workflowRecommendationLabel(kind: 'full' | 'targeted_then_full' | 'targeted' | 'optional' | 'skip'): string {
+    switch (kind) {
+      case 'full':
+        return 'Run full workflow';
+      case 'targeted_then_full':
+        return 'Targeted, then full if needed';
+      case 'targeted':
+        return 'Targeted checks first';
+      case 'optional':
+        return 'Targeted checks usually enough';
+      case 'skip':
+        return 'No workflow usually needed';
+      default:
+        return 'Targeted guidance';
+    }
+  }
+
+  function renderJmaRecommendation(code: number | null): void {
+    const recommendation = getJmaRecommendation(code);
+    if (!recommendation) {
+      ui.jmaRecommendation.innerHTML = '';
+      ui.jmaRecommendation.classList.add('jma-recommendation-hidden');
+      return;
+    }
+
+    const buttonLabel = recommendation.workflowRecommendation === 'skip'
+      ? 'Run Checks Anyway'
+      : 'Run Recommended Checks';
+    const buttonDisabled = !serial.isConnected || configSync.hasStagedCandidate();
+
+    ui.jmaRecommendation.className = `jma-recommendation-card severity-${recommendation.severity}`;
+    ui.jmaRecommendation.innerHTML = `
+      <div class="jma-recommendation-header">
+        <div>
+          <div class="jma-recommendation-eyebrow">JMA Guidance</div>
+          <div class="jma-recommendation-title">${escapeHtml(recommendation.title)}</div>
+        </div>
+        <span class="jma-recommendation-workflow">${escapeHtml(workflowRecommendationLabel(recommendation.workflowRecommendation))}</span>
+      </div>
+      <div class="jma-recommendation-sections">
+        <div class="jma-recommendation-section">
+          <div class="jma-recommendation-section-title">What?</div>
+          <div class="jma-recommendation-copy">${escapeHtml(recommendation.summary)}</div>
+        </div>
+        <div class="jma-recommendation-section">
+          <div class="jma-recommendation-section-title">So what?</div>
+          <div class="jma-recommendation-copy">${escapeHtml(recommendation.implication)}</div>
+        </div>
+        <div class="jma-recommendation-section">
+          <div class="jma-recommendation-section-title">What next?</div>
+          <div class="jma-recommendation-copy">${escapeHtml(recommendation.workflowNote)}</div>
+          <div class="jma-recommendation-subtitle">Recommended first checks</div>
+          <ul class="jma-recommendation-list">
+            ${recommendation.checks
+              .map(
+                (check) => `
+                  <li>
+                    <strong>${escapeHtml(check.label)}</strong>
+                    <span>${escapeHtml(check.why)}</span>
+                  </li>`,
+              )
+              .join('')}
+          </ul>
+          <div class="jma-recommendation-subtitle">Potential actions</div>
+          <ul class="jma-recommendation-list">
+            ${recommendation.remediation
+              .map((step) => `<li><span>${escapeHtml(step)}</span></li>`)
+              .join('')}
+          </ul>
+        </div>
+      </div>
+      <div class="jma-recommendation-actions">
+        <button
+          type="button"
+          class="btn ${recommendation.workflowRecommendation === 'skip' ? 'btn-secondary' : 'btn-primary'} btn-sm"
+          data-action="run-recommended-checks"
+          ${buttonDisabled ? 'disabled' : ''}
+        >
+          ${escapeHtml(buttonLabel)}
+        </button>
+      </div>
+    `;
+    ui.jmaRecommendation.classList.remove('jma-recommendation-hidden');
+  }
+
+  function openAccordionSection(targetId: string): void {
+    const trigger = document.querySelector<HTMLElement>(`.accordion-trigger[data-target="${targetId}"]`);
+    const content = document.getElementById(`accordion-${targetId}`);
+    if (!trigger || !content) return;
+    trigger.classList.add('active');
+    content.classList.add('open');
+    setTimeout(() => term.fit(), 300);
   }
 
   async function withCloudStatusPollingPaused<T>(fn: () => Promise<T>): Promise<T> {
@@ -1656,6 +1759,60 @@ function init(): void {
       rc.finalise(results);
       term.writeSystem('— Cloud connectivity check complete —');
       ui.btnRunTroubleshoot.disabled = false;
+    });
+  }
+
+  async function runRecommendedChecksFromJma(): Promise<void> {
+    const recommendation = getJmaRecommendation(latestJmaCode);
+    if (!recommendation) return;
+
+    await withCloudStatusPollingPaused(async () => {
+      const cloudId = ui.mistCloud.value;
+      const cloud = getCloudById(cloudId);
+      if (!cloud) {
+        term.writeError('Please select a Mist cloud region.');
+        return;
+      }
+
+      openAccordionSection('troubleshooting');
+      ui.tsResults.innerHTML = '';
+
+      const title = `Recommended Checks — ${recommendation.title}`;
+      const rc = createResultsContainer(title);
+      ui.tsResults.appendChild(rc.container);
+
+      ui.btnRunTroubleshoot.disabled = true;
+      ui.btnMistStatus.disabled = true;
+      ui.btnSslCheck.disabled = true;
+
+      term.writeSystem(`— Running recommended checks for JMA ${recommendation.code} ${recommendation.label} —`);
+
+      accumulatedResults = [];
+
+      try {
+        const results = await troubleshooter.runRecommendedChecks({
+          cloud,
+          uplinkPort: ui.tsUplinkPort.value.trim(),
+          siteId: deviceContext.matchResult?.mistDevice?.site_id || undefined,
+          deviceId: deviceContext.matchResult?.mistDevice?.id || undefined,
+          checkIds: recommendation.checks.map((check) => check.id),
+          onProgress: (result: CheckResult) => {
+            accumulatedResults.push(result);
+            rc.addResult(result);
+            term.writeSystem(`  [${statusIcon(result.status)}] ${result.name}: ${result.detail}`);
+          },
+        });
+
+        rc.finalise(results);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ui.tsResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
+        term.writeError(`Recommended checks failed: ${msg}`);
+      } finally {
+        updateConfigSyncUIState();
+      }
+
+      term.writeSystem('— Recommended checks complete —');
     });
   }
 
@@ -2461,6 +2618,13 @@ function init(): void {
   ui.btnRollbackSync.addEventListener('click', doRollbackSync);
   ui.btnOfflineTimeline.addEventListener('click', checkOfflineTimeline);
   ui.btnAdopt.addEventListener('click', adoptSwitch);
+  ui.jmaRecommendation.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const button = target.closest<HTMLButtonElement>('[data-action="run-recommended-checks"]');
+    if (!button || button.disabled) return;
+    void runRecommendedChecksFromJma();
+  });
 
   // ---- Accordion logic ----
   document.querySelectorAll('.accordion-trigger').forEach((trigger) => {

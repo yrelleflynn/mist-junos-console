@@ -13,6 +13,76 @@ Use a layered integration model:
 
 Do not expose only raw serial or raw tests directly to the agent as the primary model.
 
+## Product Split: Deterministic UI vs Agent Interpretation
+
+The recommended product split is:
+
+- the core UI provides deterministic, explainable operator guidance
+- the agent layer provides deeper interpretation and prioritization
+
+This is intentional.
+
+The base product should be useful without an agent:
+
+- detect the current state
+- explain what the state means
+- recommend the next checks to run
+- suggest bounded remediation actions
+
+The preferred operator-facing format is:
+
+- `What?`
+- `So what?`
+- `What next?`
+
+This keeps the baseline workflow understandable and predictable for operators
+who may not trust or want AI in the critical path.
+
+### What the core UI should do
+
+The non-agent path should remain deterministic and rule-driven:
+
+- map JMA state to a likely failure domain
+- recommend the best first checks
+- use simple context-aware logic from test results where confidence is high
+- suggest likely remediation commands or actions
+
+This is closer to an explainable IFTTT-style guidance layer than a reasoning
+engine.
+
+### What the agent should add
+
+The agent layer should add value where interpretation matters:
+
+- correlate multiple signals
+- explain ambiguity and contradictions
+- prioritize likely root causes
+- recommend a remediation sequence rather than a flat list
+- notice mismatches between:
+  - JMA state
+  - Mist last-known state
+  - local troubleshooting results
+  - config drift / intended state
+
+This is a much better use of an AI agent than replacing the base workflow.
+
+## Product Packaging Alignment
+
+This split also aligns well with the Mist product model:
+
+- baseline AIOps-style guidance fits naturally into the core wired / wireless /
+  WAN Assurance experience
+- deeper interpretive and agent-assisted guidance fits naturally into an
+  advanced Marvis-style tier
+
+In practical terms:
+
+- the base workflow can provide deterministic guided recovery
+- the advanced workflow can provide richer AI-assisted diagnosis and reasoning
+
+This helps keep the core product broadly useful while still leaving room for a
+clear premium AI story.
+
 ## Why This Approach
 
 The agent needs access to two different kinds of truth:
@@ -107,6 +177,8 @@ The agent can:
 - trigger approved read-only checks
 - correlate live state with Mist intended and last-known state
 - suggest likely causes and next actions
+- explain why the product is prioritizing a given failure domain or
+  remediation path
 
 The agent still cannot perform state-changing actions on its own.
 

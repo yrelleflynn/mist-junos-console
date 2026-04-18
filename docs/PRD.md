@@ -90,6 +90,7 @@ Based on the current implementation, the product already includes:
 - automated cloud connectivity checks (14-check engine with gate logic)
 - JMA Connectivity State monitoring (switch-reported cloud state, parsed from cc-state)
 - staged config sync: fetch Mist diff, stage candidate, show | compare, commit check, then operator-gated Commit Confirmed / Commit / Rollback
+- staged config sync: fetch Mist diff, stage candidate, show | compare, commit check, then operator-gated Commit / Rollback
 - remote support console mirroring over WebSocket
 
 ### Demoable scope as of hackathon (April 2026)
@@ -109,9 +110,8 @@ prerequisite has already failed. Config drift output highlights the exact
 
 **Autonomous action (Level 3):**
 Staged config sync loads the Mist diff as a candidate, validates it with
-`commit check`, and presents the operator with a Commit Confirmed, Commit, or
-Rollback decision. The operator approves; the tool executes. Commit Confirmed
-uses a 5-minute Junos auto-rollback window for production safety.
+`commit check`, and presents the operator with a Commit or Rollback decision.
+The operator approves; the tool executes.
 
 **What is not yet implemented (roadmap only):**
 AI agent integration via a backend MCP server is documented in
@@ -198,12 +198,22 @@ See [`docs/MIST-API-INTEGRATION.md`](/Users/mdusty/Library/CloudStorage/OneDrive
 - Checks must support stop conditions for missing prerequisites such as no management IP or no default route.
 - Each check must produce a status, explanation, raw evidence, and remediation guidance where applicable.
 - The troubleshooting flow must remain understandable to non-expert operators.
+- The troubleshooting UX should present high-level guidance in an operator-friendly
+  format such as:
+  - `What?`
+  - `So what?`
+  - `What next?`
+- The baseline guidance layer should remain deterministic and explainable,
+  using JMA state, test outcomes, and a small set of high-confidence rules.
 - For disconnect investigation, the product should prefer collecting and presenting evidence over making overconfident claims about exact root cause.
 - The troubleshooting flow should incorporate high-signal device-native status indicators where available, including the JMA cloud connectivity state reported by the switch.
 - The UI should keep both Mist device connected state and switch-reported JMA connectivity state visible as separate but related indicators.
 - The product should periodically refresh lightweight status indicators such as Mist device status and JMA connectivity state while the session is active.
 - Lightweight background monitoring or bootstrap actions may run silently so they do not pollute the operator terminal.
 - Operator-invoked workflows such as explicit identify, troubleshooting, config comparison, and guided remediation should remain visible in the terminal so the operator can follow what the tool is doing.
+- Deeper interpretation of conflicting signals, likely root-cause ranking, and
+  remediation sequencing should be treated as an agent-assist layer rather than
+  a requirement of the deterministic base UI.
 
 ### Config comparison
 
@@ -211,6 +221,9 @@ See [`docs/MIST-API-INTEGRATION.md`](/Users/mdusty/Library/CloudStorage/OneDrive
 - The app must make config drift understandable and actionable.
 - The app should compare Mist intent against inherited Junos `display set` output rather than relying on raw textual equality.
 - The app should normalize common Mist intent patterns such as grouped config, `apply-groups`, interface ranges, and array-style `set` commands before deciding drift.
+- The app must support a staged config workflow where the operator reviews a
+  diff, sees the `commit check` result, and explicitly chooses whether to
+  commit or roll back.
 
 ### Adoption
 
