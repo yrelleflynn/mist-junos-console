@@ -11,6 +11,60 @@ export interface MistSite {
   name: string;
 }
 
+export interface MistOrg {
+  id: string;
+  name: string;
+}
+
+// Shape returned by GET /api/v1/self (only the fields we use)
+interface MistSelfResponse {
+  privileges?: Array<{
+    scope?: string;
+    org_id?: string;
+    org_name?: string;
+    name?: string;
+    role?: string;
+  }>;
+  orgs?: Array<{
+    id?: string;
+    org_id?: string;
+    name?: string;
+    org_name?: string;
+  }>;
+  data?: {
+    privileges?: Array<{
+      scope?: string;
+      org_id?: string;
+      org_name?: string;
+      name?: string;
+      role?: string;
+    }>;
+    orgs?: Array<{
+      id?: string;
+      org_id?: string;
+      name?: string;
+      org_name?: string;
+    }>;
+    organizations?: Array<{
+      id?: string;
+      org_id?: string;
+      name?: string;
+      org_name?: string;
+    }>;
+  };
+  organizations?: Array<{
+    id?: string;
+    org_id?: string;
+    name?: string;
+    org_name?: string;
+  }>;
+}
+
+interface MistOrgDetailResponse {
+  id?: string;
+  name?: string;
+}
+
 export interface MistSiteSettings {
   switch_mgmt?: {
     root_password?: string;
@@ -67,13 +121,21 @@ export class MistApiService {
    * Make a proxied GET request to the Mist API.
    */
   private async get<T>(path: string): Promise<T> {
+    return this.getWithCredentials<T>(this.apiToken, this.apiHost, path);
+  }
+
+  /**
+   * Make a proxied GET request using explicit credentials (for pre-configuration calls
+   * such as GET /api/v1/self before orgId is known).
+   */
+  private async getWithCredentials<T>(token: string, apiHost: string, path: string): Promise<T> {
     const url = `${this.proxyBase}/mist-proxy`;
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        apiHost: this.apiHost,
-        apiToken: this.apiToken,
+        apiHost,
+        apiToken: token,
         method: 'GET',
         path,
       }),
@@ -121,6 +183,80 @@ export class MistApiService {
     return data.map((s) => ({ id: s.id, name: s.name }));
   }
 
+  async getSite(siteId: string): Promise<MistSite> {
+    const site = await this.get<MistSite>(`/api/v1/sites/${siteId}`);
+    return { id: site.id, name: site.name };
+  }
+
+  /**
+   * Fetch the list of orgs accessible to the supplied token via GET /api/v1/self.
+   * Uses explicit credentials so this can be called before orgId is configured.
+   */
+  async getAccessibleOrgs(token: string, apiHost: string): Promise<MistOrg[]> {
+    const self = await this.getWithCredentials<MistSelfResponse | MistSelfResponse['privileges']>(token, apiHost, '/api/v1/self');
+    const selfObj: MistSelfResponse = Array.isArray(self) ? { privileges: self } : (self ?? {});
+    const privileges =
+      selfObj.privileges
+      ?? selfObj.data?.privileges
+      ?? [];
+    const topLevelOrgs =
+      selfObj.orgs
+      ?? selfObj.organizations
+      ?? selfObj.data?.orgs
+      ?? selfObj.data?.organizations
+      ?? [];
+    const orgMap = new Map<string, MistOrg>();
+    const unresolvedOrgIds = new Set<string>();
+    const orgScopedPrivileges = privileges.filter((p) => p.scope === 'org' && p.org_id);
+    const fallbackPrivileges = orgScopedPrivileges.length > 0
+      ? orgScopedPrivileges
+      : privileges.filter((p) => p.org_id);
+
+    for (const p of fallbackPrivileges) {
+      if (p.org_id) {
+        const name = p.name ?? p.org_name ?? '';
+        if (!orgMap.has(p.org_id)) {
+          orgMap.set(p.org_id, { id: p.org_id, name: name || p.org_id });
+        }
+        if (!name) {
+          unresolvedOrgIds.add(p.org_id);
+        }
+      }
+    }
+
+    for (const org of topLevelOrgs) {
+      const orgId = org.id ?? org.org_id ?? '';
+      if (!orgId) continue;
+      const name = org.name ?? org.org_name ?? '';
+      if (!orgMap.has(orgId)) {
+        orgMap.set(orgId, { id: orgId, name: name || orgId });
+      }
+      if (!name) {
+        unresolvedOrgIds.add(orgId);
+      }
+    }
+
+    await Promise.all(
+      Array.from(unresolvedOrgIds).map(async (orgId) => {
+        try {
+          const org = await this.getWithCredentials<MistOrgDetailResponse>(
+            token,
+            apiHost,
+            `/api/v1/orgs/${orgId}`,
+          );
+          const resolvedName = org.name?.trim();
+          if (resolvedName) {
+            orgMap.set(orgId, { id: orgId, name: resolvedName });
+          }
+        } catch {
+          // Keep the org ID fallback if detail lookup is unavailable.
+        }
+      }),
+    );
+
+    return Array.from(orgMap.values());
+  }
+
   /**
    * Fetch site settings, including switch_mgmt.root_password.
    */
@@ -149,14 +285,15 @@ export class MistApiService {
 
   /**
    * Find a device in the Mist inventory by serial number.
+   * Uses the targeted serial-filter endpoint for efficiency on large orgs.
    */
   async findDeviceBySerial(serial: string): Promise<MistInventoryDevice | null> {
     try {
-      const inventory = await this.getInventory();
-      const match = inventory.find((d) =>
-        d.serial?.toLowerCase() === serial.toLowerCase()
+      const results = await this.get<MistInventoryDevice[]>(
+        `/api/v1/orgs/${this.orgId}/inventory?serial=${encodeURIComponent(serial)}&type=switch`,
       );
-      return match || null;
+      const match = results.find((d) => d.serial?.toLowerCase() === serial.toLowerCase());
+      return match ?? null;
     } catch {
       return null;
     }
@@ -164,6 +301,7 @@ export class MistApiService {
 
   /**
    * Find a device in the Mist inventory by MAC address.
+   * Falls back to full inventory scan since the API does not support MAC-filter on this endpoint.
    */
   async findDeviceByMac(mac: string): Promise<MistInventoryDevice | null> {
     try {
@@ -173,7 +311,7 @@ export class MistApiService {
         const deviceMac = d.mac?.toLowerCase().replace(/[:-]/g, '') || '';
         return deviceMac === normalized;
       });
-      return match || null;
+      return match ?? null;
     } catch {
       return null;
     }
@@ -198,7 +336,7 @@ export class MistApiService {
    * Fetch the Mist device configuration (intended config).
    */
   async getDeviceConfig(siteId: string, deviceId: string): Promise<MistDeviceConfig> {
-    return this.get<MistDeviceConfig>(`/api/v1/sites/${siteId}/devices/${deviceId}`);
+    return this.get<MistDeviceConfig>(`/api/v1/sites/${siteId}/devices/${deviceId}/config_cmd`);
   }
 
   /**

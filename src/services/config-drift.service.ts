@@ -2,7 +2,7 @@
  * config-drift.service.ts — Compare Mist intended config vs actual Junos config
  *
  * Converts the Mist device JSON config into equivalent 'set' commands,
- * then diffs against the actual 'show configuration | display set' output
+ * then diffs against the actual 'show configuration | display inheritance | display set' output
  * to detect drift.
  */
 
@@ -29,6 +29,9 @@ export interface ConfigDriftResult {
  * general switch operation — ignoring ephemeral or auto-generated lines.
  */
 const RELEVANT_PREFIXES = [
+  'set apply-groups',
+  'set system commit',
+  'set system time-zone',
   'set system host-name',
   'set system name-server',
   'set system ntp',
@@ -46,9 +49,14 @@ const RELEVANT_PREFIXES = [
   'set interfaces mge-',
   'set vlans',
   'set protocols lldp',
+  'set protocols dot1x',
   'set protocols rstp',
   'set protocols stp',
   'set protocols vstp',
+  'set forwarding-options',
+  'set policy-options',
+  'set firewall',
+  'set access',
   'set routing-options',
   'set switch-options',
   'set ethernet-switching-options',
@@ -60,11 +68,22 @@ const RELEVANT_PREFIXES = [
  * Lines to ignore in comparison — auto-generated, timestamps, secrets, etc.
  */
 const IGNORE_PATTERNS = [
+  /^set version /,
   /^set system (commit|scripts|extensions|processes)/,
+  /^set system configuration-database ephemeral/,
   /^set system services outbound-ssh client mist secret/,
+  /^set system services ssh protocol-version/,
+  /^set system services ssh connection-limit/,
+  /^set system services netconf/,
+  /^set system services outbound-ssh/,
+  /^set system services telnet/,
   /^set system login user mist/,
   /^set system root-authentication encrypted-password/,
   /^set system login user \S+ authentication encrypted-password/,
+  /^set system auto-snapshot/,
+  /^set system authentication-order/,
+  /^set chassis redundancy graceful-switchover/,
+  /^set security pki/,
   /^set (event-options|chassis auto-image-upgrade)/,
   /encrypted-password/,
   /\$\d\$/,  // Hashed passwords
@@ -75,7 +94,7 @@ export class ConfigDriftService {
    * Compare Mist intended config against the actual running config.
    *
    * @param mistConfig — Mist device config JSON from the API
-   * @param runningConfig — Output of 'show configuration | display set'
+   * @param runningConfig — Output of 'show configuration | display inheritance | display set'
    */
   compare(mistConfig: MistDeviceConfig, runningConfig: string): ConfigDriftResult {
     // Parse running config into a set of normalised lines
@@ -84,17 +103,18 @@ export class ConfigDriftService {
     // Convert Mist config JSON to equivalent 'set' commands
     const mistLines = this.parseMistConfig(mistConfig);
 
-    // Build sets for comparison
-    const switchSet = new Set(switchLines.map((l) => this.normalizeLine(l)));
-    const mistSet = new Set(mistLines.map((l) => this.normalizeLine(l)));
+    const switchMap = this.toUniqueNormalizedMap(switchLines);
+    const mistMap = this.toUniqueNormalizedMap(mistLines);
+
+    const switchSet = new Set(switchMap.keys());
+    const mistSet = new Set(mistMap.keys());
 
     const mistOnlyLines: ConfigDiffLine[] = [];
     const switchOnlyLines: ConfigDiffLine[] = [];
     let matchedLines = 0;
 
     // Find lines in Mist config but not on switch
-    for (const line of mistLines) {
-      const normalized = this.normalizeLine(line);
+    for (const [normalized, line] of mistMap.entries()) {
       if (switchSet.has(normalized)) {
         matchedLines++;
       } else {
@@ -107,8 +127,7 @@ export class ConfigDriftService {
     }
 
     // Find lines on switch but not in Mist config
-    for (const line of switchLines) {
-      const normalized = this.normalizeLine(line);
+    for (const [normalized, line] of switchMap.entries()) {
       if (!mistSet.has(normalized)) {
         switchOnlyLines.push({
           type: 'switch-only',
@@ -128,8 +147,8 @@ export class ConfigDriftService {
     }
 
     return {
-      totalMistLines: mistLines.length,
-      totalSwitchLines: switchLines.length,
+      totalMistLines: mistMap.size,
+      totalSwitchLines: switchMap.size,
       matchedLines,
       mistOnlyLines,
       switchOnlyLines,
@@ -141,12 +160,14 @@ export class ConfigDriftService {
    * Parse the running config output into filtered, relevant 'set' lines.
    */
   private parseRunningConfig(config: string): string[] {
-    return config
+    return this.expandBracketArrayLines(
+      config
       .split('\n')
       .map((l) => l.trim())
       .filter((l) => l.startsWith('set '))
       .filter((l) => this.isRelevant(l))
-      .filter((l) => !this.isIgnored(l));
+      .filter((l) => !this.isIgnored(l)),
+    );
   }
 
   /**
@@ -157,6 +178,10 @@ export class ConfigDriftService {
    * for the most common config elements.
    */
   private parseMistConfig(config: MistDeviceConfig): string[] {
+    if (Array.isArray(config.cli) && config.cli.length > 0) {
+      return this.parseMistCliConfig(config.cli);
+    }
+
     const lines: string[] = [];
 
     // Hostname
@@ -238,7 +263,101 @@ export class ConfigDriftService {
       }
     }
 
-    return lines.filter((l) => !this.isIgnored(l));
+    return this.expandBracketArrayLines(lines.filter((l) => !this.isIgnored(l)));
+  }
+
+  private parseMistCliConfig(cli: unknown[]): string[] {
+    const rawLines = this.keepLastScalarAssignments(
+      cli
+      .filter((line): line is string => typeof line === 'string')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .filter((line) => !line.startsWith('#'))
+      .filter((line) => !line.startsWith('delete '))
+      .filter((line) => line.startsWith('set '))
+      .filter((line) => !this.isIgnored(line)),
+    );
+
+    const interfaceRangeMembers = new Map<string, string[]>();
+    const interfaceRangeApplyGroups = new Map<string, string[]>();
+    const groupLines = new Map<string, string[]>();
+    const globalApplyGroups = new Set<string>();
+    const directLines: string[] = [];
+
+    for (const line of rawLines) {
+      const memberMatch = line.match(/^set interfaces interface-range (\S+) member (.+)$/);
+      if (memberMatch) {
+        const rangeName = memberMatch[1];
+        const members = interfaceRangeMembers.get(rangeName) ?? [];
+        members.push(...this.expandInterfaceTokens(memberMatch[2]));
+        interfaceRangeMembers.set(rangeName, members);
+        directLines.push(this.normalizeSpacing(line));
+        continue;
+      }
+
+      const applyGroupMatch = line.match(/^set interfaces interface-range (\S+) apply-groups (\S+)$/);
+      if (applyGroupMatch) {
+        const rangeName = applyGroupMatch[1];
+        const groupName = applyGroupMatch[2];
+        const groups = interfaceRangeApplyGroups.get(rangeName) ?? [];
+        groups.push(groupName);
+        interfaceRangeApplyGroups.set(rangeName, groups);
+        continue;
+      }
+
+      const globalApplyMatch = line.match(/^set apply-groups (\S+)$/);
+      if (globalApplyMatch) {
+        globalApplyGroups.add(globalApplyMatch[1]);
+        continue;
+      }
+
+      const groupMatch = line.match(/^set groups (\S+) (.+)$/);
+      if (groupMatch) {
+        const groupName = groupMatch[1];
+        const groupBody = groupMatch[2];
+        const entries = groupLines.get(groupName) ?? [];
+        entries.push(groupBody);
+        groupLines.set(groupName, entries);
+        continue;
+      }
+
+      directLines.push(this.normalizeSpacing(line));
+    }
+
+    const expandedLines: string[] = [...directLines];
+
+    for (const groupName of globalApplyGroups) {
+      const lines = groupLines.get(groupName) ?? [];
+      for (const line of lines) {
+        if (line.startsWith('interfaces <*>')) continue;
+        expandedLines.push(this.normalizeSpacing(`set ${line}`));
+      }
+    }
+
+    for (const [rangeName, groups] of interfaceRangeApplyGroups.entries()) {
+      const members = interfaceRangeMembers.get(rangeName) ?? [];
+      if (members.length === 0) continue;
+
+      for (const groupName of groups) {
+        const lines = groupLines.get(groupName) ?? [];
+        for (const line of lines) {
+          const interfaceTemplateMatch = line.match(/^interfaces <\*> (.+)$/);
+          if (!interfaceTemplateMatch) continue;
+          const suffix = interfaceTemplateMatch[1];
+          for (const member of members) {
+            expandedLines.push(this.normalizeSpacing(`set interfaces ${member} ${suffix}`));
+          }
+        }
+      }
+    }
+
+    const fullyExpanded = expandedLines.flatMap((line) =>
+      this.expandInterfaceRangeReferences(line, interfaceRangeMembers),
+    );
+
+    return this.expandBracketArrayLines(fullyExpanded)
+      .filter((line) => this.isRelevant(line))
+      .filter((line) => !this.isIgnored(line));
   }
 
   /**
@@ -259,7 +378,116 @@ export class ConfigDriftService {
    * Normalize a config line for comparison (trim whitespace, lowercase, remove trailing semicolons).
    */
   private normalizeLine(line: string): string {
-    return line.trim().replace(/;+$/, '').toLowerCase();
+    return line
+      .trim()
+      .replace(/;+$/, '')
+      .replace(/"([^"]+)"/g, '$1')
+      .replace(/((?:ge|xe|et|mge)-\d+\/\d+\/\d+)\.0\b/g, '$1')
+      .replace(/\s+/g, ' ')
+      .toLowerCase();
+  }
+
+  /**
+   * Expand Junos array-style `set` commands into the per-value lines that
+   * `display set` emits on the switch.
+   *
+   * Example:
+   *   set ... vlan members [ guest staff ]
+   * becomes:
+   *   set ... vlan members guest
+   *   set ... vlan members staff
+   */
+  private expandBracketArrayLines(lines: string[]): string[] {
+    return lines.flatMap((line) => this.expandBracketArrayLine(line));
+  }
+
+  private expandBracketArrayLine(line: string): string[] {
+    const match = line.match(/^(.*)\[\s*([^\]]+?)\s*\](.*)$/);
+    if (!match) {
+      return [this.normalizeSpacing(line)];
+    }
+
+    const prefix = this.normalizeSpacing(match[1]);
+    const values = match[2].trim().split(/\s+/).filter(Boolean);
+    const suffix = this.normalizeSpacing(match[3]);
+
+    if (values.length === 0) {
+      return [this.normalizeSpacing(`${prefix} ${suffix}`)];
+    }
+
+    return values.flatMap((value) =>
+      this.expandBracketArrayLine(this.normalizeSpacing(`${prefix} ${value} ${suffix}`)),
+    );
+  }
+
+  private normalizeSpacing(line: string): string {
+    return line.trim().replace(/\s+/g, ' ');
+  }
+
+  private normalizeToken(token: string): string {
+    return token.trim().replace(/^"(.*)"$/, '$1');
+  }
+
+  private expandInterfaceTokens(token: string): string[] {
+    const normalized = this.normalizeToken(token);
+    const bracketRangeMatch = normalized.match(/^((?:ge|xe|et|mge)-\d+\/\d+\/)\[(\d+)-(\d+)\]$/);
+    if (bracketRangeMatch) {
+      return this.expandPortRange(`${bracketRangeMatch[1]}${bracketRangeMatch[2]}-${bracketRangeMatch[3]}`);
+    }
+    return this.expandPortRange(normalized);
+  }
+
+  private expandInterfaceRangeReferences(line: string, interfaceRangeMembers: Map<string, string[]>): string[] {
+    const rstpMatch = line.match(/^set protocols rstp interface (\S+) (.+)$/);
+    if (rstpMatch) {
+      const members = interfaceRangeMembers.get(rstpMatch[1]);
+      if (members && members.length > 0) {
+        return members.map((member) =>
+          this.normalizeSpacing(`set protocols rstp interface ${member} ${rstpMatch[2]}`),
+        );
+      }
+    }
+
+    const dot1xMatch = line.match(/^set protocols dot1x authenticator interface (\S+) (.+)$/);
+    if (dot1xMatch) {
+      const members = interfaceRangeMembers.get(dot1xMatch[1]);
+      if (members && members.length > 0) {
+        return members.map((member) =>
+          this.normalizeSpacing(`set protocols dot1x authenticator interface ${member}.0 ${dot1xMatch[2]}`),
+        );
+      }
+    }
+
+    return [this.normalizeSpacing(line)];
+  }
+
+  private toUniqueNormalizedMap(lines: string[]): Map<string, string> {
+    const map = new Map<string, string>();
+    for (const line of lines) {
+      map.set(this.normalizeLine(line), line);
+    }
+    return map;
+  }
+
+  private keepLastScalarAssignments(lines: string[]): string[] {
+    const singletonPrefixes = [
+      'set system host-name ',
+      'set system time-zone ',
+    ];
+
+    const lastIndexByPrefix = new Map<string, number>();
+    lines.forEach((line, index) => {
+      const prefix = singletonPrefixes.find((candidate) => line.startsWith(candidate));
+      if (prefix) {
+        lastIndexByPrefix.set(prefix, index);
+      }
+    });
+
+    return lines.filter((line, index) => {
+      const prefix = singletonPrefixes.find((candidate) => line.startsWith(candidate));
+      if (!prefix) return true;
+      return lastIndexByPrefix.get(prefix) === index;
+    });
   }
 
   /**

@@ -34,43 +34,50 @@
             Connection
           </button>
           <div class="accordion-content open" id="accordion-connection">
-            <label for="baud-rate">Baud Rate</label>
-            <select id="baud-rate">
-              <option value="9600" selected>9600</option>
-              <option value="19200">19200</option>
-              <option value="38400">38400</option>
-              <option value="57600">57600</option>
-              <option value="115200">115200</option>
-            </select>
+            <div class="connection-defaults-inline">
+              <span class="connection-defaults-label">EX Serial Defaults</span>
+              <code class="connection-defaults-value">9600 · 8N1 · No flow</code>
+            </div>
 
-            <label for="data-bits">Data Bits</label>
-            <select id="data-bits">
-              <option value="7">7</option>
-              <option value="8" selected>8</option>
-            </select>
+            <div class="serial-defaults-hidden" aria-hidden="true">
+              <label for="baud-rate">Baud Rate</label>
+              <select id="baud-rate" tabindex="-1">
+                <option value="9600" selected>9600</option>
+              </select>
 
-            <label for="parity">Parity</label>
-            <select id="parity">
-              <option value="none" selected>None</option>
-              <option value="even">Even</option>
-              <option value="odd">Odd</option>
-            </select>
+              <label for="data-bits">Data Bits</label>
+              <select id="data-bits" tabindex="-1">
+                <option value="8" selected>8</option>
+              </select>
 
-            <label for="stop-bits">Stop Bits</label>
-            <select id="stop-bits">
-              <option value="1" selected>1</option>
-              <option value="2">2</option>
-            </select>
+              <label for="parity">Parity</label>
+              <select id="parity" tabindex="-1">
+                <option value="none" selected>None</option>
+              </select>
 
-            <label for="flow-control">Flow Control</label>
-            <select id="flow-control">
-              <option value="none" selected>None</option>
-              <option value="hardware">Hardware (RTS/CTS)</option>
-            </select>
+              <label for="stop-bits">Stop Bits</label>
+              <select id="stop-bits" tabindex="-1">
+                <option value="1" selected>1</option>
+              </select>
+
+              <label for="flow-control">Flow Control</label>
+              <select id="flow-control" tabindex="-1">
+                <option value="none" selected>None</option>
+              </select>
+            </div>
 
             <div class="sidebar-actions">
-              <button id="btn-connect" class="btn btn-primary">Connect</button>
+              <button id="btn-connect" class="btn btn-primary">Choose Serial Port</button>
               <button id="btn-disconnect" class="btn btn-danger" disabled>Disconnect</button>
+              <button id="btn-clear-connection" class="btn btn-secondary" disabled>Clear Terminal</button>
+            </div>
+            <div class="connection-helper">
+              Opens browser port picker (Chrome/Edge only).
+            </div>
+            <div class="connection-next-steps">
+              <div><strong>01 Login to Switch</strong> — after connecting, authenticate to Junos.</div>
+              <div><strong>02 Identify Switch</strong> — confirm hostname/serial before cloud checks.</div>
+              <div>Optional: configure Mist API and load sites for cloud troubleshooting.</div>
             </div>
 
             <div class="remote-session-block">
@@ -97,35 +104,9 @@
             Mist API
           </button>
           <div class="accordion-content" id="accordion-mist-api">
-            <label for="mist-cloud">Cloud Region</label>
-            <select id="mist-cloud"></select>
-
-            <label for="mist-api-token">API Token</label>
-            <input type="password" id="mist-api-token" placeholder="Your Mist API token" autocomplete="off">
-
-            <label for="mist-org-id">Org ID</label>
-            <input type="text" id="mist-org-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
-
-            <label for="mist-site">Site</label>
-            <div class="input-row">
-              <select id="mist-site" disabled>
-                <option value="">— Load sites first —</option>
-              </select>
-              <button id="btn-load-sites" class="btn btn-secondary btn-sm">Load</button>
-            </div>
-
+            <button id="btn-open-mist-modal" class="btn btn-secondary">Configure Mist API</button>
+            <div class="connection-helper">Optional: configure Mist API and load sites for cloud troubleshooting.</div>
             <div id="mist-api-status" class="status-text"></div>
-          </div>
-        </div>
-
-        <!-- Terminal section -->
-        <div class="accordion-section" data-section="terminal">
-          <button class="accordion-trigger" data-target="terminal">
-            <svg class="accordion-chevron" viewBox="0 0 16 16" width="14" height="14"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            Terminal
-          </button>
-          <div class="accordion-content" id="accordion-terminal">
-            <button id="btn-clear" class="btn btn-secondary">Clear Output</button>
           </div>
         </div>
 
@@ -147,7 +128,7 @@
               <button id="btn-identify" class="btn btn-secondary" disabled>Identify Switch</button>
             </div>
 
-            <div id="device-identity" class="device-info-panel"></div>
+            <div id="device-identity" class="device-info-panel sidebar-device-identity-hidden" aria-hidden="true"></div>
 
             <div class="sidebar-actions" style="margin-top:8px;">
               <button id="btn-root-password" class="btn btn-secondary" disabled>Get Root Password</button>
@@ -156,16 +137,12 @@
             <div id="root-password-result"></div>
 
             <div class="sidebar-actions" style="margin-top:8px;">
-              <button id="btn-config-drift" class="btn btn-secondary" disabled>Check Config Drift</button>
+              <button id="btn-config-sync-preview" class="btn btn-secondary" disabled>Config Sync</button>
             </div>
-
-            <div id="config-drift-results"></div>
 
             <div class="sidebar-actions" style="margin-top:8px;">
               <button id="btn-offline-timeline" class="btn btn-secondary" disabled>Offline Timeline</button>
             </div>
-
-            <div id="timeline-results"></div>
 
             <div class="sidebar-actions" style="margin-top:8px;">
               <button id="btn-adopt" class="btn btn-secondary" disabled>Adopt Switch</button>
@@ -187,18 +164,15 @@
           <div class="accordion-content" id="accordion-troubleshooting">
             <label for="ts-uplink-port">Uplink Port (auto-detect if blank)</label>
             <input type="text" id="ts-uplink-port" placeholder="e.g. ge-0/0/0" autocomplete="off">
+            <div class="connection-helper" style="margin-top:4px;">Leave blank to auto-detect uplink from LLDP.</div>
 
-            <div class="sidebar-actions" style="margin-top:10px;">
-              <button id="btn-run-troubleshoot" class="btn btn-primary" disabled>Run Cloud Check</button>
-            </div>
             <div class="sidebar-actions" style="margin-top:6px;">
-              <button id="btn-mist-status" class="btn btn-secondary" disabled>Mist Status</button>
-            </div>
-            <div class="sidebar-actions" style="margin-top:6px;">
-              <button id="btn-ssl-check" class="btn btn-secondary" disabled>Firewall Policy Check</button>
+              <button id="btn-dhcp-refresh" class="btn btn-secondary" disabled>DHCP Refresh</button>
             </div>
 
-            <div id="ts-results"></div>
+            <div class="sidebar-actions" style="margin-top:8px;">
+              <button id="btn-restart-mist-agent" class="btn btn-secondary" disabled>Restart Mist Agent</button>
+            </div>
           </div>
         </div>
 
@@ -209,9 +183,148 @@
 
       </aside>
 
-      <!-- Terminal area -->
-      <div id="terminal-container"></div>
+      <section id="workspace">
+        <div id="workspace-top-strip" class="workspace-strip workspace-strip-top">
+          <div class="session-bar">
+            <span class="session-bar-label">Port</span>
+            <span id="selected-port" class="session-bar-port-value">None selected</span>
+            <span class="session-bar-divider" aria-hidden="true"></span>
+            <div id="device-summary" class="device-summary device-summary-empty">
+              <span class="device-summary-placeholder">Log in to identify the switch.</span>
+            </div>
+            <div id="console-task-indicator" class="console-task-indicator is-hidden" aria-live="polite"></div>
+            <button id="btn-clear" class="btn btn-secondary btn-sm session-bar-clear-btn">Clear Terminal</button>
+          </div>
+        </div>
 
+        <div id="terminal-container"></div>
+
+        <div
+          id="results-resize-handle"
+          class="results-resize-handle"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Resize results panel"
+        >
+          <div class="results-resize-grip" aria-hidden="true"></div>
+        </div>
+
+        <!-- Results panel — detailed workflow output lives here, not in the sidebar -->
+        <div id="results-panel">
+          <div id="results-panel-tabs">
+            <span class="results-panel-label">Results</span>
+            <button class="results-tab" data-pane="checks">Checks</button>
+            <button class="results-tab" data-pane="actions">Actions</button>
+            <button class="results-tab" data-pane="config-sync">Config Sync</button>
+            <button class="results-tab" data-pane="timeline">Timeline</button>
+            <div class="results-panel-spacer"></div>
+            <span id="mist-api-status" class="status-text results-api-status"></span>
+          </div>
+          <div id="results-panel-body">
+            <!-- Checks pane: diagnostic check results live here, not in the sidebar -->
+            <div class="results-pane results-pane-hidden" id="checks-results">
+              <div id="ts-results">
+              </div>
+            </div>
+            <div class="results-pane results-pane-hidden" id="actions-results">
+              <div id="actions-content">
+                <div class="results-pane-empty">Run <strong>DHCP Refresh</strong>, <strong>Get Root Password</strong>, or other operator actions to see their results here.</div>
+              </div>
+            </div>
+            <div class="results-pane" id="config-sync-results">
+              <div id="config-sync-content">
+                <div class="results-pane-empty">Run <strong>Config Sync</strong> to see the staged diff and commit-check result here.</div>
+              </div>
+              <div id="config-sync-action-bar" aria-label="Config sync pending actions">
+                <div id="config-sync-staged-banner" class="config-sync-staged-banner">
+                  <span class="config-sync-staged-banner-icon" aria-hidden="true">⚠</span>
+                  Candidate config is staged on the switch and <strong>not yet committed</strong>. Choose an action below.
+                </div>
+                <div class="config-sync-action-buttons">
+                  <button id="btn-commit-sync" class="btn btn-primary btn-sm" disabled>Commit</button>
+                  <button id="btn-rollback-sync" class="btn btn-danger btn-sm" disabled>Rollback</button>
+                </div>
+              </div>
+            </div>
+            <div class="results-pane results-pane-hidden" id="timeline-results">
+              <div class="results-pane-empty">Run <strong>Offline Timeline</strong> to see Mist event history and switch logs here.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right guidance panel: cloud status pills + JMA recommendation card -->
+      <!-- Moved out of session header so it has a fixed column and doesn't compress the terminal -->
+      <aside id="guidance-panel">
+        <div
+          id="guidance-resize-handle"
+          class="guidance-resize-handle"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize guidance panel"
+        ></div>
+        <div id="cloud-status-panel" class="guidance-cloud-status">
+          <div class="cloud-status-panel-header">
+            <span class="guidance-panel-title">Cloud Status</span>
+            <span id="cloud-status-last-updated" class="cloud-status-panel-meta">Not yet checked</span>
+          </div>
+          <div class="cloud-status-grid">
+            <div class="cloud-status-card">
+              <div class="cloud-status-card-label">Mist Status</div>
+              <span id="mist-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
+              <div id="mist-monitor-detail" class="cloud-status-card-detail">Identify and match the switch in Mist to enable Mist status monitoring.</div>
+            </div>
+            <div class="cloud-status-card">
+              <div class="cloud-status-card-label">Switch Cloud State</div>
+              <span id="jma-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
+              <div id="jma-monitor-detail" class="cloud-status-card-detail">Log in to start the switch-reported cloud status monitor.</div>
+            </div>
+          </div>
+        </div>
+        <div id="jma-recommendation" class="jma-recommendation-card jma-recommendation-hidden" aria-live="polite"></div>
+      </aside>
+
+    </div>
+
+    <div id="mist-modal-overlay" class="mist-modal-overlay is-hidden" aria-hidden="true">
+      <div class="mist-modal" role="dialog" aria-modal="true" aria-labelledby="mist-modal-title">
+        <div class="mist-modal-header">
+          <h3 id="mist-modal-title">Mist API Integration Setup</h3>
+          <button id="btn-close-mist-modal" class="mist-modal-close" type="button" aria-label="Close Mist setup">&times;</button>
+        </div>
+        <p class="mist-modal-description">
+          Configure your Mist Cloud credentials to enable cloud-managed diagnostics and automated onboarding features.
+        </p>
+
+        <label for="mist-cloud">Mist Cloud / Region</label>
+        <select id="mist-cloud"></select>
+
+        <label for="mist-api-token">API Token</label>
+        <div class="input-row">
+          <input type="password" id="mist-api-token" placeholder="Enter your Mist API token" autocomplete="off">
+          <button id="btn-load-orgs" class="btn btn-secondary btn-sm" type="button">Load Orgs</button>
+        </div>
+
+        <label for="mist-org">Organization</label>
+        <select id="mist-org" disabled>
+          <option value="">— Load orgs first —</option>
+        </select>
+
+        <label for="mist-site">Site <span class="mist-modal-label-hint">(optional — for root password lookup)</span></label>
+        <div class="input-row">
+          <select id="mist-site" disabled>
+            <option value="">— Load sites first —</option>
+          </select>
+          <button id="btn-load-sites" class="btn btn-secondary btn-sm">Load Sites</button>
+        </div>
+
+        <div id="mist-modal-status" class="status-text mist-modal-status-area"></div>
+
+        <div class="mist-modal-actions">
+          <button id="btn-cancel-mist-modal" class="btn btn-secondary" type="button">Cancel</button>
+          <button id="btn-save-mist-modal" class="btn btn-primary" type="button">Save Configuration</button>
+        </div>
+      </div>
     </div>
 
   </div>

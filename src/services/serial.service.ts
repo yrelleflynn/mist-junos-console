@@ -39,6 +39,7 @@ export class SerialService {
   private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private reading = false;
+  private uiSuppressionCount = 0;
 
   private listeners: {
     [K in keyof SerialEventMap]?: Set<SerialEventCallback<SerialEventMap[K]>>;
@@ -208,5 +209,17 @@ export class SerialService {
    */
   get isConnected(): boolean {
     return this.port !== null && this.reading;
+  }
+
+  beginUiDataSuppression(): void {
+    this.uiSuppressionCount += 1;
+  }
+
+  endUiDataSuppression(): void {
+    this.uiSuppressionCount = Math.max(0, this.uiSuppressionCount - 1);
+  }
+
+  get isUiDataSuppressed(): boolean {
+    return this.uiSuppressionCount > 0;
   }
 }

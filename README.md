@@ -1,5 +1,11 @@
 # Junos Console — Web Serial Terminal
 
+For ongoing product and engineering direction, see:
+
+- [`docs/PRD.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/PRD.md)
+- [`docs/DEVELOPMENT-METHODOLOGY.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/DEVELOPMENT-METHODOLOGY.md)
+- [`docs/ENGINEERING-REVIEW.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/ENGINEERING-REVIEW.md)
+
 A browser-based serial terminal and automated troubleshooting tool for Juniper Mist switches running Junos, via USB-C or RJ45 console connection.
 
 **Audience:** Operators who may not be deeply technical—often a switch that is **disconnected in Mist** and needs console-side diagnosis or adoption. Long term, the experience should be launchable from the Mist UI (for example “Troubleshoot via console”) so the user only opens a URL in Chrome or Edge and plugs in a cable—**no local install of Node, npm, or Vite** in production.
@@ -311,7 +317,7 @@ Ideas and follow-ups (not committed work). Add or tick items as you go.
 - Modular troubleshoot: first segment (**LLDP → upstream → port → errors**) driven by **`TroubleshootStep`** queue
 - Node backend (`server/index.mjs`): Mist **`/mist-proxy`**, **`/health`**, WebSocket **`/ws`** for shared console sessions
 - Operator **remote session** checkbox + **`support.html`** for remote view/type (session ID acts as shared secret; add auth before wider rollout)
-- Vite proxies `/mist-proxy` and `/ws` to the backend; `npm run dev` starts both processes
+- Vite proxies `/mist-proxy` to the backend; console WebSocket uses direct `ws://127.0.0.1:<port>/ws` in dev; `npm run dev` starts both processes
 - Serial **`tx`** events for mirroring operator-originated bytes without echoing support-injected bytes back as operator traffic
 
 ### v0.6.0

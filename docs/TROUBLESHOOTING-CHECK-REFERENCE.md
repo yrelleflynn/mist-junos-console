@@ -1,14 +1,138 @@
-================================================================================
-JUNOS CONSOLE — CLOUD CONNECTIVITY CHECK: TEST REFERENCE
-================================================================================
+# MIST JUNOS CONSOLE
 
-This document describes each automated test, what it checks, why it
+Browser-based serial console and guided recovery workspace for
+Juniper Mist-managed switches running Junos.
+
+## WHAT IT IS
+
+mist-junos-console is a single-page web application that runs in Chrome or Edge
+using the Web Serial API. It gives an operator a complete recovery workspace for
+an offline, unadopted, or misconfigured Mist-managed EX switch — without
+installing any software, opening a separate terminal, or manually cross-referencing
+the Mist dashboard.
+
+Core capabilities:
+  - Web Serial console terminal (xterm, Junos syntax highlighting)
+  - Automatic device identification matched against Mist inventory
+  - JMA Connectivity State monitoring (switch-reported cloud state)
+  - Mist Status monitoring (last-known cloud state from Mist)
+  - 14-check automated cloud connectivity troubleshooting
+  - Config drift comparison (Mist intended vs live running config)
+  - Staged config sync with operator-gated Commit Confirmed, Commit, and Rollback
+  - Remote session mirroring for shared support sessions
+
+## THE PROBLEM IT SOLVES
+
+When a Mist-managed switch goes offline, the current workflow is slow and
+fragmented: physical console access, a separate terminal application, manual
+Mist context lookup, tribal-knowledge troubleshooting, and manual command
+construction for any remediation. Less experienced operators escalate. Recovery
+takes 30-60 minutes per switch.
+
+This tool collapses that into a single browser tab. The operator connects the
+cable, opens the app, and has structured diagnostics and guided remediation in
+one place — without deep Junos expertise.
+
+## ARCHITECTURE
+
+Frontend (browser):
+  - src/main.ts         — UI orchestration and workflow wiring
+  - src/components/terminal.component.ts — xterm terminal wrapper and render path
+  - src/services/       — Modular workflow services:
+      troubleshoot.service.ts   — 14-check connectivity diagnostic engine
+      config-sync.service.ts    — Staged config sync with commit/rollback
+      config-drift.service.ts   — Mist intent vs live config comparison
+      switch-identity.service.ts — Switch identification and Mist matching
+      command-runner.service.ts  — Console command execution, prompt, and mode handling
+  - src/controllers/    — Shared session and device workflow controllers:
+      cloud-status.controller.ts — Mist status and JMA state orchestration
+      device-context.controller.ts — Device identity and Mist match state
+  - index.html          — UI layout
+  - src/styles/main.css — Styling
+
+Backend (Node/Express):
+  - server/index.mjs    — Mist API proxy, WebSocket relay for remote sessions
+  - Proxies Mist REST calls (config, stats, events, adoption commands)
+  - Manages session state and remote participant connections
+  - Exposes /mcp/session-state and /mcp/agent-context for MCP POC integration
+
+MCP server (standalone, Phase 1 POC):
+  - mcp/server.ts       — Read-only MCP server for AI agent access
+  - Tools: get_session_summary, get_device_identity, get_jma_connectivity_state,
+            get_check_results, get_device_config (fully wired via Mist proxy)
+  - See docs/BACKEND-MCP-POC.md for setup and current status
+
+## SETUP
+
+Requirements:
+  - Node.js 18+
+  - Chrome or Edge (Web Serial API required; Firefox not supported)
+  - USB-to-serial cable connected to an EX switch console port
+  - Mist API token with org/site/device read access
+
+Install and run:
+  npm install
+  npm run build
+  npm start
+
+Open http://localhost:3000 in Chrome or Edge.
+
+Configure in the app settings panel:
+  - Mist cloud (api.mist.com or EU/staging equivalent)
+  - API token
+  - Organization
+
+The site and device are discovered automatically after identification.
+
+## EXAMPLE OPERATOR WORKFLOW
+
+1. Connect USB serial cable to EX switch console port.
+2. Open the app in Chrome, click Connect, select the serial port.
+3. Log in to the switch if prompted (use root password from Mist site settings).
+4. Click Identify Device — the tool matches the switch to Mist inventory.
+5. Observe JMA Connectivity State and Mist Status in the session header.
+6. Click Run Troubleshoot — 14 checks run in sequence.
+   - Gated checks skip automatically if a prerequisite fails.
+   - Each failed check shows what was found, what was expected, and remediation.
+7. Click Config Drift to compare Mist-intended config to live running config.
+8. Click Config Sync to stage the Mist diff as a candidate:
+   - The tool runs show | compare and commit check.
+   - The candidate is left staged on the switch.
+   - Choose Commit Confirmed (5-min auto-rollback), Commit, or Rollback.
+9. Observe the session header — Mist Status updates to connected after a
+   successful commit.
+
+## EXAMPLE OUTPUTS
+
+Troubleshooting check (failed gateway):
+  [FAIL] Default Gateway
+  Expected: A default route in the routing table.
+  Found: No inet.0 default route.
+  Skipped downstream: DNS Resolution, Route to Mist Endpoints, Firewall Policy
+  Remediation: Verify DHCP lease, check gateway config on uplink, renew DHCP.
+
+Config drift (missing VLAN):
+  Mist intent includes:
+    set vlans MGMT vlan-id 100
+    set interfaces irb unit 100 family inet address 10.1.1.10/24
+  Running config is missing both lines.
+
+Config sync staged:
+  show | compare output:
+    [edit vlans]
+    + MGMT { vlan-id 100; }
+    [edit interfaces irb]
+    + unit 100 { family inet { address 10.1.1.10/24; } }
+  commit check: configuration check succeeds
+  Candidate staged — choose Commit Confirmed, Commit, or Rollback.
+
+## JUNOS CONSOLE — CLOUD CONNECTIVITY CHECK: TEST REFERENCE
+
+This section describes each automated test, what it checks, why it
 matters, what pass/fail means, and recommended remediation steps.
 These remediation steps form the basis for future automated fixes.
 
-================================================================================
-1. LLDP NEIGHBORS
-================================================================================
+### 1. LLDP NEIGHBORS
 
 Command:    show lldp neighbors
 Purpose:    Detect devices connected to the switch via LLDP and identify the
@@ -33,9 +157,7 @@ Remediation:
   5. If LLDP is intentionally disabled upstream, manually specify the
      uplink port in the tool's "Uplink Port" field and continue.
 
-================================================================================
-2. UPLINK PORT STATUS
-================================================================================
+### 2. UPLINK PORT STATUS
 
 Command:    show interfaces <port> terse
             show interfaces <port>
@@ -60,9 +182,7 @@ Remediation:
        commit
   4. Check for PoE issues if using a PoE-powered device on the uplink.
 
-================================================================================
-2b. UPLINK INTERFACE ERRORS
-================================================================================
+### 2b. UPLINK INTERFACE ERRORS
 
 Command:    show interfaces <port> extensive | match error
 Purpose:    Check for CRC errors, framing errors, drops, discards on the
@@ -87,9 +207,7 @@ Remediation:
   6. If using fiber, clean the connectors and check light levels:
        show interfaces diagnostics optics <port>
 
-================================================================================
-3. VLAN CONFIGURATION
-================================================================================
+### 3. VLAN CONFIGURATION
 
 Command:    show vlans interface <port>
             show ethernet-switching interface <port>  (fallback)
@@ -115,9 +233,7 @@ Remediation:
   4. If the switch is Mist-managed, check the port profile in the Mist
      dashboard — the VLAN assignment may need to be updated there.
 
-================================================================================
-4. MANAGEMENT IP ADDRESS  [CRITICAL]
-================================================================================
+### 4. MANAGEMENT IP ADDRESS  [CRITICAL]
 
 Command:    show interfaces terse | match "inet "
 Purpose:    Verify the switch has an IP address on a management interface.
@@ -149,9 +265,7 @@ Remediation:
   5. If using me0 (out-of-band management), ensure the management
      cable is connected to the dedicated management port on the switch.
 
-================================================================================
-4b. DHCP LEASE DETAILS
-================================================================================
+### 4b. DHCP LEASE DETAILS
 
 Command:    show dhcp client binding
             show dhcp client binding detail
@@ -164,21 +278,34 @@ Remediation (if DHCP expected but not working):
   1. Verify the DHCP client is enabled:
        show configuration interfaces irb unit 0
      Should contain "family inet dhcp".
-  2. Check if the DHCP server is providing offers:
+  2. Force the DHCP client to renew its lease:
+       request dhcp client renew irb.0
+     This is the preferred first-step way to reinitialize DHCP lease
+     acquisition on EX switches before changing interface configuration.
+  3. If the DHCP client still appears stuck after a renew:
+     a. During a maintenance window, remove and re-add the DHCP client
+        stanza on the IRB interface to force a deeper reinitialization:
+          delete interfaces irb unit 0 family inet dhcp
+          commit
+          set interfaces irb unit 0 family inet dhcp
+          commit
+     b. Re-check:
+          show dhcp client binding detail
+     c. Use this cautiously — Junos DHCP client behavior can be sticky,
+        and this is a stronger workaround than a normal renew.
+  4. Check if the DHCP server is providing offers:
        monitor traffic interface irb.0 matching "port 67 or port 68"
      Look for DHCP Discover/Offer/Request/Ack.
-  3. Verify the VLAN tagging — DHCP may fail if the switch is on the
+  5. Verify the VLAN tagging — DHCP may fail if the switch is on the
      wrong VLAN or the uplink isn't carrying the management VLAN.
-  4. Check the DHCP scope on the server — ensure it has available
+  6. Check the DHCP scope on the server — ensure it has available
      addresses and the correct subnet/gateway/DNS options.
-  5. If DHCP is working but missing gateway or DNS options, update the
+  7. If DHCP is working but missing gateway or DNS options, update the
      DHCP scope on the server to include:
      - Option 3 (Router/Gateway)
      - Option 6 (DNS Servers)
 
-================================================================================
-5. ARP TABLE
-================================================================================
+### 5. ARP TABLE
 
 Command:    show arp no-resolve
 Purpose:    Verify the ARP table has entries.
@@ -204,9 +331,7 @@ Remediation:
   6. Verify there are no firewall filters blocking ARP:
        show configuration firewall
 
-================================================================================
-6. DEFAULT GATEWAY  [CRITICAL]
-================================================================================
+### 6. DEFAULT GATEWAY  [CRITICAL]
 
 Command:    show route 0.0.0.0/0
 Purpose:    Verify a default route exists.
@@ -229,9 +354,7 @@ Remediation:
   5. If Mist-managed, check the site configuration in the Mist dashboard
      for the management IP settings.
 
-================================================================================
-7. DNS CONFIGURATION
-================================================================================
+### 7. DNS CONFIGURATION
 
 Commands:   show configuration system name-server
             show configuration groups | display set | match name-server
@@ -262,9 +385,7 @@ Remediation:
   5. Verify DNS servers are reachable:
        ping inet 8.8.8.8 count 3
 
-================================================================================
-8. DNS RESOLUTION & REACHABILITY  [CRITICAL]
-================================================================================
+### 8. DNS RESOLUTION & REACHABILITY  [CRITICAL]
 
 Command:    ping inet <oc-term-host> count 3 rapid
 Purpose:    Test DNS resolution and ICMP reachability to the Mist cloud.
@@ -292,9 +413,7 @@ Remediation:
         to force IPv4.
      b. Check routing (test 6).
 
-================================================================================
-9. ROUTE TO MIST ENDPOINTS
-================================================================================
+### 9. ROUTE TO MIST ENDPOINTS
 
 Command:    show host <oc-term-host>
             show route <resolved-ip>
@@ -314,9 +433,7 @@ Remediation:
   3. If using a management routing instance, ensure outbound traffic
      from the management interface uses the correct routing table.
 
-================================================================================
-10. ENDPOINT TCP REACHABILITY
-================================================================================
+### 10. ENDPOINT TCP REACHABILITY
 
 Commands:   ping inet <host> count 1 rapid
             telnet inet <host> port <port>
@@ -354,9 +471,7 @@ Remediation:
      a. The switch may still connect via the CloudX/JMA path on port 443.
      b. If the switch requires port 2200, request it be opened.
 
-================================================================================
-10b. SSL CERTIFICATE INSPECTION CHECK
-================================================================================
+### 10b. SSL CERTIFICATE INSPECTION CHECK
 
 Command:    curl -vk --connect-timeout 10 https://<host>/ -o /dev/null 2>&1
             (run via interactive shell: start shell → curl → exit → cli)
@@ -387,9 +502,7 @@ Remediation:
   6. After making firewall changes, re-run this test to confirm the
      certificate is now from the expected issuer.
 
-================================================================================
-10c. TRACEROUTE (on failed endpoints only)
-================================================================================
+### 10c. TRACEROUTE (on failed endpoints only)
 
 Command:    traceroute inet <host> wait 2 as-number-lookup no-resolve
 Purpose:    Show where the network path breaks for unreachable endpoints.
@@ -410,9 +523,7 @@ Remediation:
      b. This doesn't necessarily mean the TCP connection will also fail.
      c. Focus on the telnet test results instead.
 
-================================================================================
-11. MIST AGENT VERSION
-================================================================================
+### 11. MIST AGENT VERSION
 
 Command:    show version | match mist
 Purpose:    Check if the Mist Agent is installed.
@@ -431,9 +542,7 @@ Remediation:
      b. Or upgrade manually:
           request system software add <image-url> no-validate reboot
 
-================================================================================
-12. MIST AGENT PROCESSES (mcd/jmd)
-================================================================================
+### 12. MIST AGENT PROCESSES (mcd/jmd)
 
 Command:    ps aux | grep mcd|jmd  (via interactive shell)
 Purpose:    Verify the Mist Cloud Daemon (mcd) and Junos Mist Daemon (jmd)
@@ -463,9 +572,7 @@ Remediation:
      If full, free up space:
        request system storage cleanup
 
-================================================================================
-13. OUTBOUND SSH CONFIGURATION
-================================================================================
+### 13. OUTBOUND SSH CONFIGURATION
 
 Command:    show configuration system services outbound-ssh
 Purpose:    Verify the outbound-ssh client "mist" is configured.
@@ -494,9 +601,7 @@ Remediation:
        show configuration system services outbound-ssh client mist
      The target should be oc-term.<cloud>.mist.com or oc-term.mistsys.net.
 
-================================================================================
-14. ACTIVE CLOUD CONNECTIONS
-================================================================================
+### 14. ACTIVE CLOUD CONNECTIONS
 
 Commands:   show system connections | grep <management-ip>
             show host <endpoint>  (for each cloud endpoint FQDN)
@@ -537,9 +642,7 @@ Remediation:
      b. The device-id in the outbound-ssh config may not match any org.
         Delete and re-adopt the switch.
 
-================================================================================
-LOGIN FLOW
-================================================================================
+### LOGIN FLOW
 
 The Login to Switch button handles these scenarios:
 
@@ -567,9 +670,7 @@ Remediation for login failures:
      b. Ensure the site has a root password configured in
         Organization → Site Configuration → Switch Management.
 
-================================================================================
-CRITICAL GATE LOGIC
-================================================================================
+### CRITICAL GATE LOGIC
 
   4. Management IP Address — skips all remaining if no IP.
   6. Default Gateway — skips DNS and cloud checks if no route.

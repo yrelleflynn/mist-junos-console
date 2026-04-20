@@ -15,8 +15,16 @@ export interface CommandResult {
   error?: string;
 }
 
+export interface CommandExecutionOptions {
+  silent?: boolean;
+}
+
+export interface WaitForOptions {
+  silent?: boolean;
+}
+
 /** Common Junos CLI prompt patterns */
-const PROMPT_PATTERNS = [
+export const PROMPT_PATTERNS = [
   /[\w\-@.:]+>\s*$/,       // operational mode: user@switch>
   /[\w\-@.:]+#\s*$/,       // config mode: user@switch#
   /[\w\-@.:]+%\s*$/,       // shell mode: root@switch%
@@ -24,8 +32,60 @@ const PROMPT_PATTERNS = [
   /[Pp]assword:\s*$/,      // password prompt
 ];
 
-const MORE_PATTERN = /---\(more\s*\d*%?\)---/i;
-const MORE_PATTERN_ALT = /--\(more\)--/i;
+export const MORE_PATTERN = /---\(more\s*\d*%?\)---/i;
+export const MORE_PATTERN_ALT = /--\(more\)--/i;
+
+/**
+ * Normalise raw serial capture before prompt/echo stripping:
+ * - remove carriage returns
+ * - collapse backspace-overstrike sequences produced by shell echo wrapping
+ */
+export function normalizeSerialCapture(raw: string): string {
+  let output = raw.replace(/\r/g, '');
+  let previous = '';
+  while (output !== previous) {
+    previous = output;
+    output = output.replace(/[^\n]\x08/g, '');
+  }
+  return output.replace(/\x08/g, '');
+}
+
+/**
+ * Strip the echoed command from the beginning of captured output,
+ * remove surrounding blank lines, and drop the trailing prompt line.
+ *
+ * This is extracted as a pure function so it can be tested without a real
+ * serial connection.
+ */
+export function stripCommandEcho(raw: string, command: string): string {
+  let output = normalizeSerialCapture(raw);
+  const cmdIndex = output.indexOf(command);
+  if (cmdIndex !== -1) {
+    output = output.substring(cmdIndex + command.length);
+  }
+  // Strip leading/trailing whitespace and newlines
+  output = output.replace(/^\s*\n/, '').replace(/\n\s*$/, '');
+  // Strip the trailing prompt line
+  const lines = output.split('\n');
+  if (lines.length > 0 && PROMPT_PATTERNS.some((p) => p.test(lines[lines.length - 1]))) {
+    lines.pop();
+  }
+  return lines.join('\n').trimEnd();
+}
+
+/**
+ * Return true if the trimmed buffer ends with a recognised Junos CLI prompt.
+ */
+export function endsWithPrompt(buffer: string): boolean {
+  return PROMPT_PATTERNS.some((p) => p.test(buffer.trimEnd()));
+}
+
+/**
+ * Return true if the buffer contains a --More-- pagination marker.
+ */
+export function containsMorePrompt(buffer: string): boolean {
+  return MORE_PATTERN.test(buffer) || MORE_PATTERN_ALT.test(buffer);
+}
 
 export class CommandRunnerService {
   private serial: SerialService;
@@ -44,7 +104,12 @@ export class CommandRunnerService {
    * @param timeoutMs — Max time to wait for output (default 15s)
    * @param promptWait — Time to wait after last data for prompt detection (default 1s)
    */
-  async execute(command: string, timeoutMs = 20000, promptWait = 2000): Promise<CommandResult> {
+  async execute(
+    command: string,
+    timeoutMs = 20000,
+    promptWait = 2000,
+    options: CommandExecutionOptions = {},
+  ): Promise<CommandResult> {
     if (!this.serial.isConnected) {
       return { command, output: '', success: false, error: 'Not connected' };
     }
@@ -60,6 +125,9 @@ export class CommandRunnerService {
           this.serial.off('data', this.dataHandler);
           this.dataHandler = null;
         }
+        if (options.silent) {
+          this.serial.endUiDataSuppression();
+        }
         clearInterval(checkInterval);
         clearTimeout(absoluteTimeout);
       };
@@ -69,21 +137,7 @@ export class CommandRunnerService {
         settled = true;
         cleanup();
 
-        // Strip the echoed command from the beginning of output
-        let output = this.outputBuffer;
-        const cmdIndex = output.indexOf(command);
-        if (cmdIndex !== -1) {
-          output = output.substring(cmdIndex + command.length);
-        }
-        // Strip leading/trailing whitespace and newlines
-        output = output.replace(/^\s*\n/, '').replace(/\n\s*$/, '');
-        // Strip the trailing prompt line
-        const lines = output.split('\n');
-        if (lines.length > 0 && PROMPT_PATTERNS.some((p) => p.test(lines[lines.length - 1]))) {
-          lines.pop();
-        }
-        output = lines.join('\n').trimEnd();
-
+        const output = stripCommandEcho(this.outputBuffer, command);
         resolve({ command, output, success, error });
       };
 
@@ -95,9 +149,9 @@ export class CommandRunnerService {
         lastDataTime = Date.now();
 
         // Handle --More-- pagination
-        if (MORE_PATTERN.test(this.outputBuffer) || MORE_PATTERN_ALT.test(this.outputBuffer)) {
+        if (containsMorePrompt(this.outputBuffer)) {
           // Send space to get next page
-          this.serial.writeString(' ').catch(() => {});
+          this.serial.writeString(' ', !options.silent).catch(() => {});
         }
       };
       this.serial.on('data', this.dataHandler);
@@ -106,9 +160,7 @@ export class CommandRunnerService {
       checkInterval = setInterval(() => {
         const elapsed = Date.now() - lastDataTime;
         if (elapsed >= promptWait && this.outputBuffer.length > 0) {
-          // Check if buffer ends with a prompt
-          const trimmed = this.outputBuffer.trimEnd();
-          if (PROMPT_PATTERNS.some((p) => p.test(trimmed))) {
+          if (endsWithPrompt(this.outputBuffer)) {
             finish(true);
           }
         }
@@ -120,7 +172,10 @@ export class CommandRunnerService {
       }, timeoutMs);
 
       // Send the command
-      this.serial.writeString(command + '\n').catch((err) => {
+      if (options.silent) {
+        this.serial.beginUiDataSuppression();
+      }
+      this.serial.writeString(command + '\n', !options.silent).catch((err) => {
         finish(false, `Send error: ${err instanceof Error ? err.message : String(err)}`);
       });
     });
@@ -142,6 +197,7 @@ export class CommandRunnerService {
     text: string,
     pattern: RegExp,
     timeoutMs = 10000,
+    options: WaitForOptions = {},
   ): Promise<{ output: string; matched: boolean }> {
     if (!this.serial.isConnected) {
       return { output: '', matched: false };
@@ -163,6 +219,9 @@ export class CommandRunnerService {
         if (settled) return;
         settled = true;
         this.serial.off('data', handler);
+        if (options.silent) {
+          this.serial.endUiDataSuppression();
+        }
         clearTimeout(timeout);
         resolve({ output: buffer, matched });
       };
@@ -171,7 +230,10 @@ export class CommandRunnerService {
 
       const timeout = setTimeout(() => done(false), timeoutMs);
 
-      this.serial.writeString(text).catch(() => done(false));
+      if (options.silent) {
+        this.serial.beginUiDataSuppression();
+      }
+      this.serial.writeString(text, !options.silent).catch(() => done(false));
     });
   }
 
@@ -219,8 +281,8 @@ export class CommandRunnerService {
    * Detect the current CLI mode by sending Enter and examining the prompt.
    * Returns: 'operational' | 'config' | 'shell' | 'login' | 'unknown'
    */
-  async detectMode(): Promise<'operational' | 'config' | 'shell' | 'login' | 'unknown'> {
-    const result = await this.sendAndWaitFor('\n', />\s*$|#\s*$|%\s*$|login:/i, 3000);
+  async detectMode(options: WaitForOptions = {}): Promise<'operational' | 'config' | 'shell' | 'login' | 'unknown'> {
+    const result = await this.sendAndWaitFor('\n', />\s*$|#\s*$|%\s*$|login:/i, 3000, options);
     const output = result.output.trim();
 
     if (/login:\s*$/i.test(output)) return 'login';
@@ -234,28 +296,31 @@ export class CommandRunnerService {
    * Ensure the CLI is in Junos operational mode.
    * Exits config mode or shell if needed.
    */
-  async ensureOperationalMode(): Promise<void> {
-    const mode = await this.detectMode();
+  async ensureOperationalMode(options: CommandExecutionOptions = {}): Promise<void> {
+    const mode = await this.detectMode(options);
 
     if (mode === 'config') {
       // Exit config mode without committing
-      await this.execute('exit', 5000);
+      await this.execute('exit', 5000, 2000, options);
       // Check if we're still in config (nested edit levels)
-      const mode2 = await this.detectMode();
+      const mode2 = await this.detectMode(options);
       if (mode2 === 'config') {
-        await this.execute('top', 3000);
-        await this.execute('exit', 5000);
+        await this.execute('top', 3000, 2000, options);
+        await this.execute('exit', 5000, 2000, options);
       }
     } else if (mode === 'shell') {
-      // Exit shell, then enter CLI
-      await this.send('exit\n');
+      // On EX, `exit` from `start shell` usually returns straight to CLI.
+      await this.sendAndWaitFor('exit\n', />\s*$|#\s*$|%\s*$|login:/i, 3000, options);
       await new Promise((r) => setTimeout(r, 1000));
-      await this.send('cli\n');
-      await new Promise((r) => setTimeout(r, 1500));
+      const modeAfterExit = await this.detectMode(options);
+      if (modeAfterExit === 'shell') {
+        await this.sendAndWaitFor('cli\n', />\s*$|#\s*$|login:/i, 5000, options);
+        await new Promise((r) => setTimeout(r, 1500));
+      }
     }
 
     // Disable pagination
-    await this.execute('set cli screen-length 0', 5000);
+    await this.execute('set cli screen-length 0', 5000, 2000, options);
   }
 
   /**
@@ -280,5 +345,26 @@ export class CommandRunnerService {
 
     // Now in operational mode — enter config
     await this.execute('configure', 5000);
+  }
+
+  /**
+   * Ensure the CLI is in the shell prompt (`%`).
+   * Exits config mode if needed, then enters shell from operational mode.
+   */
+  async ensureShellMode(options: CommandExecutionOptions = {}): Promise<void> {
+    const mode = await this.detectMode(options);
+
+    if (mode === 'shell') return;
+
+    if (mode === 'config') {
+      await this.ensureOperationalMode(options);
+    } else if (mode === 'login') {
+      throw new Error('Cannot enter shell while at the login prompt');
+    }
+
+    const shellResult = await this.sendAndWaitFor('start shell\n', /%\s*$|login:/i, 5000, options);
+    if (!shellResult.matched || !/%\s*$/.test(shellResult.output.trimEnd())) {
+      throw new Error('Could not enter shell mode');
+    }
   }
 }
