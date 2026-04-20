@@ -383,7 +383,13 @@ const server = http.createServer((req, res) => {
   res.end('Not found');
 });
 
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({
+  noServer: true,
+  perMessageDeflate: {
+    zlibDeflateOptions: { level: 6 },
+    threshold: 256,
+  },
+});
 
 server.on('upgrade', (request, socket, head) => {
   const path = request.url?.split('?')[0];
