@@ -10,6 +10,11 @@ const sessionInput = document.getElementById('support-session-id') as HTMLInputE
 const btnConnect = document.getElementById('btn-support-connect') as HTMLButtonElement;
 const statusEl = document.getElementById('support-status') as HTMLElement;
 const wrap = document.getElementById('support-terminal-wrap') as HTMLElement;
+const bannerEl = document.createElement('div');
+bannerEl.className = 'support-session-banner is-hidden';
+bannerEl.setAttribute('role', 'status');
+bannerEl.setAttribute('aria-live', 'polite');
+wrap.parentElement?.insertBefore(bannerEl, wrap);
 
 const params = new URLSearchParams(window.location.search);
 const preset = params.get('session');
@@ -21,6 +26,16 @@ let cs: ConsoleSessionService | null = null;
 function setStatus(text: string, kind: 'info' | 'error' | 'success' = 'info'): void {
   statusEl.textContent = text;
   statusEl.className = `support-status status-text ${kind}`;
+}
+
+function setSessionBanner(text: string | null, kind: 'info' | 'warn' | 'error' = 'info'): void {
+  if (!text) {
+    bannerEl.textContent = '';
+    bannerEl.className = 'support-session-banner is-hidden';
+    return;
+  }
+  bannerEl.textContent = text;
+  bannerEl.className = `support-session-banner ${kind}`;
 }
 
 term.onInput = (data: string) => {
@@ -37,6 +52,7 @@ btnConnect.addEventListener('click', () => {
   }
   cs?.close();
   term.clear();
+  setSessionBanner(null);
   term.writeSystem('— Joining session… —');
   setStatus('Connecting…', 'info');
 
@@ -44,6 +60,7 @@ btnConnect.addEventListener('click', () => {
   cs = session;
   session.onJoined = () => {
     setStatus('Connected — mirrored console.', 'success');
+    setSessionBanner(null);
     term.focus();
     term.writeSystem('— Connected. Output from the switch appears below. —');
   };
@@ -55,9 +72,12 @@ btnConnect.addEventListener('click', () => {
   };
   session.onSessionEnded = (reason: string) => {
     setStatus(`Session ended: ${reason}`, 'info');
+    setSessionBanner('Operator disconnected — this support view is no longer live.', 'warn');
+    term.writeSystem('— Operator disconnected. Session ended. —');
   };
   session.onError = (msg: string) => {
     setStatus(msg, 'error');
+    setSessionBanner(msg, 'error');
   };
   session.startAsSupport(sid);
 });

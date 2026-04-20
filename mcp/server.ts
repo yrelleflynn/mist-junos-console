@@ -768,6 +768,7 @@ async function runBoundedOperatorAction(
   type: string,
   params: Record<string, unknown>,
   timeoutMs: number,
+  options: { allowTimeoutHandoff?: boolean } = {},
 ) {
   const state = await fetchSessionState();
   const active = ensureActiveOperatorSession(state);
@@ -776,7 +777,29 @@ async function runBoundedOperatorAction(
   }
 
   const action = await createMcpAction(active.sessionId, type, params);
-  const completed = await waitForMcpActionCompletion(action.id, timeoutMs);
+  let completed: McpActionRecord;
+  try {
+    completed = await waitForMcpActionCompletion(action.id, timeoutMs);
+  } catch (err) {
+    if (!options.allowTimeoutHandoff) throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      source: 'operator_action',
+      action: {
+        id: action.id,
+        type: action.type,
+        status: 'running',
+        createdAt: action.createdAt,
+        startedAt: action.startedAt ?? null,
+        completedAt: null,
+      },
+      result: null,
+      error: null,
+      note:
+        `The operator workflow is still running in the app (${message}). ` +
+        'Follow up with get_check_results to read the latest structured results.',
+    };
+  }
   return {
     source: 'operator_action',
     action: {
@@ -887,7 +910,7 @@ const TOOLS = [
   {
     name: 'get_check_results',
     description:
-      'Return the structured results of the last cloud connectivity troubleshoot workflow run in the current session — 14 ordered checks covering L1/L2, DHCP, routing, DNS, cloud path, SSL inspection, and Mist agent health. Each result includes status, summary, remediation guidance, and raw evidence excerpt. Source: live_console. Returns stub until frontend wires up agent-context pushes.',
+      'Return the structured results of the last cloud connectivity troubleshoot workflow run in the current session — up to 19 checks covering L1/L2, DHCP, routing, DNS, cloud path, SSL inspection, and Mist agent health. Each result includes status, summary, remediation guidance, and raw evidence excerpt. Source: live_console. Returns stub until frontend wires up agent-context pushes.',
     inputSchema: {
       type: 'object' as const,
       properties: {},
@@ -997,7 +1020,8 @@ const TOOLS = [
   {
     name: 'run_all_catalog_checks',
     description:
-      'Run all catalog checks in the operator UI and wait for completion. This is the catalog-wide runner, not the ordered full baseline workflow.',
+      'Run all catalog checks in the operator UI. This is the catalog-wide runner, not the ordered full baseline workflow. ' +
+      'If the UI run is still in progress when the bounded wait expires, this tool returns a running handoff instead of failing; follow up with get_check_results for the latest structured results.',
     inputSchema: {
       type: 'object' as const,
       properties: {},
@@ -1207,7 +1231,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case 'run_all_catalog_checks':
-      result = await runBoundedOperatorAction('run_all_catalog_checks', {}, 180000);
+      result = await runBoundedOperatorAction('run_all_catalog_checks', {}, 30000, {
+        allowTimeoutHandoff: true,
+      });
       break;
 
     case 'run_recommended_checks':

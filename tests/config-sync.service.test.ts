@@ -494,7 +494,7 @@ describe('ConfigSyncService.previewSync()', () => {
     const service = new ConfigSyncService(cmdRunner as any, makeMistApiStub([]) as any);
 
     await expect(service.previewSync('site-1', 'dev-1')).rejects.toThrow(
-      'Config sync preview cannot run while already in configuration mode.',
+      'Config sync cannot run while already in configuration mode.',
     );
 
     expect(cmdRunner.ensureConfigMode).not.toHaveBeenCalled();

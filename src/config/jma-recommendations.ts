@@ -135,6 +135,7 @@ const RECOMMENDATIONS: Record<number, JmaRecommendation> = {
       { id: 'route-to-mist', label: 'Route to Mist Endpoints', why: 'Confirm the switch knows how to reach the Mist path.' },
       { id: 'cloud-connections', label: 'Active Cloud Connections', why: 'See whether any live TCP sessions to Mist exist.' },
       { id: 'fw-check', label: 'Firewall Policy Check', why: 'Detect blocked TCP 443 or SSL interception.' },
+      { id: 'traceroute-to-mist', label: 'Traceroute to Mist', why: 'Show where along the path traffic stops responding when the cloud is unreachable.' },
       { id: 'outbound-ssh-config', label: 'Outbound SSH Config', why: 'Verify the registration path is configured as expected.' },
     ],
     remediation: [

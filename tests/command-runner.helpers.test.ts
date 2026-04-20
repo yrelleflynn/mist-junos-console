@@ -158,6 +158,12 @@ describe('stripCommandEcho', () => {
     expect(result).toContain('Junos: 21.4R3');
   });
 
+  it('removes a garbled echoed command when serial echo duplicates tokens', () => {
+    const raw = 'showshow interfaces interfaces terse terse\r\nge-0/0/0 up up\r\nroot@switch> ';
+    const result = stripCommandEcho(raw, 'show interfaces terse');
+    expect(result).toBe('ge-0/0/0 up up');
+  });
+
   it('handles empty raw input gracefully', () => {
     expect(stripCommandEcho('', 'show version')).toBe('');
   });

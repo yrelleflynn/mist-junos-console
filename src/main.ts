@@ -29,6 +29,7 @@ import { getJmaRecommendation } from './config/jma-recommendations';
 import {
   CATALOG_GROUPS,
   ALL_CATALOG_CHECK_IDS,
+  RUN_ALL_CATALOG_CHECK_IDS,
   getCatalogCheck,
   getCatalogGroupChecks,
   resultIdToCatalogId,
@@ -204,6 +205,12 @@ function init(): void {
     }
   }
 
+  type EffectiveCloudResolution = {
+    cloud: MistCloud | null;
+    source: 'outbound-ssh' | 'selected' | 'none';
+    host: string | null;
+  };
+
   function saveSelectedMistOrg(orgId: string): void {
     if (orgId) {
       window.localStorage.setItem(MIST_ORG_STORAGE_KEY, orgId);
@@ -220,8 +227,55 @@ function init(): void {
       ui.mistCloud.value = savedCloudId;
       return;
     }
-    const apac01 = MIST_CLOUDS.find((c) => c.id === 'apac01');
-    if (apac01) ui.mistCloud.value = apac01.id;
+    const preferredDefault = MIST_CLOUDS.find((c) => c.apiHost === 'api.mist.com') ?? MIST_CLOUDS[0];
+    if (preferredDefault) ui.mistCloud.value = preferredDefault.id;
+  }
+
+  async function resolveEffectiveMistCloud(): Promise<EffectiveCloudResolution> {
+    const selectedCloud = getCloudById(ui.mistCloud.value) ?? null;
+    const fallback: EffectiveCloudResolution = selectedCloud
+      ? { cloud: selectedCloud, source: 'selected', host: null }
+      : { cloud: null, source: 'none', host: null };
+
+    if (!serial.isConnected || configSync.hasStagedCandidate() || !isOperationalPromptVisible()) {
+      return fallback;
+    }
+
+    if (effectiveCloudCache && effectiveCloudCache.expiresAt > Date.now()) {
+      const cachedCloud = effectiveCloudCache.cloudId ? getCloudById(effectiveCloudCache.cloudId) ?? null : null;
+      return cachedCloud
+        ? { cloud: cachedCloud, source: 'outbound-ssh', host: effectiveCloudCache.host }
+        : fallback;
+    }
+
+    const cmd = await cmdRunner.execute('show configuration system services outbound-ssh', 10000, 1500, { silent: true });
+    if (!cmd.success) {
+      return fallback;
+    }
+
+    const host = cmd.output.match(/(oc-term[\w.-]+)/)?.[1] ?? null;
+    if (!host) {
+      return fallback;
+    }
+
+    const inferredCloud = MIST_CLOUDS.find((cloud) =>
+      cloud.switchEndpoints.some((endpoint) => endpoint.host === host),
+    ) ?? null;
+
+    effectiveCloudCache = {
+      cloudId: inferredCloud?.id ?? null,
+      host,
+      expiresAt: Date.now() + 30000,
+    };
+
+    return inferredCloud
+      ? { cloud: inferredCloud, source: 'outbound-ssh', host }
+      : fallback;
+  }
+
+  function describeEffectiveCloudResolution(resolution: EffectiveCloudResolution): string | null {
+    if (resolution.source !== 'outbound-ssh' || !resolution.cloud || !resolution.host) return null;
+    return `Using Mist cloud ${resolution.cloud.name} inferred from outbound-ssh host ${resolution.host}.`;
   }
 
   function saveLastPortLabel(label: string): void {
@@ -258,6 +312,7 @@ function init(): void {
   let recentConsoleTail = '';
   let cloudStatusLoopStarted = false;
   let localIdentifyInFlight = false;
+  let effectiveCloudCache: { cloudId: string | null; host: string | null; expiresAt: number } | null = null;
   let localIdentifyPromise: Promise<void> | null = null;
   let loggedInBootstrapPromise: Promise<void> | null = null;
   let resolvedMatchedSiteName: string | null = null;
@@ -885,10 +940,49 @@ function init(): void {
           break;
         }
         case 'run_all_catalog_checks': {
-          if (ALL_CATALOG_CHECK_IDS.some((checkId) => !canRunCatalogCheck(checkId))) {
-            throw new Error('Run All Catalog Checks is not currently available.');
+          const runnableCheckIds = RUN_ALL_CATALOG_CHECK_IDS.filter((checkId) => canRunCatalogCheck(checkId));
+          if (runnableCheckIds.length === 0) {
+            throw new Error('No catalog checks are currently available.');
           }
-          await runAllChecks();
+          await withCloudStatusPollingPaused(async () => {
+            await withConsoleTask('catalog-all-checks', 'user', 'all catalog checks', async () => {
+              const effectiveCloud = await resolveEffectiveMistCloud();
+              const resolved = resolveCatalogRunOptions(runnableCheckIds, effectiveCloud.cloud);
+              if ('error' in resolved) {
+                throw new Error(resolved.error);
+              }
+              catalogRunning = true;
+              beginLatestAgentCheckRun();
+              refreshCatalogRunButtons(true);
+              activateResultsTab('checks');
+
+              resetCatalogRows(ALL_CATALOG_CHECK_IDS);
+              runnableCheckIds.forEach((checkId) => {
+                const dot = document.getElementById(`catalog-dot-${checkId}`);
+                const badge = document.getElementById(`catalog-badge-${checkId}`);
+                if (dot) dot.className = 'check-status-dot running';
+                if (badge) setCatalogBadgeState(badge, 'running', '…', '');
+              });
+
+              term.writeSystem('— Agent requested action: run_all_catalog_checks —');
+              const cloudMessage = describeEffectiveCloudResolution(effectiveCloud);
+              if (cloudMessage) {
+                term.writeSystem(`  ${cloudMessage}`);
+              }
+              try {
+                const results = await troubleshooter.runRecommendedChecks(resolved.options);
+                setLatestAgentCheckResults(results);
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                term.writeError(`Check suite failed: ${msg}`);
+                throw err;
+              } finally {
+                catalogRunning = false;
+                refreshCatalogRunButtons(false);
+                term.writeSystem('— All catalog checks complete —');
+              }
+            });
+          });
           break;
         }
         case 'run_full_baseline': {
@@ -1175,9 +1269,9 @@ function init(): void {
 
     // Action bar: visible only while a candidate is staged
     if (staged) {
-      ui.configSyncActionBar.classList.add('is-visible');
+      ui.configSyncActionBar.classList.remove('is-hidden');
     } else {
-      ui.configSyncActionBar.classList.remove('is-visible');
+      ui.configSyncActionBar.classList.add('is-hidden');
     }
 
     // Action buttons: commit only enabled after a clean, passing preview.
@@ -1210,6 +1304,35 @@ function init(): void {
     renderConsoleTaskIndicator();
     renderJmaRecommendation(latestJmaCode);
     scheduleAgentContextPush();
+  }
+
+  function ensureConfigSyncActionAllowed(action: 'commit' | 'rollback'): boolean {
+    updateConfigSyncUIState();
+
+    if (!serial.isConnected) {
+      const label = action === 'commit' ? 'Commit' : 'Rollback';
+      const message = `${label} is unavailable because the switch is disconnected.`;
+      ui.configSyncResults.innerHTML = `<div class="status-text error">${escapeHtml(message)}</div>`;
+      term.writeError(message);
+      return false;
+    }
+
+    if (!configSync.hasStagedCandidate()) {
+      const label = action === 'commit' ? 'Commit' : 'Rollback';
+      const message = `${label} is unavailable because there is no staged config sync candidate.`;
+      ui.configSyncResults.innerHTML = `<div class="status-text error">${escapeHtml(message)}</div>`;
+      term.writeError(message);
+      return false;
+    }
+
+    if (action === 'commit' && !configSync.sessionInfo?.canCommit) {
+      const message = 'Commit is unavailable because the staged config sync candidate is not in a committable state.';
+      ui.configSyncResults.innerHTML = `<div class="status-text error">${escapeHtml(message)}</div>`;
+      term.writeError(message);
+      return false;
+    }
+
+    return true;
   }
 
   // ---- UI state helpers ----
@@ -1398,9 +1521,12 @@ function init(): void {
 
   function renderDeviceSummaryPlaceholder(): void {
     const loadingMarkup = buildDeviceSummaryLoadingMarkup();
+    const placeholder = serial.isConnected
+      ? 'Connected — click Identify Switch to read device details.'
+      : 'Log in to identify the switch.';
     ui.deviceSummary.innerHTML = loadingMarkup
       ? loadingMarkup
-      : '<span class="device-summary-placeholder">Log in to identify the switch.</span>';
+      : `<span class="device-summary-placeholder">${placeholder}</span>`;
     ui.deviceSummary.classList.add('device-summary-empty');
   }
 
@@ -1523,6 +1649,38 @@ function init(): void {
         });
       })
       .catch(() => {});
+  }
+
+  async function refreshMistStatusAfterMistSave(): Promise<void> {
+    if (!serial.isConnected) return;
+    if (localIdentifyInFlight || identifyInFlight) {
+      maybeAutoMatchAfterMistSave();
+      return;
+    }
+
+    await waitForConsoleIdle();
+    if (!serial.isConnected || configSync.hasStagedCandidate()) {
+      maybeAutoMatchAfterMistSave();
+      return;
+    }
+    if (!isOperationalPromptVisible()) {
+      maybeAutoMatchAfterMistSave();
+      return;
+    }
+
+    const refreshed = await withConsoleTask(
+      'mist-save-identify-refresh',
+      'background',
+      'Mist status refresh',
+      async () => {
+        await deviceContext.runIdentify({ silent: true });
+        return true;
+      },
+    );
+
+    if (!refreshed) {
+      maybeAutoMatchAfterMistSave();
+    }
   }
 
   function msSinceLastUserConsoleInput(): number {
@@ -1966,6 +2124,7 @@ function init(): void {
   });
 
   serial.on('disconnect', () => {
+    effectiveCloudCache = null;
     pendingInitialShellToCli = false;
     initialShellToCliInFlight = false;
     setConnectedState(false);
@@ -2364,7 +2523,7 @@ function init(): void {
 
     const runAllBtn = document.getElementById('catalog-btn-run-all') as HTMLButtonElement | null;
     if (runAllBtn) {
-      runAllBtn.disabled = forceDisabled || ALL_CATALOG_CHECK_IDS.some((checkId) => !canRunCatalogCheck(checkId));
+      runAllBtn.disabled = forceDisabled || RUN_ALL_CATALOG_CHECK_IDS.some((checkId) => !canRunCatalogCheck(checkId));
     }
 
     const runBaselineBtn = document.getElementById('catalog-btn-run-baseline') as HTMLButtonElement | null;
@@ -2373,13 +2532,13 @@ function init(): void {
     }
   }
 
-  function resolveCatalogRunOptions(checkIds: string[]): { options: CatalogRunOptions } | { error: string } {
+  function resolveCatalogRunOptions(checkIds: string[], cloudOverride?: MistCloud | null): { options: CatalogRunOptions } | { error: string } {
     for (const checkId of checkIds) {
       const check = getCatalogCheck(checkId);
       if (!check) {
         return { error: `Unknown check: ${checkId}` };
       }
-      if (check.requiresCloud && !getCloudById(ui.mistCloud.value)) {
+      if (check.requiresCloud && !(cloudOverride ?? getCloudById(ui.mistCloud.value))) {
         return { error: `Select a Mist cloud region before running ${check.name}.` };
       }
       if (check.requiresMistApi) {
@@ -2391,7 +2550,7 @@ function init(): void {
       }
     }
 
-    const cloud = getCloudById(ui.mistCloud.value);
+    const cloud = cloudOverride ?? getCloudById(ui.mistCloud.value);
     if (!cloud) {
       return { error: 'Select a Mist cloud region first.' };
     }
@@ -2549,14 +2708,15 @@ function init(): void {
     if (catalogRunning) return;
     if (!ensureCatalogCanRun('This check')) return;
     renderGuidedCheckAnalysis(null);
-    const resolved = resolveCatalogRunOptions([catalogId]);
-    if ('error' in resolved) {
-      term.writeError(resolved.error);
-      refreshCatalogRunButtons(false);
-      return;
-    }
     await withCloudStatusPollingPaused(async () => {
       await withConsoleTask('catalog-single-check', 'user', 'catalog check', async () => {
+        const effectiveCloud = await resolveEffectiveMistCloud();
+        const resolved = resolveCatalogRunOptions([catalogId], effectiveCloud.cloud);
+        if ('error' in resolved) {
+          term.writeError(resolved.error);
+          refreshCatalogRunButtons(false);
+          return;
+        }
         catalogRunning = true;
         beginLatestAgentCheckRun();
         refreshCatalogRunButtons(true);
@@ -2569,6 +2729,10 @@ function init(): void {
         if (badge) setCatalogBadgeState(badge, 'running', '…', '');
 
         term.writeSystem(`— Running check: ${getCatalogCheck(catalogId)?.name ?? catalogId} —`);
+        const cloudMessage = describeEffectiveCloudResolution(effectiveCloud);
+        if (cloudMessage) {
+          term.writeSystem(`  ${cloudMessage}`);
+        }
 
         try {
           const results = await troubleshooter.runRecommendedChecks(resolved.options);
@@ -2592,14 +2756,15 @@ function init(): void {
     renderGuidedCheckAnalysis(null);
     const checks = getCatalogGroupChecks(groupId);
     if (checks.length === 0) return;
-    const resolved = resolveCatalogRunOptions(checks.map(c => c.id));
-    if ('error' in resolved) {
-      term.writeError(resolved.error);
-      refreshCatalogRunButtons(false);
-      return;
-    }
     await withCloudStatusPollingPaused(async () => {
       await withConsoleTask('catalog-group-checks', 'user', 'catalog check group', async () => {
+        const effectiveCloud = await resolveEffectiveMistCloud();
+        const resolved = resolveCatalogRunOptions(checks.map(c => c.id), effectiveCloud.cloud);
+        if ('error' in resolved) {
+          term.writeError(resolved.error);
+          refreshCatalogRunButtons(false);
+          return;
+        }
         catalogRunning = true;
         beginLatestAgentCheckRun();
         refreshCatalogRunButtons(true);
@@ -2615,6 +2780,10 @@ function init(): void {
 
         const groupName = CATALOG_GROUPS.find(g => g.id === groupId)?.name ?? groupId;
         term.writeSystem(`— Running group: ${groupName} —`);
+        const cloudMessage = describeEffectiveCloudResolution(effectiveCloud);
+        if (cloudMessage) {
+          term.writeSystem(`  ${cloudMessage}`);
+        }
 
         try {
           const results = await troubleshooter.runRecommendedChecks(resolved.options);
@@ -2634,14 +2803,15 @@ function init(): void {
     if (catalogRunning) return;
     if (!ensureCatalogCanRun('All catalog checks')) return;
     renderGuidedCheckAnalysis(null);
-    const resolved = resolveCatalogRunOptions(ALL_CATALOG_CHECK_IDS);
-    if ('error' in resolved) {
-      term.writeError(resolved.error);
-      refreshCatalogRunButtons(false);
-      return;
-    }
     await withCloudStatusPollingPaused(async () => {
       await withConsoleTask('catalog-all-checks', 'user', 'all catalog checks', async () => {
+        const effectiveCloud = await resolveEffectiveMistCloud();
+        const resolved = resolveCatalogRunOptions(RUN_ALL_CATALOG_CHECK_IDS, effectiveCloud.cloud);
+        if ('error' in resolved) {
+          term.writeError(resolved.error);
+          refreshCatalogRunButtons(false);
+          return;
+        }
         catalogRunning = true;
         beginLatestAgentCheckRun();
         refreshCatalogRunButtons(true);
@@ -2658,6 +2828,10 @@ function init(): void {
         });
 
         term.writeSystem('— Running all catalog checks —');
+        const cloudMessage = describeEffectiveCloudResolution(effectiveCloud);
+        if (cloudMessage) {
+          term.writeSystem(`  ${cloudMessage}`);
+        }
 
         try {
           const results = await troubleshooter.runRecommendedChecks(resolved.options);
@@ -2678,15 +2852,15 @@ function init(): void {
     if (catalogRunning) return;
     if (!ensureCatalogCanRun('The full baseline')) return;
     renderGuidedCheckAnalysis(null);
-    const cloud = getCloudById(ui.mistCloud.value);
-    if (!cloud) {
-      term.writeError('Select a Mist cloud region before running the full baseline.');
-      refreshCatalogRunButtons(false);
-      return;
-    }
-
     await withCloudStatusPollingPaused(async () => {
       await withConsoleTask('full-baseline', 'user', 'full baseline troubleshooting', async () => {
+        const effectiveCloud = await resolveEffectiveMistCloud();
+        const cloud = effectiveCloud.cloud;
+        if (!cloud) {
+          term.writeError('Select a Mist cloud region before running the full baseline.');
+          refreshCatalogRunButtons(false);
+          return;
+        }
         catalogRunning = true;
         beginLatestAgentCheckRun();
         refreshCatalogRunButtons(true);
@@ -2694,6 +2868,10 @@ function init(): void {
         resetCatalogRows(ALL_CATALOG_CHECK_IDS);
 
         term.writeSystem('— Running full baseline troubleshooting workflow —');
+        const cloudMessage = describeEffectiveCloudResolution(effectiveCloud);
+        if (cloudMessage) {
+          term.writeSystem(`  ${cloudMessage}`);
+        }
 
         try {
           const results = await troubleshooter.runAll({
@@ -3139,17 +3317,24 @@ function init(): void {
     document.body.appendChild(overlay);
 
     // Close handlers
-    const closeModal = () => overlay.remove();
+    let escHandler: ((e: KeyboardEvent) => void) | null = null;
+    const closeModal = () => {
+      if (escHandler) {
+        document.removeEventListener('keydown', escHandler);
+        escHandler = null;
+      }
+      overlay.remove();
+    };
     document.getElementById('check-modal-close-btn')?.addEventListener('click', closeModal);
     overlay.addEventListener('click', (e) => {
       if (e.target === overlay) closeModal();
     });
-    document.addEventListener('keydown', function escHandler(e) {
+    escHandler = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         closeModal();
-        document.removeEventListener('keydown', escHandler);
       }
-    });
+    };
+    document.addEventListener('keydown', escHandler);
 
     // Run Fix button handler
     const runFixBtn = document.getElementById('check-modal-run-fix');
@@ -3160,6 +3345,61 @@ function init(): void {
         runFixBtn.textContent = 'Running…';
         const outputEl = document.getElementById('check-modal-output')!;
         outputEl.innerHTML = '';
+
+        const promptForFixInput = async (
+          message: string,
+          options?: { allowEmpty?: boolean; masked?: boolean; okLabel?: string },
+        ): Promise<string | null> =>
+          new Promise((resolve) => {
+            const existingPrompt = document.getElementById('check-modal-inline-prompt');
+            existingPrompt?.remove();
+
+            const promptWrap = document.createElement('div');
+            promptWrap.id = 'check-modal-inline-prompt';
+            promptWrap.className = 'check-modal-section';
+            promptWrap.innerHTML = `
+              <div class="check-modal-section-title">${escapeHtml(options?.okLabel || 'Input Required')}</div>
+              <div class="check-modal-detail">${escapeHtml(message).replace(/\n/g, '<br>')}</div>
+              <div class="check-modal-actions" style="margin-top:10px; align-items:center; gap:8px;">
+                <input id="check-modal-inline-input" type="${options?.masked ? 'password' : 'text'}" class="input" style="flex:1; min-width:220px;" />
+                <button class="btn btn-primary" id="check-modal-inline-ok">${escapeHtml(options?.okLabel || 'Continue')}</button>
+                <button class="btn btn-secondary" id="check-modal-inline-cancel">Cancel</button>
+              </div>
+            `;
+            outputEl.appendChild(promptWrap);
+
+            const input = document.getElementById('check-modal-inline-input') as HTMLInputElement | null;
+            const okBtn = document.getElementById('check-modal-inline-ok') as HTMLButtonElement | null;
+            const cancelBtn = document.getElementById('check-modal-inline-cancel') as HTMLButtonElement | null;
+
+            const cleanup = () => promptWrap.remove();
+            const submit = () => {
+              const value = input?.value ?? '';
+              if (!options?.allowEmpty && value.length === 0) {
+                input?.focus();
+                return;
+              }
+              cleanup();
+              resolve(value);
+            };
+            const cancel = () => {
+              cleanup();
+              resolve(null);
+            };
+
+            okBtn?.addEventListener('click', submit);
+            cancelBtn?.addEventListener('click', cancel);
+            input?.addEventListener('keydown', (event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                submit();
+              } else if (event.key === 'Escape') {
+                event.preventDefault();
+                cancel();
+              }
+            });
+            input?.focus();
+          });
 
         try {
           // Determine if commands need config mode (set/delete/activate/deactivate)
@@ -3200,7 +3440,10 @@ function init(): void {
                 if (/login:/i.test(passResult.output)) {
                   // Mist password rejected — ask user
                   outputEl.innerHTML += `<div class="check-modal-cmd-error">Mist root password was rejected.</div>`;
-                  const userPw = prompt('Mist root password was rejected.\nEnter the root password for this switch:');
+                  const userPw = await promptForFixInput(
+                    'Mist root password was rejected.\nEnter the root password for this switch:',
+                    { masked: true, okLabel: 'Login' },
+                  );
                   if (!userPw) {
                     outputEl.innerHTML += `<div class="check-modal-cmd-error">Cannot proceed without login.</div>`;
                     runFixBtn.textContent = 'Run Fix';
@@ -3219,13 +3462,14 @@ function init(): void {
                 }
               } else {
                 // No Mist password — prompt user with guidance
-                const userPw = prompt(
+                const userPw = await promptForFixInput(
                   'The switch requires a password to log in.\n\n' +
                   'No root password was found in Mist site settings.\n\n' +
                   'Default credentials:\n' +
                   '  Username: root\n' +
                   '  Password: (blank — press OK with empty field for factory default)\n\n' +
-                  'Enter root password (or leave empty for factory default):'
+                  'Enter root password (or leave empty for factory default):',
+                  { allowEmpty: true, masked: true, okLabel: 'Login' },
                 );
 
                 if (userPw === null) {
@@ -3304,7 +3548,10 @@ function init(): void {
 
               // If no Mist password, prompt the user
               if (!rootPw) {
-                rootPw = prompt('Root password is not set on this switch.\nEnter a root password to configure:');
+                rootPw = await promptForFixInput(
+                  'Root password is not set on this switch.\nEnter a root password to configure:',
+                  { masked: true, okLabel: 'Set Password' },
+                );
               }
 
               if (!rootPw) {
@@ -3381,6 +3628,22 @@ function init(): void {
               rollbackBtn.disabled = true;
               commitBtn.textContent = 'Committing…';
 
+              const checkResult = await cmdRunner.execute('commit check', 60000, 5000);
+              const checkOutput = checkResult.output.trim();
+              const checkPassed = checkResult.success
+                && (checkOutput.includes('configuration check succeeds') || !/error:/i.test(checkOutput));
+
+              if (!checkPassed) {
+                outputEl.innerHTML += `<div class="check-modal-cmd-error">Commit check failed — fix the candidate or roll it back.</div>`;
+                if (checkOutput) {
+                  outputEl.innerHTML += `<pre class="check-modal-cmd-output">${escapeHtml(checkOutput)}</pre>`;
+                }
+                commitBtn.disabled = false;
+                rollbackBtn.disabled = false;
+                commitBtn.textContent = 'Commit';
+                return;
+              }
+
               const commitResult = await cmdRunner.execute('commit and-quit', 60000, 5000);
               const commitOutput = commitResult.output.trim();
 
@@ -3402,7 +3665,7 @@ function init(): void {
               rollbackBtn.textContent = 'Rolling back…';
 
               await cmdRunner.execute('rollback 0', 10000);
-              const quitResult = await cmdRunner.execute('exit', 5000);
+              await cmdRunner.execute('exit', 5000);
               outputEl.innerHTML += `<div class="check-modal-cmd-line">Changes rolled back.</div>`;
             });
           } else if (isOperational) {
@@ -3444,8 +3707,8 @@ function init(): void {
 
     await withCloudStatusPollingPaused(async () => {
       await withConsoleTask('jma-recommended-checks', 'user', 'recommended checks', async () => {
-        const cloudId = ui.mistCloud.value;
-        const cloud = getCloudById(cloudId);
+        const effectiveCloud = await resolveEffectiveMistCloud();
+        const cloud = effectiveCloud.cloud;
         if (!cloud) {
           term.writeError('Please select a Mist cloud region.');
           return;
@@ -3457,6 +3720,10 @@ function init(): void {
         refreshCatalogRunButtons(true);
 
         term.writeSystem(`— Running recommended checks for JMA ${recommendation.code} ${recommendation.label} —`);
+        const cloudMessage = describeEffectiveCloudResolution(effectiveCloud);
+        if (cloudMessage) {
+          term.writeSystem(`  ${cloudMessage}`);
+        }
 
         try {
           const results = await troubleshooter.runRecommendedChecks({
@@ -4057,8 +4324,10 @@ function init(): void {
   // ---- Config Sync: Commit ----
   async function doCommitSync(): Promise<void> {
     if (!ensureConsoleTaskAvailable('Config sync commit', 'config-sync-commit')) return;
+    if (!ensureConfigSyncActionAllowed('commit')) return;
     await withCloudStatusPollingPaused(async () => {
       await withConsoleTask('config-sync-commit', 'exclusive', 'config sync commit', async () => {
+        if (!ensureConfigSyncActionAllowed('commit')) return;
         ui.btnCommitSync.disabled = true;
         ui.btnRollbackSync.disabled = true;
 
@@ -4082,8 +4351,10 @@ function init(): void {
   // ---- Config Sync: Rollback ----
   async function doRollbackSync(): Promise<void> {
     if (!ensureConsoleTaskAvailable('Config sync rollback', 'config-sync-rollback')) return;
+    if (!ensureConfigSyncActionAllowed('rollback')) return;
     await withCloudStatusPollingPaused(async () => {
       await withConsoleTask('config-sync-rollback', 'exclusive', 'config sync rollback', async () => {
+        if (!ensureConfigSyncActionAllowed('rollback')) return;
         ui.btnCommitSync.disabled = true;
         ui.btnRollbackSync.disabled = true;
 
@@ -4449,8 +4720,11 @@ function init(): void {
     if (saved) {
       saveSelectedMistCloud();
       closeMistModal();
-      void mistContext.loadSites(token, orgId, ui.mistCloud.value);
-      maybeAutoMatchAfterMistSave();
+      try {
+        await mistContext.loadSites(token, orgId, ui.mistCloud.value);
+      } finally {
+        void refreshMistStatusAfterMistSave();
+      }
     }
   });
   ui.mistModalOverlay.addEventListener('click', (e) => {

@@ -67,7 +67,7 @@ describe('TroubleshootService LLDP behavior', () => {
     vi.clearAllMocks();
   });
 
-  it('reports a pass result with detected uplink details when neighbors are found', async () => {
+  it('reports an info result with detected uplink details when neighbors are found', async () => {
     const runner = createRunnerMock({
       command: 'show lldp neighbors',
       output: LLDP_SINGLE_NEIGHBOR,
@@ -78,10 +78,10 @@ describe('TroubleshootService LLDP behavior', () => {
     const lldp = progress.find((r) => r.id === 'lldp');
 
     expect(lldp).toBeDefined();
-    expect(lldp?.status).toBe('pass');
-    expect(lldp?.detail).toContain('1 neighbor(s). Uplink: ge-0/0/0.0');
-    expect(lldp?.detail).toContain('core-sw-01');
-    expect(lldp?.detail).toContain('ge-0/1/5');
+    expect(lldp?.status).toBe('info');
+    expect(lldp?.detail).toContain('1 neighbor(s)');
+    // No uplink suffix when no port is nominated — neighbor detail not surfaced in summary
+    expect(lldp?.detail).not.toContain('Uplink:');
   });
 
   it('prefers the user-specified uplink port when it matches a neighbor', async () => {
@@ -94,8 +94,8 @@ describe('TroubleshootService LLDP behavior', () => {
     const progress = await runUntilLldp(runner, 'ge-0/0/1.0');
     const lldp = progress.find((r) => r.id === 'lldp');
 
-    expect(lldp?.status).toBe('pass');
-    expect(lldp?.detail).toContain('Uplink: ge-0/0/1.0');
+    expect(lldp?.status).toBe('info');
+    expect(lldp?.detail).toContain('Matched nominated uplink: ge-0/0/1.0');
     expect(lldp?.detail).toContain('ap-floor-2');
     expect(lldp?.detail).toContain('ge-0/2/3');
   });

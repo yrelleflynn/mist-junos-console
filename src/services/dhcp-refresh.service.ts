@@ -304,7 +304,7 @@ export class DhcpRefreshService {
       const dnsServers = Array.from(new Set(
         block
           .split('\n')
-          .filter((line) => /(?:DNS|Name server|Domain name server|name-server)/i.test(line))
+          .filter((line) => /(?:DNS|Name server|Domain name server|name-server|Name:\s*name-server)/i.test(line))
           .flatMap((line) => line.match(/\d+\.\d+\.\d+\.\d+/g) ?? []),
       ));
 

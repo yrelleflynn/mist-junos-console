@@ -4,6 +4,7 @@ export interface CatalogCheck {
   desc: string;
   requiresCloud: boolean;   // needs MistCloud for endpoint URLs
   requiresMistApi: boolean; // needs siteId+deviceId
+  includeInRunAll?: boolean;
 }
 
 export interface CatalogGroup {
@@ -60,13 +61,18 @@ export const CATALOG_GROUPS: CatalogGroup[] = [
     name: 'Cloud Reachability',
     checks: [
       { id: 'fw-check',       name: 'Firewall / SSL Policy', desc: 'TCP port reachability and SSL certificate inspection detection', requiresCloud: true,  requiresMistApi: false },
+      { id: 'traceroute-to-mist', name: 'Traceroute to Mist', desc: 'Trace the path to the primary Mist cloud endpoint to locate where it breaks', requiresCloud: true, requiresMistApi: false, includeInRunAll: false },
       { id: 'mist-last-seen', name: 'Offline Timeline',      desc: 'Correlate Mist events and switch logs around disconnect time',  requiresCloud: true,  requiresMistApi: true  },
     ],
   },
 ];
 
-/** All check IDs in catalog order — used for Run All */
+/** All check IDs in catalog order — used for catalog row management and resets. */
 export const ALL_CATALOG_CHECK_IDS: string[] = CATALOG_GROUPS.flatMap(g => g.checks.map(c => c.id));
+/** Catalog check IDs included in the Run All workflow. */
+export const RUN_ALL_CATALOG_CHECK_IDS: string[] = CATALOG_GROUPS.flatMap((g) =>
+  g.checks.filter((c) => c.includeInRunAll !== false).map((c) => c.id),
+);
 
 /** Look up a catalog check definition by its ID */
 export function getCatalogCheck(id: string): CatalogCheck | undefined {
@@ -89,6 +95,7 @@ export function resultIdToCatalogId(resultId: string): string {
   const timelineIds = ['mist-last-seen', 'mist-events', 'switch-uptime', 'mist-audit-logs'];
   if (timelineIds.includes(resultId) || resultId.startsWith('switch-logs')) return 'mist-last-seen';
   const skippedMap: Record<string, string> = {
+    'mist-uplink-config': 'uplink-config-compare',
     'skip-dhcp-lease-details': 'dhcp-lease',
     'skip-gateway-reachability': 'arp',
     'skip-default-routes': 'default-route',

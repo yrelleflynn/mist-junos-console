@@ -440,7 +440,7 @@ export class TroubleshootService {
         case 'vlan-config': {
           if (!ctx.uplinkPort) await ensureUplink();
           if (!ctx.uplinkPort) {
-            reportMissingUplink('vlan-config', 'VLAN Configuration');
+            reportMissingUplink('vlan-config', 'VLAN Config');
             break;
           }
           report(await this.checkVlanConfig(ctx.uplinkPort));
@@ -504,6 +504,10 @@ export class TroubleshootService {
           report(await this.checkRouteToMistEndpoints(options.cloud));
           break;
         }
+        case 'traceroute-to-mist': {
+          report(await this.checkTracerouteToMist(options.cloud));
+          break;
+        }
         case 'fw-check': {
           const fwResults = await this.checkFirewallPolicy(options.cloud);
           for (const result of fwResults) report(result);
@@ -531,6 +535,15 @@ export class TroubleshootService {
         case 'switch-uptime':
         case 'mist-audit-logs':
         case 'switch-logs': {
+          if (!options.siteId || !options.deviceId) {
+            report({
+              id: checkId,
+              name: checkId,
+              status: 'skip',
+              detail: 'Skipped — identify and match the switch in Mist first.',
+            });
+            break;
+          }
           const timelineResults = await ensureTimeline();
           const matches = timelineResults.filter((result) => {
             if (checkId === 'switch-logs') return result.id.startsWith('switch-logs');
@@ -1324,7 +1337,7 @@ export class TroubleshootService {
       return { id, name, status: 'skip', detail: 'No uplink port identified' };
     }
 
-    const cmd = await this.runner.execute(`show interfaces ${port} terse`);
+    const cmd = await this.runner.execute(`show interfaces ${port} terse`, 10000);
     if (!cmd.success) {
       return { id, name, status: 'fail', detail: cmd.error || 'Command failed', raw: cmd.output };
     }
@@ -1376,7 +1389,7 @@ export class TroubleshootService {
 
   private async checkVlanConfig(port: string): Promise<CheckResult> {
     const id = 'vlan-config';
-    const name = 'VLAN Configuration';
+    const name = 'VLAN Config';
 
     if (!port) {
       return { id, name, status: 'skip', detail: 'No uplink port identified' };
@@ -2038,38 +2051,85 @@ export class TroubleshootService {
     const id = `trace-${endpoint.host.replace(/\./g, '-')}`;
     const name = `Traceroute ${endpoint.host}`;
 
-    // Run traceroute with inet (IPv4), limited hops and wait time
+    const hostCmd = await this.runner.execute(`show host ${endpoint.host}`, 15000, 2000);
+    const resolvedIp = hostCmd.output.match(/has address\s+(\d+\.\d+\.\d+\.\d+)/)?.[1] ?? null;
+    if (!resolvedIp) {
+      return {
+        id,
+        name,
+        status: 'warn',
+        detail: `Could not resolve ${endpoint.host} for traceroute`,
+        raw: hostCmd.output,
+      };
+    }
+
+    // Trace to the resolved IPv4 address rather than the hostname so the command
+    // stays deterministic and avoids any extra name resolution behavior.
+    // Keep the hop count bounded because many Mist endpoints do not respond all
+    // the way to the destination, and the operator usually cares more about the
+    // last responding hop than a complete end-to-end trace.
     const cmd = await this.runner.execute(
-      `traceroute inet ${endpoint.host} wait 2 as-number-lookup no-resolve`,
-      30000,
+      `traceroute inet ${resolvedIp} no-resolve wait 1 ttl 15`,
+      25000,
       3000,
     );
-
-    if (!cmd.success) {
-      return { id, name, status: 'info' as CheckStatus, detail: `Traceroute failed: ${cmd.error}`, raw: cmd.output };
-    }
 
     // Parse traceroute output to find the last responding hop
     const hopLines = cmd.output.split('\n').filter((l) => /^\s*\d+\s/.test(l));
     const respondingHops = hopLines.filter((l) => !l.includes('* * *'));
     const deadHops = hopLines.filter((l) => l.includes('* * *'));
+    const timedOut = !cmd.success && (cmd.error || '').includes('timed out');
 
     if (respondingHops.length === 0) {
-      return { id, name, status: 'info' as CheckStatus, detail: 'No hops responded — traffic may be blocked at first hop', raw: cmd.output };
+      const timeoutNote = timedOut ? ' Traceroute stopped before completion.' : '';
+      return {
+        id,
+        name,
+        status: 'info' as CheckStatus,
+        detail: `No hops responded beyond the switch.${timeoutNote}`.trim(),
+        raw: cmd.output,
+      };
     }
 
     // Get the last responding hop
     const lastHop = respondingHops[respondingHops.length - 1];
     const lastHopIp = lastHop.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] || 'unknown';
-    const totalHops = hopLines.length;
     const deadCount = deadHops.length;
 
-    let detail = `${respondingHops.length} hop(s) responded, last: ${lastHopIp}`;
+    let detail = `${endpoint.host} (${resolvedIp}) — ${respondingHops.length} hop(s) responded, last: ${lastHopIp}`;
     if (deadCount > 0) {
-      detail += ` (${deadCount} hop(s) no response — possible firewall)`;
+      detail += ` (${deadCount} hop(s) no response after the last visible hop)`;
+    }
+    if (timedOut) {
+      detail += ' — bounded traceroute timed out before destination reply';
+    }
+    if (!cmd.success && !timedOut) {
+      detail += ` — traceroute ended with: ${cmd.error}`;
     }
 
     return { id, name, status: 'info' as CheckStatus, detail, raw: cmd.output };
+  }
+
+  private async checkTracerouteToMist(cloud: MistCloud): Promise<CheckResult> {
+    const primaryEndpoint = cloud.switchEndpoints.find(
+      (endpoint) => endpoint.port === 443 && endpoint.description.toLowerCase().includes('jma terminator'),
+    ) ?? cloud.switchEndpoints.find((endpoint) => endpoint.port === 443) ?? cloud.switchEndpoints[0];
+    if (!primaryEndpoint) {
+      return {
+        id: 'traceroute-to-mist',
+        name: 'Traceroute to Mist',
+        status: 'skip',
+        detail: 'Skipped — no Mist cloud endpoint is defined for the selected region.',
+      };
+    }
+
+    const traceResult = await this.checkTraceroute(primaryEndpoint);
+    return {
+      ...traceResult,
+      id: 'traceroute-to-mist',
+      name: 'Traceroute to Mist',
+      detail: `${primaryEndpoint.host}: ${traceResult.detail}`,
+    };
   }
 
   private async checkSslCertificate(endpoint: MistEndpoint): Promise<CheckResult> {
@@ -2088,23 +2148,25 @@ export class TroubleshootService {
       };
     }
 
-    // csh doesn't support 2>&1 or > redirect properly
-    // Wrap in /bin/sh -c to get proper shell redirects
-    // curl -v outputs cert info to stderr, so we redirect stderr to a file
-    await this.runner.execute(
-      `/bin/sh -c 'curl -4 -vk --connect-timeout 30 https://${endpoint.host}/ -o /dev/null 2>/tmp/certcheck.txt'`,
-      45000,
-      3000,
-    );
+    let output = '';
+    try {
+      await this.runner.execute('rm -f /tmp/certcheck.txt', 5000, 1000);
 
-    const catCmd = await this.runner.execute('cat /tmp/certcheck.txt', 10000, 2000);
-    const output = (catCmd.success && catCmd.output.trim().length > 0) ? catCmd.output : '';
+      // csh doesn't support 2>&1 or > redirect properly
+      // Wrap in /bin/sh -c to get proper shell redirects
+      // curl -v outputs cert info to stderr, so we redirect stderr to a file
+      await this.runner.execute(
+        `/bin/sh -c 'curl -4 -vk --connect-timeout 30 https://${endpoint.host}/ -o /dev/null 2>/tmp/certcheck.txt'`,
+        45000,
+        3000,
+      );
 
-    // Clean up
-    await this.runner.execute('rm -f /tmp/certcheck.txt', 5000, 1000);
-
-    // Exit shell back to Junos CLI
-    await this.runner.ensureOperationalMode();
+      const catCmd = await this.runner.execute('cat /tmp/certcheck.txt', 10000, 2000);
+      output = (catCmd.success && catCmd.output.trim().length > 0) ? catCmd.output : '';
+    } finally {
+      await this.runner.execute('rm -f /tmp/certcheck.txt', 5000, 1000).catch(() => undefined);
+      await this.runner.ensureOperationalMode().catch(() => undefined);
+    }
 
     if (!output || output.includes('command not found') || output.includes('No such file')) {
       return { id, name, status: 'warn', detail: 'curl not available on this switch', raw: output };
@@ -2319,10 +2381,12 @@ export class TroubleshootService {
       };
     }
 
-    const cmd = await this.runner.execute('/bin/sh -c \'ps aux | grep -E "mcd|jmd" | grep -v grep\'', 15000, 2000);
-
-    // Exit shell back to Junos CLI
-    await this.runner.ensureOperationalMode();
+    let cmd;
+    try {
+      cmd = await this.runner.execute('/bin/sh -c \'ps aux | grep -E "mcd|jmd" | grep -v grep\'', 15000, 2000);
+    } finally {
+      await this.runner.ensureOperationalMode().catch(() => undefined);
+    }
 
     if (!cmd.success) {
       return { id, name, status: 'warn', detail: 'Could not check processes — shell access may be restricted', raw: cmd.output };

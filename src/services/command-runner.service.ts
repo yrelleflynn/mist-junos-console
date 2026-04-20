@@ -50,6 +50,22 @@ export function normalizeSerialCapture(raw: string): string {
   return output.replace(/\x08/g, '');
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildFuzzyEchoPattern(command: string): RegExp | null {
+  const tokens = command.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return null;
+  const pattern = tokens
+    .map((token, index) => {
+      const escaped = escapeRegExp(token);
+      return `${index === 0 ? '^\\s*' : '\\s+'}(?:${escaped})(?:\\s*${escaped})*`;
+    })
+    .join('') + '\\s*$';
+  return new RegExp(pattern);
+}
+
 /**
  * Strip the echoed command from the beginning of captured output,
  * remove surrounding blank lines, and drop the trailing prompt line.
@@ -62,6 +78,22 @@ export function stripCommandEcho(raw: string, command: string): string {
   const cmdIndex = output.indexOf(command);
   if (cmdIndex !== -1) {
     output = output.substring(cmdIndex + command.length);
+  } else {
+    const lines = output.split('\n');
+    const fuzzyEchoPattern = buildFuzzyEchoPattern(command);
+    while (lines.length > 0) {
+      const firstLine = lines[0]?.trimEnd() ?? '';
+      if (!firstLine) {
+        lines.shift();
+        continue;
+      }
+      if (fuzzyEchoPattern?.test(firstLine)) {
+        lines.shift();
+        continue;
+      }
+      break;
+    }
+    output = lines.join('\n');
   }
   // Strip leading/trailing whitespace and newlines
   output = output.replace(/^\s*\n/, '').replace(/\n\s*$/, '');
