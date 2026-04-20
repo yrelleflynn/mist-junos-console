@@ -841,12 +841,15 @@ function init(): void {
     }
   }
 
-  function buildAgentActionResultPayload(): Record<string, unknown> {
+  function buildAgentActionResultPayload(extra?: Record<string, unknown>): Record<string, unknown> {
     return {
       checkResults: latestAgentCheckResults,
       guidedAnalysis: latestAgentGuidedAnalysis,
       jmaStateCode: latestJmaCode,
+      jmaStateLabel: cloudStatus.state.jma.label,
+      mistStatus: cloudStatus.state.mist.label,
       completedAt: new Date().toISOString(),
+      ...extra,
     };
   }
 
@@ -914,14 +917,22 @@ function init(): void {
           if (ui.btnDhcpRefresh.disabled) {
             throw new Error('DHCP Refresh is not currently available.');
           }
-          await runDhcpRefresh();
+          const refreshResult = await runDhcpRefresh();
+          actionResult = buildAgentActionResultPayload({
+            recoveryAction: 'run_dhcp_refresh',
+            recoveryResult: refreshResult,
+          });
           break;
         }
         case 'run_restart_mist_agent': {
           if (ui.btnRestartMistAgent.disabled) {
             throw new Error('Restart Mist Agent is not currently available.');
           }
-          await runMistAgentRestart();
+          const restartResult = await runMistAgentRestart();
+          actionResult = buildAgentActionResultPayload({
+            recoveryAction: 'run_restart_mist_agent',
+            recoveryResult: restartResult,
+          });
           break;
         }
         case 'run_config_sync_preview': {
@@ -929,6 +940,10 @@ function init(): void {
             throw new Error('Config Sync is not currently available.');
           }
           await previewConfigSync();
+          actionResult = buildAgentActionResultPayload({
+            recoveryAction: 'run_config_sync_preview',
+            configSyncState: configSync.hasStagedCandidate() ? 'staged' : 'idle',
+          });
           break;
         }
         case 'get_effective_config': {
@@ -3469,8 +3484,9 @@ function init(): void {
   }
 
   // ---- DHCP Refresh ----
-  async function runDhcpRefresh(): Promise<void> {
-    if (!ensureConsoleTaskAvailable('DHCP refresh', 'dhcp-refresh')) return;
+  async function runDhcpRefresh(): Promise<DhcpRefreshResult | null> {
+    let completedResult: DhcpRefreshResult | null = null;
+    if (!ensureConsoleTaskAvailable('DHCP refresh', 'dhcp-refresh')) return null;
     await withCloudStatusPollingPaused(async () => {
       await withConsoleTask('dhcp-refresh', 'user', 'DHCP refresh', async () => {
         activateResultsTab('actions');
@@ -3498,7 +3514,7 @@ function init(): void {
             err instanceof Error ? err.message : String(err),
           );
           ui.btnDhcpRefresh.disabled = false;
-          return;
+          throw err;
         }
 
         const summary = result.errors.length > 0
@@ -3514,8 +3530,10 @@ function init(): void {
         );
         term.writeSystem(`— DHCP refresh ${summary} —`);
         ui.btnDhcpRefresh.disabled = false;
+        completedResult = result;
       });
     });
+    return completedResult;
   }
 
   function renderDhcpRefreshResult(result: DhcpRefreshResult): string {
@@ -3639,8 +3657,9 @@ function init(): void {
     return html;
   }
 
-  async function runMistAgentRestart(): Promise<void> {
-    if (!ensureConsoleTaskAvailable('Restart Mist Agent', 'mist-agent-restart')) return;
+  async function runMistAgentRestart(): Promise<MistAgentRestartResult | null> {
+    let completedResult: MistAgentRestartResult | null = null;
+    if (!ensureConsoleTaskAvailable('Restart Mist Agent', 'mist-agent-restart')) return null;
     await withCloudStatusPollingPaused(async () => {
       await withConsoleTask('mist-agent-restart', 'user', 'Mist agent restart', async () => {
         activateResultsTab('actions');
@@ -3704,11 +3723,13 @@ function init(): void {
           if (serial.isConnected && isOperationalPromptVisible() && !configSync.hasStagedCandidate()) {
             await cloudStatus.refresh(deviceContext.matchResult, serial.isConnected);
           }
+          completedResult = result;
         } finally {
           ui.btnRestartMistAgent.disabled = !serial.isConnected || configSync.hasStagedCandidate();
         }
       });
     });
+    return completedResult;
   }
 
   function formatDhcpTime(utcString: string): string {
