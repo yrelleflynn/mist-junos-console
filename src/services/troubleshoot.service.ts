@@ -2652,11 +2652,12 @@ export class TroubleshootService {
       try {
         mistEvents = await this.mistApi.getDeviceEvents(siteId, deviceId, 20);
         if (mistEvents.length > 0) {
+          mistEvents = [...mistEvents].sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
           // Find disconnect events
           const disconnectEvents = mistEvents.filter((e) =>
-            e.type?.includes('DISCONNECTED') ||
-            e.type?.includes('disconnect') ||
-            e.text?.includes('disconnected')
+            /disconnect/i.test(e.type || '') ||
+            /disconnect/i.test(e.text || '') ||
+            /disconnect/i.test(e.reason || '')
           );
 
           const lastDisconnect = disconnectEvents[0];
@@ -2690,7 +2691,7 @@ export class TroubleshootService {
           id: 'mist-events',
           name: 'Recent Mist Events',
           status: 'warn',
-          detail: 'Could not fetch events from Mist API',
+          detail: 'Could not fetch recent events from Mist API',
         });
       }
     } else {
@@ -2711,20 +2712,32 @@ export class TroubleshootService {
     const uptimeCmd = await this.runner.execute('show system uptime', 10000);
     if (uptimeCmd.success) {
       uptimeRaw = uptimeCmd.output;
-      const bootMatch = uptimeCmd.output.match(/System booted:\s*(.+?)(?:\s*\(|$)/m);
-      const lastConfigMatch = uptimeCmd.output.match(/Last configured:\s*(.+?)(?:\s*\(|$)/m);
-      const lastConfigBy = uptimeCmd.output.match(/Last configured:.*by\s+(\S+)/m);
+      const uptimeLines = uptimeCmd.output
+        .split('\n')
+        .map((line) => line.replace(/\r/g, '').trim())
+        .filter((line) => line.length > 0);
+      const currentTimeLine = uptimeLines.find((line) => /^Current time:/i.test(line)) ?? null;
+      const bootLine = uptimeLines.find((line) => /^System booted:/i.test(line)) ?? null;
+      const lastConfigLine = uptimeLines.find((line) => /^Last configured:/i.test(line)) ?? null;
 
-      let detail = '';
-      if (bootMatch) detail += `Booted: ${bootMatch[1].trim()}`;
-      if (lastConfigMatch) detail += ` | Last config: ${lastConfigMatch[1].trim()}`;
-      if (lastConfigBy) detail += ` by ${lastConfigBy[1]}`;
+      const detailParts: string[] = [];
+      if (currentTimeLine) detailParts.push(currentTimeLine);
+      if (bootLine) detailParts.push(bootLine);
+      if (lastConfigLine) detailParts.push(lastConfigLine);
+
+      let detail = detailParts.join(' | ');
+      if (!detail) {
+        const fallbackLines = uptimeLines.slice(0, 3);
+        if (fallbackLines.length > 0) {
+          detail = fallbackLines.join(' | ');
+        }
+      }
 
       results.push({
         id: 'switch-uptime',
         name: 'Switch Uptime',
         status: 'info' as CheckStatus,
-        detail: detail || 'Could not parse uptime',
+        detail: detail || 'Uptime output captured',
         raw: uptimeCmd.output,
       });
     }

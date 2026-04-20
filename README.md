@@ -6,6 +6,13 @@ For ongoing product and engineering direction, see:
 - [`docs/DEVELOPMENT-METHODOLOGY.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/DEVELOPMENT-METHODOLOGY.md)
 - [`docs/ENGINEERING-REVIEW.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/ENGINEERING-REVIEW.md)
 
+For hackathon / reviewer readiness, start with:
+
+- [`docs/HACKATHON-SUBMISSION.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/HACKATHON-SUBMISSION.md)
+- [`docs/SETUP.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/SETUP.md)
+- [`docs/EXAMPLE-OUTPUTS.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/EXAMPLE-OUTPUTS.md)
+- [`docs/SECURITY.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/SECURITY.md)
+
 A browser-based serial terminal and automated troubleshooting tool for Juniper Mist switches running Junos, via USB-C or RJ45 console connection.
 
 **Audience:** Operators who may not be deeply technical—often a switch that is **disconnected in Mist** and needs console-side diagnosis or adoption. Long term, the experience should be launchable from the Mist UI (for example “Troubleshoot via console”) so the user only opens a URL in Chrome or Edge and plugs in a cable—**no local install of Node, npm, or Vite** in production.
@@ -48,6 +55,13 @@ Mist-managed **EX** switches that are **offline or never adopted** still show up
 - **Documentation:** Architecture (current + proposed), module map, feature list, design decisions.
 - **Example outputs:** Run **Cloud connectivity check** and **Mist status** with a live or lab switch; capture screenshots for the deck (terminal + sidebar results). Optional: support console mirror screenshot.
 - **Security:** API token in browser today (mitigated by **server-side proxy** toward Mist); **remote session IDs are secrets**—document need for **SSO/auth** before production scale; see [Security and consent](#security-and-consent-cross-cutting).
+
+Dedicated reviewer-facing docs:
+
+- [Hackathon submission guide](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/HACKATHON-SUBMISSION.md)
+- [Setup instructions](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/SETUP.md)
+- [Example outputs](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/EXAMPLE-OUTPUTS.md)
+- [Security posture](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/SECURITY.md)
 
 ### Innovation highlights
 

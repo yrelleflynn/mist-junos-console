@@ -79,6 +79,7 @@ function init(): void {
     terminalContainer: document.getElementById('terminal-container') as HTMLElement,
     connectionBadge: document.getElementById('connection-badge') as HTMLElement,
     connectionStatePill: document.getElementById('connection-state-pill') as HTMLElement | null,
+    serialPortSelect: document.getElementById('serial-port-select') as HTMLSelectElement,
     selectedPort: document.getElementById('selected-port') as HTMLElement,
     baudRate: document.getElementById('baud-rate') as HTMLSelectElement,
     dataBits: document.getElementById('data-bits') as HTMLSelectElement,
@@ -309,7 +310,10 @@ function init(): void {
   const dhcpRefresh = new DhcpRefreshService(cmdRunner);
   const mistAgentRestart = new MistAgentRestartService(cmdRunner);
   const promptDecoder = new TextDecoder();
+  const terminalEncoder = new TextEncoder();
   let recentConsoleTail = '';
+  let suppressedConsoleLineBuffer = '';
+  let suppressingPvWarning = false;
   let cloudStatusLoopStarted = false;
   let localIdentifyInFlight = false;
   let effectiveCloudCache: { cloudId: string | null; host: string | null; expiresAt: number } | null = null;
@@ -1357,6 +1361,44 @@ function init(): void {
     return ports.length === 1 ? ports[0] : null;
   }
 
+  function getSelectedAuthorizedPort(ports = authorizedPortsCache): SerialPort | null {
+    const selectedLabel = ui.serialPortSelect.value;
+    if (!selectedLabel) return null;
+    return ports.find((port) => formatPortLabel(port) === selectedLabel) ?? null;
+  }
+
+  function refreshAuthorizedPortSelector(): void {
+    const currentValue = ui.serialPortSelect.value;
+    const lastPortLabel = getLastPortLabel();
+    const preferredPort = getPreferredAuthorizedPort();
+    const preferredLabel = preferredPort ? formatPortLabel(preferredPort) : '';
+    const nextValue =
+      (currentValue && authorizedPortsCache.some((port) => formatPortLabel(port) === currentValue))
+        ? currentValue
+        : (lastPortLabel && authorizedPortsCache.some((port) => formatPortLabel(port) === lastPortLabel))
+          ? lastPortLabel
+          : preferredLabel;
+
+    ui.serialPortSelect.innerHTML = '';
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = authorizedPortsCache.length > 0
+      ? 'Choose from authorized ports or open picker'
+      : 'No authorized ports';
+    ui.serialPortSelect.appendChild(placeholder);
+
+    for (const port of authorizedPortsCache) {
+      const label = formatPortLabel(port);
+      const option = document.createElement('option');
+      option.value = label;
+      option.textContent = label;
+      ui.serialPortSelect.appendChild(option);
+    }
+
+    ui.serialPortSelect.value = nextValue || '';
+    ui.serialPortSelect.disabled = serial.isConnected || authorizedPortsCache.length === 0;
+  }
+
   async function refreshAuthorizedPortsCache(): Promise<void> {
     if (!SerialService.isSupported()) return;
     try {
@@ -1365,11 +1407,12 @@ function init(): void {
       authorizedPortsCache = [];
     }
 
+    refreshAuthorizedPortSelector();
     if (serial.isConnected) return;
-    const preferredPort = getPreferredAuthorizedPort();
-    ui.btnConnect.textContent = preferredPort ? 'Reconnect' : 'Choose Serial Port';
-    if (preferredPort) {
-      ui.selectedPort.textContent = `Selected Port: ${formatPortLabel(preferredPort)}`;
+    const selectedPort = getSelectedAuthorizedPort() ?? getPreferredAuthorizedPort();
+    ui.btnConnect.textContent = authorizedPortsCache.length > 0 ? 'Connect Selected Port' : 'Choose Serial Port';
+    if (selectedPort) {
+      ui.selectedPort.textContent = `Selected Port: ${formatPortLabel(selectedPort)}`;
     } else {
       const lastPortLabel = getLastPortLabel();
       ui.selectedPort.textContent = `Selected Port: ${lastPortLabel ?? 'None selected'}`;
@@ -1414,6 +1457,7 @@ function init(): void {
     ui.btnConnect.disabled = connected;
     ui.btnDisconnect.disabled = !connected;
     ui.btnClearConnection.disabled = !connected;
+    ui.serialPortSelect.disabled = connected || authorizedPortsCache.length === 0;
     ui.baudRate.disabled = connected;
     ui.dataBits.disabled = connected;
     ui.parity.disabled = connected;
@@ -1456,18 +1500,20 @@ function init(): void {
 
     if (connected) {
       ui.btnConnect.textContent = 'Reconnect';
+      refreshAuthorizedPortSelector();
       ui.connectionBadge.textContent = 'Connected';
       ui.connectionBadge.className = 'badge badge-connected';
       setConnectionStatePill('connected');
       term.focus();
     } else {
-      ui.btnConnect.textContent = getPreferredAuthorizedPort() ? 'Reconnect' : 'Choose Serial Port';
+      ui.btnConnect.textContent = authorizedPortsCache.length > 0 ? 'Connect Selected Port' : 'Choose Serial Port';
       ui.connectionBadge.textContent = 'Disconnected';
       ui.connectionBadge.className = 'badge badge-disconnected';
       setConnectionStatePill('disconnected');
-      const preferredPort = getPreferredAuthorizedPort();
-      const lastPortLabel = preferredPort ? formatPortLabel(preferredPort) : getLastPortLabel();
+      const selectedPort = getSelectedAuthorizedPort() ?? getPreferredAuthorizedPort();
+      const lastPortLabel = selectedPort ? formatPortLabel(selectedPort) : getLastPortLabel();
       ui.selectedPort.textContent = `Selected Port: ${lastPortLabel ?? 'None selected'}`;
+      refreshAuthorizedPortSelector();
     }
     renderConsoleTaskIndicator();
   }
@@ -1643,9 +1689,10 @@ function init(): void {
         if (!serial.isConnected) return;
         if (configSync.hasStagedCandidate()) return;
         if (identifyInFlight) return;
-        if (!isOperationalPromptVisible()) return;
+        if (getBlockingConsoleTask('background-auto-match')) return;
         return withConsoleTask('background-auto-match', 'background', 'background Mist match', async () => {
           await deviceContext.runIdentify({ silent: true });
+          await cloudStatus.refresh(deviceContext.matchResult, serial.isConnected);
         });
       })
       .catch(() => {});
@@ -1663,7 +1710,7 @@ function init(): void {
       maybeAutoMatchAfterMistSave();
       return;
     }
-    if (!isOperationalPromptVisible()) {
+    if (getBlockingConsoleTask('mist-save-identify-refresh')) {
       maybeAutoMatchAfterMistSave();
       return;
     }
@@ -1674,6 +1721,7 @@ function init(): void {
       'Mist status refresh',
       async () => {
         await deviceContext.runIdentify({ silent: true });
+        await cloudStatus.refresh(deviceContext.matchResult, serial.isConnected);
         return true;
       },
     );
@@ -1705,6 +1753,66 @@ function init(): void {
 
   function isOperationalPromptVisible(): boolean {
     return getRecentPromptMode() === 'operational';
+  }
+
+  const SUPPRESSED_CONSOLE_LINE =
+    'Approaching the limit on PV entries, consider increasing either the vm.pmap.shpgperproc or the vm.pmap.pv_entries tunable.';
+  const SUPPRESSED_CONSOLE_LINE_START = 'Approaching the limit on PV entries';
+  const SUPPRESSED_CONSOLE_LINE_END = 'tunable.';
+
+  function longestSuppressedPrefixSuffix(text: string): string {
+    const maxLen = Math.min(text.length, SUPPRESSED_CONSOLE_LINE_START.length - 1);
+    for (let len = maxLen; len > 0; len -= 1) {
+      if (SUPPRESSED_CONSOLE_LINE_START.startsWith(text.slice(-len))) {
+        return text.slice(-len);
+      }
+    }
+    return '';
+  }
+
+  function filterSuppressedConsoleNoise(text: string): string {
+    const normalized = text.replace(/\r/g, '');
+    const combined = suppressedConsoleLineBuffer + normalized;
+    suppressedConsoleLineBuffer = '';
+
+    let output = '';
+    let cursor = 0;
+
+    while (cursor < combined.length) {
+      if (suppressingPvWarning) {
+        const endIdx = combined.indexOf(SUPPRESSED_CONSOLE_LINE_END, cursor);
+        if (endIdx === -1) {
+          return output;
+        }
+        cursor = endIdx + SUPPRESSED_CONSOLE_LINE_END.length;
+        suppressingPvWarning = false;
+        continue;
+      }
+
+      const fullLineIdx = combined.indexOf(SUPPRESSED_CONSOLE_LINE, cursor);
+      const startIdx = combined.indexOf(SUPPRESSED_CONSOLE_LINE_START, cursor);
+      const matchIdx = fullLineIdx === -1
+        ? startIdx
+        : (startIdx === -1 ? fullLineIdx : Math.min(fullLineIdx, startIdx));
+
+      if (matchIdx === -1) {
+        const remainder = combined.slice(cursor);
+        const partial = longestSuppressedPrefixSuffix(remainder);
+        if (partial) {
+          output += remainder.slice(0, -partial.length);
+          suppressedConsoleLineBuffer = partial;
+        } else {
+          output += remainder;
+        }
+        return output;
+      }
+
+      output += combined.slice(cursor, matchIdx);
+      cursor = matchIdx;
+      suppressingPvWarning = true;
+    }
+
+    return output;
   }
 
   function canRunBackgroundConsoleTask(): boolean {
@@ -2095,9 +2203,11 @@ function init(): void {
   // ---- Serial events ----
   serial.on('data', (data: Uint8Array) => {
     if (!serial.isUiDataSuppressed) {
-      term.write(data);
-      remoteSession.mirrorSerialRx(data);
-      recentConsoleTail = (recentConsoleTail + promptDecoder.decode(data, { stream: true })).slice(-512);
+      const filteredText = filterSuppressedConsoleNoise(promptDecoder.decode(data, { stream: true }));
+      if (filteredText.length === 0) return;
+      term.write(filteredText);
+      remoteSession.mirrorSerialRx(terminalEncoder.encode(filteredText));
+      recentConsoleTail = (recentConsoleTail + filteredText).slice(-512);
       maybeEnterCliOnInitialShellPrompt();
       maybeStartCloudStatusFromPrompt();
     }
@@ -2184,7 +2294,7 @@ function init(): void {
       }
 
       try {
-        const authorizedPort = getPreferredAuthorizedPort();
+        const authorizedPort = getSelectedAuthorizedPort() ?? getPreferredAuthorizedPort();
         if (authorizedPort) {
           await openChosenPort(authorizedPort);
           return;
@@ -4692,6 +4802,17 @@ function init(): void {
   ui.btnDisconnect.addEventListener('click', disconnect);
   ui.btnClearConnection.addEventListener('click', () => term.clear());
   ui.btnClear.addEventListener('click', () => term.clear());
+  ui.serialPortSelect.addEventListener('change', () => {
+    const selectedPort = getSelectedAuthorizedPort();
+    if (selectedPort) {
+      const label = formatPortLabel(selectedPort);
+      ui.selectedPort.textContent = `Selected Port: ${label}`;
+      saveLastPortLabel(label);
+    } else {
+      const lastPortLabel = getLastPortLabel();
+      ui.selectedPort.textContent = `Selected Port: ${lastPortLabel ?? 'None selected'}`;
+    }
+  });
   ui.btnOpenMistModal.addEventListener('click', openMistModal);
   ui.btnCloseMistModal.addEventListener('click', closeMistModal);
   ui.btnCancelMistModal.addEventListener('click', closeMistModal);

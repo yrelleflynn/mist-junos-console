@@ -176,6 +176,32 @@ export class MistApiService {
   }
 
   /**
+   * Make a proxied POST request to the Mist API.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async post<T>(path: string, body: any): Promise<T> {
+    const url = `${this.proxyBase}/mist-proxy`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        apiHost: this.apiHost,
+        apiToken: this.apiToken,
+        method: 'POST',
+        path,
+        body,
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Mist API error ${response.status}: ${text}`);
+    }
+
+    return response.json() as Promise<T>;
+  }
+
+  /**
    * Fetch all sites in the org.
    */
   async listSites(): Promise<MistSite[]> {
@@ -379,11 +405,28 @@ export class MistApiService {
    * Fetch device events (connect/disconnect, config changes, etc.)
    */
   async getDeviceEvents(siteId: string, deviceId: string, limit = 20): Promise<MistDeviceEvent[]> {
-    const data = await this.get<{ results?: MistDeviceEvent[] } | MistDeviceEvent[]>(
-      `/api/v1/sites/${siteId}/devices/events?device_id=${deviceId}&limit=${limit}`
-    );
-    if (Array.isArray(data)) return data;
-    if (data && 'results' in data && Array.isArray(data.results)) return data.results;
+    try {
+      const data = await this.get<{ results?: MistDeviceEvent[] } | MistDeviceEvent[]>(
+        `/api/v1/sites/${siteId}/devices/events/search?device_id=${encodeURIComponent(deviceId)}&limit=${limit}`,
+      );
+      if (Array.isArray(data)) return data;
+      if (data && 'results' in data && Array.isArray(data.results)) return data.results;
+    } catch {
+      try {
+        const data = await this.post<{ results?: MistDeviceEvent[] } | MistDeviceEvent[]>(
+          `/api/v1/sites/${siteId}/devices/events/search`,
+          { device_id: deviceId, limit },
+        );
+        if (Array.isArray(data)) return data;
+        if (data && 'results' in data && Array.isArray(data.results)) return data.results;
+      } catch {
+        const data = await this.get<{ results?: MistDeviceEvent[] } | MistDeviceEvent[]>(
+          `/api/v1/sites/${siteId}/devices/events?device_id=${encodeURIComponent(deviceId)}&limit=${limit}`
+        );
+        if (Array.isArray(data)) return data;
+        if (data && 'results' in data && Array.isArray(data.results)) return data.results;
+      }
+    }
     return [];
   }
 

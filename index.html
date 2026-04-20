@@ -71,8 +71,12 @@
               <button id="btn-disconnect" class="btn btn-danger" disabled>Disconnect</button>
               <button id="btn-clear-connection" class="btn btn-secondary" disabled>Clear Terminal</button>
             </div>
+            <label for="serial-port-select">Authorized Ports</label>
+            <select id="serial-port-select">
+              <option value="">No authorized ports</option>
+            </select>
             <div class="connection-helper">
-              Opens browser port picker (Chrome/Edge only).
+              Choose an already-authorized port here, or use <strong>Choose Serial Port</strong> to open the browser picker (Chrome/Edge only).
             </div>
             <div class="connection-next-steps">
               <div><strong>01 Login to Switch</strong> — after connecting, authenticate to Junos.</div>
@@ -140,7 +144,7 @@
               <button id="btn-config-sync-preview" class="btn btn-secondary" disabled>Config Sync</button>
             </div>
 
-            <div class="sidebar-actions" style="margin-top:8px;">
+            <div class="sidebar-actions" style="margin-top:8px;" hidden>
               <button id="btn-offline-timeline" class="btn btn-secondary" disabled>Offline Timeline</button>
             </div>
 
@@ -216,7 +220,7 @@
             <button class="results-tab" data-pane="checks">Checks</button>
             <button class="results-tab" data-pane="actions">Actions</button>
             <button class="results-tab" data-pane="config-sync">Config Sync</button>
-            <button class="results-tab" data-pane="timeline">Timeline</button>
+            <button class="results-tab" data-pane="timeline" hidden>Timeline</button>
             <div class="results-panel-spacer"></div>
             <span id="mist-api-status" class="status-text results-api-status"></span>
           </div>
