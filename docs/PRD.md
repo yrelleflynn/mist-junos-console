@@ -36,6 +36,14 @@ Give an operator a single browser-based workspace that can:
 
 Field operator or site technician who has physical access to the switch but may have limited Junos expertise.
 
+Typical example:
+
+- a third-party contractor dispatched to a retail or branch site
+- has a laptop, a console cable, and a mobile hotspot
+- may be working in a comms room with poor cellular reception
+- can provide physical hands, but relies on Mist, JTAC, or guided automation
+  for diagnosis and safe remediation
+
 ### Secondary user
 
 Remote support engineer assisting the field operator during onboarding, outage triage, or recovery.
@@ -54,6 +62,19 @@ Mist product/support teams who may want this flow embedded or linked from Mist i
 6. Apply low-risk guided actions for adoption or remediation.
 7. Share the live console with remote support.
 
+### Connectivity-constrained support scenario
+
+The product must remain usable in real-world low-bandwidth environments where a
+screen share may not be practical. A core scenario is:
+
+1. A switch goes offline at a remote retail site
+2. A local contractor is sent onsite with only a laptop and console cable
+3. The contractor tethers through a mobile hotspot with weak reception
+4. A JTAC or remote support engineer joins the session
+5. The product must provide enough shared visibility and enough bounded
+   remediation capability to diagnose and, where possible, recover the device
+   without requiring Zoom or other high-bandwidth tooling
+
 ## Goals
 
 ### Product goals
@@ -62,6 +83,8 @@ Mist product/support teams who may want this flow embedded or linked from Mist i
 - Make troubleshooting consistent and usable by non-experts.
 - Bring Mist context directly into the console workflow.
 - Create a safe path toward assisted remediation and adoption.
+- Keep remote diagnosis and support viable on weak cellular links where video
+  or screen-sharing tools are unreliable.
 
 ### Engineering goals
 
@@ -90,7 +113,16 @@ Based on the current implementation, the product already includes:
 - automated cloud-connectivity troubleshooting checks with gate logic
 - JMA Connectivity State monitoring (switch-reported cloud state, parsed from cc-state)
 - staged config sync: fetch Mist diff, stage candidate, show | compare, commit check, then operator-gated Commit Confirmed / Commit / Rollback
+- bounded recovery actions such as DHCP Refresh and Restart Mist Agent
 - remote support console mirroring over WebSocket
+- backend MCP integration for bounded agent reads and actions
+  - live session summary
+  - switch identity and JMA state
+  - structured check results
+  - check and check-group execution
+  - bounded recovery action execution
+  - effective config retrieval
+  - bounded log retrieval, including rotated logs
 
 ### Demoable scope as of hackathon (April 2026)
 
@@ -112,13 +144,25 @@ Staged config sync loads the Mist diff as a candidate, validates it with
 `commit check`, and presents the operator with a Commit or Rollback decision.
 The operator approves; the tool executes.
 
-**What is not yet implemented (roadmap only):**
-AI agent integration via a backend MCP server is documented in
-[`docs/BACKEND-MCP-DESIGN.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/BACKEND-MCP-DESIGN.md)
-but is not part of the current demo. The product is designed to support this
-workflow — structured check results, JMA state, config sync outcomes — as
-tool-shaped interfaces for a diagnostic agent operating within operator-owned
-sessions. This is a planned phase-2 and phase-3 capability, not a current claim.
+**What is implemented now in bounded form:**
+AI agent integration via a backend MCP server is now available in proof-of-concept form.
+The current MCP surface can:
+
+- read live session state, JMA state, and Mist context
+- retrieve structured check results
+- run bounded checks and check groups
+- run bounded recovery actions
+- fetch effective config and targeted switch logs
+
+The current safety boundary is that the MCP layer does not provide arbitrary
+command execution. It operates through bounded in-app workflows inside the
+operator-owned session.
+
+**What is still roadmap / future work:**
+
+- richer agent orchestration and recommendation flows
+- stronger persistence / transcript / audit capabilities
+- production-grade auth, policy, and approval controls for broader agent exposure
 
 ## Key User Journeys
 
@@ -148,6 +192,14 @@ sessions. This is a planned phase-2 and phase-3 capability, not a current claim.
 3. Support joins a mirrored console.
 4. Support observes output and optionally injects keystrokes.
 5. Session ends when operator disconnects or disables sharing.
+
+### Journey 4: Agent-assisted troubleshooting
+
+1. Operator enables agent access for the live console session.
+2. The MCP layer reads session context, switch identity, Mist context, and JMA state.
+3. The agent runs bounded checks or recovery actions through the app.
+4. The operator reviews results and decides whether to proceed with any higher-risk workflow such as Config Sync commit.
+5. The session remains operator-owned throughout.
 
 ## Functional Requirements
 
@@ -235,6 +287,12 @@ See [`docs/MIST-API-INTEGRATION.md`](/Users/mdusty/Library/CloudStorage/OneDrive
 - The app must allow an operator to start a support session.
 - The app must allow a human support user to join by session ID or a future authenticated equivalent.
 - The app may allow an AI agent to join a session under explicit operator consent and policy controls.
+- The app should expose bounded tool-shaped interfaces for an AI agent to:
+  - inspect session and device context
+  - run structured checks
+  - run bounded recovery actions
+  - fetch effective config and targeted logs
+  without granting arbitrary command execution.
 - The app must mirror RX and TX traffic appropriately.
 - The product must make the trust boundary obvious to the operator.
 - The product must clearly indicate whether a session participant is a human support user or an AI agent.

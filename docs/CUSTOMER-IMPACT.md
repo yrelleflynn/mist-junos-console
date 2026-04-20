@@ -30,6 +30,22 @@ This tool collapses that into a single browser tab. There is no software to inst
 - Does not need to ask the operator to read back CLI output line by line
 - Can guide the operator through a structured workflow with shared evidence
 
+### Representative customer scenario
+
+A realistic deployment case is a retail customer with 100+ sites using a mix of
+regional third-party contractors for onsite work. When a switch goes offline:
+
+1. The customer dispatches a local technician to site
+2. The technician arrives with a laptop, console cable, and a mobile hotspot
+3. Reception in the comms room or back-of-store area may be weak and unstable
+4. A Zoom call or live screen share is often not viable on that cellular link
+5. JTAC or a remote network engineer still needs enough visibility to diagnose
+   the switch and, where safe, get it back online
+
+This product is explicitly well suited to that environment because it replaces
+high-bandwidth video support with a low-bandwidth text console session plus
+structured Mist-aware diagnostics and bounded recovery actions.
+
 ---
 
 ## The Pain Today
@@ -51,6 +67,13 @@ Config sync stages the exact candidate, shows the diff, runs commit check, and g
 When a less experienced operator cannot resolve an issue, they escalate. The escalating engineer then has to reconstruct context from verbal relay or screenshots. This is slow and frustrating on both sides.
 
 Remote session mirroring gives a support engineer a live view of the same console without needing physical access or a VPN session to the switch. The shared context reduces escalation time significantly.
+
+In low-bandwidth retail and branch environments, this is more than a
+convenience improvement. It can be the difference between:
+
+- a viable text-based remote recovery workflow
+- and a failed support attempt because the cellular link cannot sustain video,
+  screen share, or repeated screenshot relay
 
 ---
 
@@ -98,6 +121,13 @@ The tool works across any environment where Mist manages EX switches with consol
 | Branch networks | Single switch sites where escalation cost is high relative to site size |
 
 The checks and config sync flow are device-context-aware but not site-topology-specific. The same operator workflow can be reused across many EX switch deployments even though exact root causes and validation details will vary by environment.
+
+Retail is an especially strong fit because:
+
+- there is often no local IT expert permanently onsite
+- physical access is available, but network conditions for remote support are poor
+- recovery speed matters directly to store operations
+- console plus hotspot is often the only realistic fallback path
 
 ---
 

@@ -2,7 +2,7 @@
 
 ## One-Sentence Summary
 
-`mist-junos-console` is a browser-based serial console workspace that connects directly to an offline Juniper EX switch, runs automated cloud connectivity diagnostics against live Mist context, and lets the operator stage and safely commit a Mist-intended config fix — without any additional tooling or local install.
+`mist-junos-console` is a browser-based serial console workspace that connects directly to an offline Juniper EX switch, runs automated cloud connectivity diagnostics against live Mist context, exposes those results to a bounded MCP agent workflow, and lets the operator stage and safely commit a Mist-intended config fix — without any additional tooling or local install.
 
 ---
 
@@ -42,6 +42,18 @@ For the current hackathon scope, the strongest remediation emphasis is:
 
 - **Config Sync** as the bridge when an operator has already corrected intent in Mist but the switch is offline and cannot receive those changes
 - **DHCP Refresh** as a bounded recovery action for stale or missing DHCP-derived management state such as DNS servers
+- **Restart Mist Agent** as a bounded service-recovery action when the issue is agent-side rather than config-side
+
+**AI-assisted workflow (implemented, bounded)**
+
+The backend MCP server is now live and can:
+
+- read the live session, switch identity, Mist context, JMA state, and last check results
+- run individual checks, check groups, recommended checks, and the full baseline
+- run bounded recovery actions such as **DHCP Refresh**, **Restart Mist Agent**, and **Config Sync Preview**
+- fetch effective config and bounded log windows, including rotated `mcd` / `jmd` logs
+
+The important safety boundary is that the MCP layer does not execute arbitrary commands. It instructs the already-open operator session to run bounded in-app workflows.
 
 See [`docs/JMA-ACTION-SHORTLIST.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/JMA-ACTION-SHORTLIST.md) for the current action prioritization by JMA state.
 
@@ -62,9 +74,9 @@ Connect to the switch via Web Serial. The app authenticates automatically if the
 
 **Talking point:** No software install. No SSH tunnel. No separate terminal emulator. The console is the app.
 
-Once connected, click **Identify Device**. The tool reads the switch serial number, hostname, and MAC address, matches it against Mist inventory, and populates the session header with org, site, and device context.
+Once connected, click **Identify Device**. The tool reads the switch serial number, hostname, and MAC address, matches it against Mist inventory, and populates the session header with org, site, and device context when Mist API access is pre-configured.
 
-**Talking point:** The operator does not need to know which org or site this switch belongs to. The tool discovers it.
+**Talking point:** In the demo, the operator does not have to manually look up org or site context. The tool discovers it from the device identity and pre-configured Mist access.
 
 ### Step 2 — JMA Connectivity State (30 sec)
 
@@ -72,9 +84,17 @@ Point to the JMA Connectivity State indicator in the session header. It shows th
 
 **Talking point:** This is the switch's view of its own problem, not just Mist's last-known status. Two signals, not one.
 
-### Step 3 — Run troubleshoot (3–4 min)
+### Step 3 — Run recommended checks or baseline (3–4 min)
 
-Click **Run Troubleshoot**. Walk through the check results as they appear:
+Point to the JMA guidance card first. For targeted demo flow:
+
+- click **Run Recommended Checks** when the switch is in a meaningful JMA state such as `106 DNSLookupFailed` or `108 CloudUnreachable`
+
+For a broader walk-through:
+
+- click **Run Full Baseline**
+
+Walk through the check results as they appear:
 
 - LLDP identifies the uplink port
 - Uplink port is up, no errors
@@ -88,11 +108,15 @@ Click **Run Troubleshoot**. Walk through the check results as they appear:
 
 Highlight the remediation guidance on the failed check.
 
-### Step 4 — Config drift (1–2 min)
+### Step 4 — Actions and evidence (1–2 min)
 
-Click **Config Drift**. The tool fetches Mist-intended config via the backend Mist proxy and compares it to the live running config. Show the diff — for example, a missing native VLAN on the uplink or a missing management VLAN membership.
+Use the **Actions** tab to show bounded remediation or evidence collection:
 
-**Talking point:** The Mist UI shows intended config. The switch has something different. This tool shows exactly what is missing, right next to the console.
+- **DHCP Refresh** for stale DHCP-derived management state
+- **Restart Mist Agent** for service-recovery
+- effective config / log reads through the MCP path if you want to show the agent-assist angle
+
+**Talking point:** The operator does not have to leave the console workflow. Checks, actions, and recovery evidence all stay in the same workspace.
 
 ### Step 5 — Staged config sync (3–4 min)
 
@@ -112,7 +136,18 @@ Click **Commit**. The tool sends `commit comment "junos console config sync"` an
 
 **Talking point:** The important safety boundary is that the tool stages the candidate, validates it, and then waits for operator approval before applying anything.
 
-### Step 6 — Reconnect or verification outcome (1 min)
+### Step 6 — MCP / agent angle (1–2 min)
+
+If time allows, show the MCP angle explicitly:
+
+- the agent can read the current JMA state, check results, and Mist context
+- it can trigger bounded checks and bounded recovery actions
+- it can pull effective config and targeted `mcd` / `jmd` logs
+- it still works inside the operator-owned session with the same safety boundaries
+
+**Talking point:** This is not “AI with arbitrary shell access.” It is an agent working through the same guardrailed workflows the operator uses.
+
+### Step 7 — Reconnect or verification outcome (1 min)
 
 Best case live path: the Mist Status indicator in the session header updates from offline to connected and the JMA state updates to `111 Connected`.
 
@@ -151,9 +186,10 @@ The detection and diagnosis portions (Steps 1–4) do not require the switch to 
 | Connect | No install, no SSH, browser-native Web Serial |
 | Identify | Device auto-matched to Mist inventory |
 | JMA state | Switch's own cloud view, not just Mist's guess |
-| Troubleshoot | Structured cloud-connectivity checks, gated with remediation |
-| Config drift | Mist intent vs live switch, inline in the console workflow |
+| Checks | Structured cloud-connectivity checks, gated with remediation |
+| Actions | Bounded recovery actions and evidence in the same workspace |
 | Staged sync | Candidate staged, operator approves commit — not auto-applied |
+| MCP | Agent can inspect, run bounded workflows, and fetch logs/config safely |
 | Commit | Operator-approved application after staged diff + commit check |
 | Reconnect | Guided recovery loop: detect → diagnose → stage → operator-approved act |
 
@@ -175,7 +211,7 @@ A: It is designed for Mist-managed EX switches with console access and a Mist-in
 
 **Q: What is the AI/MCP angle?**
 
-A: The backend MCP design is documented as a roadmap item. The current product exposes structured check results, JMA state, config drift, and staged sync outcomes — exactly the kind of data a diagnostic AI agent needs. The MCP would expose these as tool-shaped interfaces, allowing an agent to observe the session, run targeted checks, and propose actions for operator approval. The product is designed to support that workflow safely.
+A: The MCP layer is live in bounded form. The agent can observe live session state, JMA state, check results, Mist context, effective config, and targeted logs. It can also trigger bounded workflows such as recommended checks, full baseline, DHCP Refresh, Restart Mist Agent, and Config Sync Preview. The safety model is that the agent does not get arbitrary CLI access — it works through the same in-app workflows and guardrails as the operator.
 
 **Q: What happens if the commit makes things worse?**
 
