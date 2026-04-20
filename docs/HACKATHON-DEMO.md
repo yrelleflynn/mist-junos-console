@@ -38,6 +38,13 @@ Check results include a structured interpretation: not just pass/fail output, bu
 
 Staged config sync fetches the Mist-intended config diff, loads it as a candidate on the switch, runs `commit check`, shows the operator a clear diff and check result, and then waits for an explicit operator action: **Commit** (apply) or **Rollback** (discard). The operator approves; the tool executes.
 
+For the current hackathon scope, the strongest remediation emphasis is:
+
+- **Config Sync** as the bridge when an operator has already corrected intent in Mist but the switch is offline and cannot receive those changes
+- **DHCP Refresh** as a bounded recovery action for stale or missing DHCP-derived management state such as DNS servers
+
+See [`docs/JMA-ACTION-SHORTLIST.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/JMA-ACTION-SHORTLIST.md) for the current action prioritization by JMA state.
+
 ---
 
 ## Demo Flow (10–15 minutes)
@@ -89,7 +96,7 @@ Click **Config Drift**. The tool fetches Mist-intended config via the backend Mi
 
 ### Step 5 — Staged config sync (3–4 min)
 
-Click **Preview Config Sync**. Walk through what happens:
+Click **Config Sync**. Walk through what happens:
 
 1. Tool fetches the Mist-intended config for this device
 2. Loads the diff as a candidate using `load set terminal`
@@ -130,7 +137,7 @@ If the live reconnect is slow or not appropriate to wait for during the demo, st
 If the serial device is unavailable or the live sync is too risky for a demo switch:
 
 - Run **Config Drift** against a pre-staged switch with known drift and walk through the diff comparison
-- Show a pre-recorded terminal output of the **Preview Config Sync** flow including the `show | compare` diff and commit check result
+- Show a pre-recorded terminal output of the **Config Sync** flow including the `show | compare` diff and commit check result
 - Show the action bar with the two decision buttons and explain the commit / rollback model without completing the commit
 
 The detection and diagnosis portions (Steps 1–4) do not require the switch to be offline and can be run against any reachable Mist-managed switch with a console cable attached.

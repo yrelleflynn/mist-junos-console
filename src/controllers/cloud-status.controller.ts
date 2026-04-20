@@ -10,6 +10,7 @@ import {
 
 export interface CloudStatusControllerCallbacks {
   onStatusUpdated(state: CloudStatusState): void;
+  onRefreshStateChange?(inFlight: boolean): void;
 }
 
 export class CloudStatusController {
@@ -45,6 +46,7 @@ export class CloudStatusController {
   async refresh(matchResult: MistMatchResult | null, serialConnected: boolean): Promise<void> {
     if (this.inFlight) return;
     this.inFlight = true;
+    this.callbacks.onRefreshStateChange?.(true);
     try {
       const mistPromise = this.buildMistStatus(matchResult);
       const jmaPromise = serialConnected
@@ -61,6 +63,7 @@ export class CloudStatusController {
       this.callbacks.onStatusUpdated(this.state);
     } finally {
       this.inFlight = false;
+      this.callbacks.onRefreshStateChange?.(false);
     }
   }
 

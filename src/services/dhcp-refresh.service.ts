@@ -35,6 +35,8 @@ export interface DhcpBinding {
   leaseStart: string | null;
   /** ISO-8601 UTC string, or null when not available */
   leaseExpires: string | null;
+  /** DNS servers learned for this client/interface, in effective order */
+  dnsServers: string[];
 }
 
 export type DhcpBindingOutcome =
@@ -63,19 +65,87 @@ export interface DhcpRefreshResult {
   errors: string[];
 }
 
+export type DhcpRefreshStepStatus = 'running' | 'completed';
+
+export interface DhcpRefreshStep {
+  key:
+    | 'read-before'
+    | 'disable-interfaces'
+    | 'commit-disable'
+    | 'restore-interfaces'
+    | 'commit-restore'
+    | 'wait-renewal'
+    | 'read-after';
+  label: string;
+  status: DhcpRefreshStepStatus;
+}
+
 /** How long to wait after the second commit before re-reading bindings */
 const POST_COMMIT_WAIT_MS = 5000;
+
+const DHCP_STATE_TOKENS = new Set([
+  'BOUND',
+  'SELECTING',
+  'RENEWING',
+  'REBINDING',
+  'INIT',
+  'INIT-REBOOT',
+  'REQUESTING',
+  'REBOOTING',
+  'UNKNOWN',
+]);
+
+function isHardwareAddressToken(token: string): boolean {
+  return /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(token);
+}
+
+function isInterfaceToken(token: string): boolean {
+  return /^(?:irb|vme|me0|vlan|fxp0|reth\d*|ae\d*|lo0)\.\d+$/i.test(token)
+    || /^(?:ge|xe|et|fe)-\d+\/\d+\/\d+(?:\.\d+)?$/i.test(token);
+}
+
+function isDhcpStateToken(token: string): boolean {
+  return DHCP_STATE_TOKENS.has(token.toUpperCase());
+}
+
+function parseDhcpSummaryLine(trimmed: string): Pick<DhcpBinding, 'interface' | 'ipAddress' | 'hwAddress' | 'expiresSeconds' | 'state'> | null {
+  const parts = trimmed.split(/\s+/);
+  if (parts.length < 5) return null;
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(parts[0])) return null;
+
+  const ipAddress = parts[0];
+  const hwAddress = parts.find(isHardwareAddressToken);
+  const state = parts.find(isDhcpStateToken);
+  const interfaceName = parts.find(isInterfaceToken);
+  const expiresToken = parts.find((part) => /^\d+$/.test(part));
+
+  if (!hwAddress || !state || !interfaceName || !expiresToken) return null;
+
+  return {
+    ipAddress,
+    hwAddress,
+    expiresSeconds: parseInt(expiresToken, 10) || 0,
+    state,
+    interface: interfaceName,
+  };
+}
 
 export class DhcpRefreshService {
   constructor(private readonly runner: CommandRunnerService) {}
 
   // ---- Public API --------------------------------------------------------
 
-  async refresh(): Promise<DhcpRefreshResult> {
+  async refresh(onStep?: (step: DhcpRefreshStep) => void): Promise<DhcpRefreshResult> {
     const errors: string[] = [];
 
+    const reportStep = (key: DhcpRefreshStep['key'], label: string, status: DhcpRefreshStepStatus): void => {
+      onStep?.({ key, label, status });
+    };
+
     // 1. Read current bindings — silently so the terminal stays clean
+    reportStep('read-before', 'Checking DHCP bindings before refresh', 'running');
     const before = await this.readBindings({ silent: true });
+    reportStep('read-before', 'Checked DHCP bindings before refresh', 'completed');
 
     if (before.length === 0) {
       return {
@@ -111,14 +181,24 @@ export class DhcpRefreshService {
     await this.runner.ensureConfigMode();
 
     // 4. Disable each DHCP client interface
+    reportStep('disable-interfaces', 'Disabling DHCP client interfaces', 'running');
     for (const iface of targetInterfaces) {
       const path = ifaceToJunosPath(iface);
       await this.runner.execute(`set ${path} disable`, 10000, 2000);
     }
+    reportStep('disable-interfaces', 'Disabled DHCP client interfaces', 'completed');
 
     // 5. First commit — forces DHCP release
+    reportStep('commit-disable', 'Committing interface disable to force DHCP release', 'running');
     const commit1 = await this.runner.execute('commit', 60000, 5000);
     const commitDisableSuccess = /commit complete/i.test(commit1.output);
+    reportStep(
+      'commit-disable',
+      commitDisableSuccess
+        ? 'Committed interface disable to force DHCP release'
+        : 'Disable commit failed',
+      'completed',
+    );
 
     if (!commitDisableSuccess) {
       // Roll back our staged changes and bail out
@@ -139,11 +219,21 @@ export class DhcpRefreshService {
     }
 
     // 6. Rollback 1 — load the prior committed config (without disable statements)
+    reportStep('restore-interfaces', 'Restoring DHCP client interfaces from prior config', 'running');
     await this.runner.execute('rollback 1', 10000, 2000);
+    reportStep('restore-interfaces', 'Restored DHCP client interfaces from prior config', 'completed');
 
     // 7. Second commit — re-enables interfaces, triggers DHCP discovery
+    reportStep('commit-restore', 'Committing interface restore to trigger DHCP renewal', 'running');
     const commit2 = await this.runner.execute('commit', 60000, 5000);
     const commitRestoreSuccess = /commit complete/i.test(commit2.output);
+    reportStep(
+      'commit-restore',
+      commitRestoreSuccess
+        ? 'Committed interface restore to trigger DHCP renewal'
+        : 'Restore commit failed',
+      'completed',
+    );
 
     if (!commitRestoreSuccess) {
       errors.push(
@@ -155,10 +245,14 @@ export class DhcpRefreshService {
     await this.runner.execute('exit', 5000, 2000);
 
     // 9. Wait for DHCP to negotiate
+    reportStep('wait-renewal', 'Waiting for DHCP renewal to complete', 'running');
     await new Promise<void>((resolve) => setTimeout(resolve, POST_COMMIT_WAIT_MS));
+    reportStep('wait-renewal', 'Waited for DHCP renewal to complete', 'completed');
 
     // 10. Read bindings again — silently
+    reportStep('read-after', 'Checking DHCP bindings after refresh', 'running');
     const after = await this.readBindings({ silent: true });
+    reportStep('read-after', 'Checked DHCP bindings after refresh', 'completed');
 
     // 11. Build change summary
     const changes = buildChanges(targetInterfaces, before, after);
@@ -181,23 +275,21 @@ export class DhcpRefreshService {
     for (const line of output.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed || /^IP\s+address/i.test(trimmed)) continue;
-      // Format: <ip>  <hw>  <expires>  <state>  <interface>
-      const parts = trimmed.split(/\s+/);
-      if (parts.length < 5) continue;
-      if (!/^\d+\.\d+\.\d+\.\d+$/.test(parts[0])) continue;
-      bindings.push({
-        ipAddress: parts[0],
-        hwAddress: parts[1],
-        expiresSeconds: parseInt(parts[2], 10) || 0,
-        state: parts[3],
-        interface: parts[4],
-      });
+      const binding = parseDhcpSummaryLine(trimmed);
+      if (!binding) continue;
+      bindings.push(binding);
     }
     return bindings;
   }
 
-  parseDetail(output: string): Map<string, Pick<DhcpBinding, 'serverIdentifier' | 'leaseStart' | 'leaseExpires'>> {
-    const map = new Map<string, Pick<DhcpBinding, 'serverIdentifier' | 'leaseStart' | 'leaseExpires'>>();
+  parseDetail(output: string): Map<string, Pick<DhcpBinding, 'serverIdentifier' | 'leaseStart' | 'leaseExpires' | 'dnsServers'> & {
+    router: string | null;
+    subnetMask: string | null;
+  }> {
+    const map = new Map<string, Pick<DhcpBinding, 'serverIdentifier' | 'leaseStart' | 'leaseExpires' | 'dnsServers'> & {
+      router: string | null;
+      subnetMask: string | null;
+    }>();
     // Each binding block starts with "Client Interface/Id: <iface>"
     for (const block of output.split(/(?=Client Interface\/Id:)/)) {
       const ifaceMatch = block.match(/Client Interface\/Id:\s*(\S+)/);
@@ -207,11 +299,22 @@ export class DhcpRefreshService {
       const serverMatch = block.match(/Server Identifier:\s*(\S+)/);
       const leaseStartMatch = block.match(/Lease Start:\s*(.+?UTC)/);
       const leaseExpiresMatch = block.match(/Lease Expires:\s*(.+?UTC)/);
+      const routerMatch = block.match(/Name:\s*router,\s*Value:\s*\[\s*(\d+\.\d+\.\d+\.\d+)/i);
+      const subnetMaskMatch = block.match(/Name:\s*subnet-mask,\s*Value:\s*(\d+\.\d+\.\d+\.\d+)/i);
+      const dnsServers = Array.from(new Set(
+        block
+          .split('\n')
+          .filter((line) => /(?:DNS|Name server|Domain name server|name-server)/i.test(line))
+          .flatMap((line) => line.match(/\d+\.\d+\.\d+\.\d+/g) ?? []),
+      ));
 
       map.set(iface, {
         serverIdentifier: serverMatch?.[1] ?? null,
         leaseStart: leaseStartMatch?.[1]?.trim() ?? null,
         leaseExpires: leaseExpiresMatch?.[1]?.trim() ?? null,
+        dnsServers,
+        router: routerMatch?.[1] ?? null,
+        subnetMask: subnetMaskMatch?.[1] ?? null,
       });
     }
     return map;
@@ -231,6 +334,7 @@ export class DhcpRefreshService {
       serverIdentifier: detailMap.get(b.interface)?.serverIdentifier ?? null,
       leaseStart: detailMap.get(b.interface)?.leaseStart ?? null,
       leaseExpires: detailMap.get(b.interface)?.leaseExpires ?? null,
+      dnsServers: detailMap.get(b.interface)?.dnsServers ?? [],
     }));
   }
 }

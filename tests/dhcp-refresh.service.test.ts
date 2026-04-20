@@ -19,6 +19,12 @@ IP address        Hardware address   Expires     State      Interface
 10.99.0.108       58:00:bb:b7:66:39  86260       BOUND      irb.0
 `;
 
+const SUMMARY_INTERFACE_SECOND = `
+IP address        Interface  Hardware address   Expires     State
+10.99.0.108       irb.0      58:00:bb:b7:66:39  86260       BOUND
+0.0.0.0           vme.0      58:00:bb:b7:66:3a  0           SELECTING
+`;
+
 const SUMMARY_EMPTY = `
 IP address        Hardware address   Expires     State      Interface
 `;
@@ -91,6 +97,7 @@ function makeBinding(overrides: Partial<DhcpBinding> = {}): DhcpBinding {
     serverIdentifier: '10.99.0.1',
     leaseStart: '2026-04-18 11:13:12 UTC',
     leaseExpires: '2026-04-19 11:13:12 UTC',
+    dnsServers: [],
     ...overrides,
   };
 }
@@ -129,6 +136,25 @@ describe('DhcpRefreshService.parseSummary', () => {
     const bindings = svc.parseSummary(SUMMARY_OUTPUT);
     expect(bindings.every((b) => /^\d+\.\d+/.test(b.ipAddress))).toBe(true);
   });
+
+  it('parses bindings even when the interface column is not the last token', () => {
+    const svc = makeService();
+    const bindings = svc.parseSummary(SUMMARY_INTERFACE_SECOND);
+
+    expect(bindings).toHaveLength(2);
+    expect(bindings[0]).toMatchObject({
+      ipAddress: '10.99.0.108',
+      interface: 'irb.0',
+      hwAddress: '58:00:bb:b7:66:39',
+      expiresSeconds: 86260,
+      state: 'BOUND',
+    });
+    expect(bindings[1]).toMatchObject({
+      interface: 'vme.0',
+      hwAddress: '58:00:bb:b7:66:3a',
+      state: 'SELECTING',
+    });
+  });
 });
 
 // ---- parseDetail -----------------------------------------------------------
@@ -142,6 +168,7 @@ describe('DhcpRefreshService.parseDetail', () => {
       serverIdentifier: '10.99.0.1',
       leaseStart: '2026-04-18 11:13:12 UTC',
       leaseExpires: '2026-04-19 11:13:12 UTC',
+      dnsServers: ['45.90.28.80', '45.90.30.80'],
     });
   });
 

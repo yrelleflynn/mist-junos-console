@@ -28,7 +28,7 @@ const RECOMMENDATIONS: Record<number, JmaRecommendation> = {
     implication: 'This is usually a local uplink, VLAN, or DHCP problem. Cloud checks will not be meaningful until the switch gets an IP.',
     severity: 'fail',
     checks: [
-      { id: 'mgmt-ip', label: 'Management IP Address', why: 'Confirm that the switch truly has no usable management IP.' },
+      { id: 'mgmt-ip', label: 'Interface IP Summary', why: 'Confirm which IPv4 interfaces have addresses and whether DHCP appears to be involved.' },
       { id: 'dhcp-lease', label: 'DHCP Lease Details', why: 'See whether DHCP is configured and whether a lease was offered.' },
       { id: 'vlan-config', label: 'VLAN Configuration', why: 'Verify the management VLAN is present on the uplink.' },
       { id: 'port-status', label: 'Uplink Port Status', why: 'Check whether the uplink is physically up.' },
@@ -49,10 +49,10 @@ const RECOMMENDATIONS: Record<number, JmaRecommendation> = {
     implication: 'This is usually a DHCP Option 3 issue or a missing static route. Off-subnet cloud traffic cannot leave the switch.',
     severity: 'fail',
     checks: [
-      { id: 'default-route', label: 'Default Gateway', why: 'Confirm whether a default route exists at all.' },
+      { id: 'default-route', label: 'Default Routes', why: 'Confirm whether one or more active default routes exist at all.' },
       { id: 'dhcp-lease', label: 'DHCP Lease Details', why: 'Check whether DHCP delivered a gateway option.' },
-      { id: 'mgmt-ip', label: 'Management IP Address', why: 'Confirm the management subnet is what you expect.' },
-      { id: 'arp', label: 'ARP Table', why: 'Check whether the expected gateway appears locally reachable.' },
+      { id: 'mgmt-ip', label: 'Interface IP Summary', why: 'Confirm which routed IPv4 interfaces exist before reviewing default routes.' },
+      { id: 'arp', label: 'Gateway Reachability', why: 'Check whether the discovered gateway path looks reachable via ARP or ping.' },
     ],
     remediation: [
       'If DHCP is intended, verify the server is sending Option 3 and renew the lease.',
@@ -70,7 +70,7 @@ const RECOMMENDATIONS: Record<number, JmaRecommendation> = {
     implication: 'This usually points to a Layer 2 adjacency problem such as VLAN mismatch, missing trunk membership, ARP failure, or physical errors.',
     severity: 'fail',
     checks: [
-      { id: 'arp', label: 'ARP Table', why: 'See whether the gateway MAC is learned at all.' },
+      { id: 'arp', label: 'Gateway Reachability', why: 'See whether the discovered default-route gateway looks reachable at all.' },
       { id: 'port-status', label: 'Uplink Port Status', why: 'Confirm the uplink is up before chasing routing issues.' },
       { id: 'interface-errors', label: 'Uplink Interface Errors', why: 'Look for physical-layer trouble like CRC or framing errors.' },
       { id: 'vlan-config', label: 'VLAN Configuration', why: 'Check whether the management VLAN is actually on the uplink.' },
@@ -299,8 +299,8 @@ const RECOMMENDATIONS: Record<number, JmaRecommendation> = {
     implication: 'Another device is answering for the same IP, which can cause intermittent reachability, ARP instability, and misleading cloud symptoms.',
     severity: 'fail',
     checks: [
-      { id: 'mgmt-ip', label: 'Management IP Address', why: 'Confirm the current management address in use.' },
-      { id: 'arp', label: 'ARP Table', why: 'Look for unexpected MAC entries related to the management IP or gateway.' },
+      { id: 'mgmt-ip', label: 'Interface IP Summary', why: 'Confirm the current IPv4 addresses and any DHCP-configured interfaces.' },
+      { id: 'arp', label: 'Gateway Reachability', why: 'Look for whether the management gateway path actually appears reachable.' },
       { id: 'vlan-config', label: 'VLAN Configuration', why: 'Confirm the management VLAN scope is what you expect.' },
       { id: 'interface-errors', label: 'Uplink Interface Errors', why: 'Rule out physical instability while investigating the conflict.' },
     ],

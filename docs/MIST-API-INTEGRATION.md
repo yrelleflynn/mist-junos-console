@@ -52,6 +52,7 @@ Product usage:
 
 - populate the site selector
 - establish site context before device-specific actions
+- support future optional target-switch selection within the chosen site
 
 ## 2. Device Intent API
 

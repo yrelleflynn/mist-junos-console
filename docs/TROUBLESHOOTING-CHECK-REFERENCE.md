@@ -95,7 +95,7 @@ The site and device are discovered automatically after identification.
    - Gated checks skip automatically if a prerequisite fails.
    - Each failed check shows what was found, what was expected, and remediation.
 7. Click Config Drift to compare Mist-intended config to live running config.
-8. Click Preview Config Sync to stage the Mist diff as a candidate:
+8. Click Config Sync to stage the Mist diff as a candidate:
    - The tool runs show | compare and commit check.
    - The candidate is left staged on the switch.
    - Choose Commit Confirmed (5-min auto-rollback), Commit, or Rollback.

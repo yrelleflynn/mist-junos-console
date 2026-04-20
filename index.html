@@ -137,7 +137,7 @@
             <div id="root-password-result"></div>
 
             <div class="sidebar-actions" style="margin-top:8px;">
-              <button id="btn-config-sync-preview" class="btn btn-secondary" disabled>Preview Config Sync</button>
+              <button id="btn-config-sync-preview" class="btn btn-secondary" disabled>Config Sync</button>
             </div>
 
             <div class="sidebar-actions" style="margin-top:8px;">
@@ -164,18 +164,14 @@
           <div class="accordion-content" id="accordion-troubleshooting">
             <label for="ts-uplink-port">Uplink Port (auto-detect if blank)</label>
             <input type="text" id="ts-uplink-port" placeholder="e.g. ge-0/0/0" autocomplete="off">
+            <div class="connection-helper" style="margin-top:4px;">Leave blank to auto-detect uplink from LLDP.</div>
 
-            <div class="sidebar-actions" style="margin-top:10px;">
-              <button id="btn-run-troubleshoot" class="btn btn-primary" disabled>Run Diagnostics</button>
-            </div>
-            <div class="sidebar-actions" style="margin-top:6px;">
-              <button id="btn-mist-status" class="btn btn-secondary" disabled>Mist Status</button>
-            </div>
-            <div class="sidebar-actions" style="margin-top:6px;">
-              <button id="btn-ssl-check" class="btn btn-secondary" disabled>Firewall Policy Check</button>
-            </div>
             <div class="sidebar-actions" style="margin-top:6px;">
               <button id="btn-dhcp-refresh" class="btn btn-secondary" disabled>DHCP Refresh</button>
+            </div>
+
+            <div class="sidebar-actions" style="margin-top:8px;">
+              <button id="btn-restart-mist-agent" class="btn btn-secondary" disabled>Restart Mist Agent</button>
             </div>
           </div>
         </div>
@@ -196,6 +192,7 @@
             <div id="device-summary" class="device-summary device-summary-empty">
               <span class="device-summary-placeholder">Log in to identify the switch.</span>
             </div>
+            <div id="console-task-indicator" class="console-task-indicator is-hidden" aria-live="polite"></div>
             <button id="btn-clear" class="btn btn-secondary btn-sm session-bar-clear-btn">Clear Terminal</button>
           </div>
         </div>
@@ -217,8 +214,9 @@
           <div id="results-panel-tabs">
             <span class="results-panel-label">Results</span>
             <button class="results-tab" data-pane="checks">Checks</button>
+            <button class="results-tab" data-pane="actions">Actions</button>
             <button class="results-tab" data-pane="config-sync">Config Sync</button>
-<button class="results-tab" data-pane="timeline">Timeline</button>
+            <button class="results-tab" data-pane="timeline">Timeline</button>
             <div class="results-panel-spacer"></div>
             <span id="mist-api-status" class="status-text results-api-status"></span>
           </div>
@@ -226,12 +224,16 @@
             <!-- Checks pane: diagnostic check results live here, not in the sidebar -->
             <div class="results-pane results-pane-hidden" id="checks-results">
               <div id="ts-results">
-                <div class="results-pane-empty">Run <strong>Diagnostics</strong> to see check results here.</div>
+              </div>
+            </div>
+            <div class="results-pane results-pane-hidden" id="actions-results">
+              <div id="actions-content">
+                <div class="results-pane-empty">Run <strong>DHCP Refresh</strong>, <strong>Get Root Password</strong>, or other operator actions to see their results here.</div>
               </div>
             </div>
             <div class="results-pane" id="config-sync-results">
               <div id="config-sync-content">
-                <div class="results-pane-empty">Run <strong>Preview Config Sync</strong> to see the staged diff and commit-check result here.</div>
+                <div class="results-pane-empty">Run <strong>Config Sync</strong> to see the staged diff and commit-check result here.</div>
               </div>
               <div id="config-sync-action-bar" aria-label="Config sync pending actions">
                 <div id="config-sync-staged-banner" class="config-sync-staged-banner">
@@ -244,7 +246,7 @@
                 </div>
               </div>
             </div>
-<div class="results-pane results-pane-hidden" id="timeline-results">
+            <div class="results-pane results-pane-hidden" id="timeline-results">
               <div class="results-pane-empty">Run <strong>Offline Timeline</strong> to see Mist event history and switch logs here.</div>
             </div>
           </div>

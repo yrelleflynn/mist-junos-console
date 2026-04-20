@@ -26,6 +26,75 @@ const sessions = new Map();
  * @type {Map<string, Record<string, unknown>>}
  */
 const mcpSessionStates = new Map();
+/** @type {Map<string, string[]>} */
+const mcpActionQueues = new Map();
+/**
+ * @typedef {'pending' | 'claimed' | 'running' | 'completed' | 'failed'} McpActionStatus
+ */
+/**
+ * @typedef {{
+ *   id: string;
+ *   sessionId: string;
+ *   type: string;
+ *   params: Record<string, unknown>;
+ *   status: McpActionStatus;
+ *   createdAt: string;
+ *   updatedAt: string;
+ *   claimedAt?: string;
+ *   startedAt?: string;
+ *   completedAt?: string;
+ *   result?: unknown;
+ *   error?: string | null;
+ * }} McpActionRecord
+ */
+/** @type {Map<string, McpActionRecord>} */
+const mcpActions = new Map();
+
+function latestMcpStubState() {
+  return {
+    sessionId: null,
+    agentAccessEnabled: false,
+    serialConnected: false,
+    deviceIdentified: false,
+    mistStatus: null,
+    configSyncState: null,
+    identity: null,
+    jma: null,
+    checkResults: null,
+    updatedAt: null,
+    _stub: true,
+  };
+}
+
+/**
+ * @param {string} sessionId
+ * @returns {McpActionRecord | null}
+ */
+function claimNextMcpAction(sessionId) {
+  const queue = mcpActionQueues.get(sessionId);
+  if (!queue?.length) return null;
+
+  while (queue.length > 0) {
+    const nextId = queue[0];
+    const action = mcpActions.get(nextId);
+    if (!action) {
+      queue.shift();
+      continue;
+    }
+    if (action.status !== 'pending') {
+      queue.shift();
+      continue;
+    }
+    const now = new Date().toISOString();
+    action.status = 'claimed';
+    action.claimedAt = now;
+    action.updatedAt = now;
+    queue.shift();
+    return action;
+  }
+
+  return null;
+}
 
 /**
  * Handle MCP-oriented read-only and push endpoints under /mcp/.
@@ -45,26 +114,16 @@ function mcpHandler(req, res) {
     return;
   }
 
+  const reqUrl = new URL(req.url, 'http://127.0.0.1');
+
   // GET /mcp/session-state — return the most recently pushed session context.
   // The backend MCP server polls this to build tool responses.
-  if (req.method === 'GET' && req.url === '/mcp/session-state') {
+  if (req.method === 'GET' && reqUrl.pathname === '/mcp/session-state') {
     const states = [...mcpSessionStates.values()];
     const latest = states.at(-1);
     if (!latest) {
       res.writeHead(200);
-      res.end(JSON.stringify({
-        sessionId: null,
-        agentAccessEnabled: false,
-        serialConnected: false,
-        deviceIdentified: false,
-        mistStatus: null,
-        configSyncState: null,
-        identity: null,
-        jma: null,
-        checkResults: null,
-        updatedAt: null,
-        _stub: true,
-      }));
+      res.end(JSON.stringify(latestMcpStubState()));
       return;
     }
     res.writeHead(200);
@@ -72,9 +131,42 @@ function mcpHandler(req, res) {
     return;
   }
 
+  // GET /mcp/actions/next?sessionId=... — operator frontend claims next queued agent action.
+  if (req.method === 'GET' && reqUrl.pathname === '/mcp/actions/next') {
+    const sessionId = reqUrl.searchParams.get('sessionId');
+    if (!sessionId) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Missing sessionId' }));
+      return;
+    }
+    const next = claimNextMcpAction(sessionId);
+    res.writeHead(200);
+    res.end(JSON.stringify(next ? { action: next } : { action: null }));
+    return;
+  }
+
+  // GET /mcp/actions/:id — return action status/result for MCP polling.
+  if (req.method === 'GET' && reqUrl.pathname.startsWith('/mcp/actions/')) {
+    const actionId = reqUrl.pathname.slice('/mcp/actions/'.length);
+    if (!actionId) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Missing action id' }));
+      return;
+    }
+    const action = mcpActions.get(actionId);
+    if (!action) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'Unknown action' }));
+      return;
+    }
+    res.writeHead(200);
+    res.end(JSON.stringify(action));
+    return;
+  }
+
   // POST /mcp/agent-context — frontend pushes session state when operator
   // enables agent access. Phase 2: wire this from the operator UI.
-  if (req.method === 'POST' && req.url === '/mcp/agent-context') {
+  if (req.method === 'POST' && reqUrl.pathname === '/mcp/agent-context') {
     let body = '';
     req.on('data', (chunk) => { body += chunk; });
     req.on('end', () => {
@@ -92,6 +184,108 @@ function mcpHandler(req, res) {
         console.log('[mcp] agent-context updated for session', state.sessionId);
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
+      } catch {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+      }
+    });
+    return;
+  }
+
+  // POST /mcp/actions — enqueue a bounded agent action for the operator session.
+  if (req.method === 'POST' && reqUrl.pathname === '/mcp/actions') {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body);
+        const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : '';
+        const type = typeof payload.type === 'string' ? payload.type : '';
+        const params = (payload.params && typeof payload.params === 'object')
+          ? payload.params
+          : {};
+
+        if (!sessionId) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Missing or invalid sessionId' }));
+          return;
+        }
+        if (!type) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Missing or invalid action type' }));
+          return;
+        }
+
+        const id = randomUUID();
+        const now = new Date().toISOString();
+        /** @type {McpActionRecord} */
+        const action = {
+          id,
+          sessionId,
+          type,
+          params,
+          status: 'pending',
+          createdAt: now,
+          updatedAt: now,
+          error: null,
+        };
+        mcpActions.set(id, action);
+        const queue = mcpActionQueues.get(sessionId) ?? [];
+        queue.push(id);
+        mcpActionQueues.set(sessionId, queue);
+        res.writeHead(200);
+        res.end(JSON.stringify(action));
+      } catch {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+      }
+    });
+    return;
+  }
+
+  // POST /mcp/actions/:id/status — operator frontend reports progress/result.
+  if (req.method === 'POST' && reqUrl.pathname.startsWith('/mcp/actions/') && reqUrl.pathname.endsWith('/status')) {
+    const prefix = '/mcp/actions/';
+    const actionId = reqUrl.pathname.slice(prefix.length, -'/status'.length);
+    if (!actionId) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Missing action id' }));
+      return;
+    }
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body);
+        const action = mcpActions.get(actionId);
+        if (!action) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'Unknown action' }));
+          return;
+        }
+        const status = typeof payload.status === 'string' ? payload.status : '';
+        if (!['running', 'completed', 'failed'].includes(status)) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Invalid status' }));
+          return;
+        }
+        const now = new Date().toISOString();
+        action.status = /** @type {McpActionStatus} */ (status);
+        action.updatedAt = now;
+        if (status === 'running') {
+          action.startedAt = now;
+        }
+        if (status === 'completed' || status === 'failed') {
+          action.completedAt = now;
+        }
+        if ('result' in payload) {
+          action.result = payload.result;
+        }
+        if ('error' in payload) {
+          action.error = typeof payload.error === 'string' ? payload.error : null;
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify(action));
       } catch {
         res.writeHead(400);
         res.end(JSON.stringify({ error: 'Invalid JSON body' }));
@@ -342,6 +536,13 @@ wss.on('connection', (ws) => {
         }
       }
       sessions.delete(sessionId);
+      mcpSessionStates.delete(sessionId);
+      mcpActionQueues.delete(sessionId);
+      for (const [actionId, action] of mcpActions.entries()) {
+        if (action.sessionId === sessionId) {
+          mcpActions.delete(actionId);
+        }
+      }
       console.log('[ws] session closed (operator left)', sessionId);
     } else if (sess.members.length === 0) {
       sessions.delete(sessionId);

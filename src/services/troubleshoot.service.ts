@@ -20,6 +20,7 @@ import {
   selectUplinkNeighbor,
 } from './troubleshoot/parsers/lldp.parser';
 import { parseJmaConnectivityState } from './troubleshoot/parsers/jma-connectivity.parser';
+import { DhcpRefreshService } from './dhcp-refresh.service';
 
 export type CheckStatus = 'pending' | 'running' | 'pass' | 'fail' | 'warn' | 'skip' | 'info';
 
@@ -91,6 +92,12 @@ interface DnsReachabilitySnapshot {
   expiresAt: number;
 }
 
+interface DefaultRoutePath {
+  table: string;
+  nextHop: string;
+  iface: string;
+}
+
 /** Mutable context for the modular troubleshoot step queue (Juniper EX). */
 export interface TroubleshootContext {
   cloud: MistCloud;
@@ -121,10 +128,12 @@ export class TroubleshootService {
   private mistApi: MistApiService | null;
   private dnsServerCache: DnsServerSnapshot | null = null;
   private dnsReachabilityCache: DnsReachabilitySnapshot | null = null;
+  private dhcpParser: DhcpRefreshService;
 
   constructor(runner: CommandRunnerService, mistApi?: MistApiService) {
     this.runner = runner;
     this.mistApi = mistApi || null;
+    this.dhcpParser = new DhcpRefreshService(runner);
   }
 
   /**
@@ -158,9 +167,6 @@ export class TroubleshootService {
         name: 'LLDP Neighbors',
         run: async (ctx) => {
           const lldpResult = await this.checkLldp(ctx.uplinkPort);
-          if (!ctx.uplinkPort && lldpResult.detectedPort) {
-            ctx.uplinkPort = lldpResult.detectedPort;
-          }
           ctx.uplinkNeighbor = lldpResult.uplinkNeighbor;
           return { result: lldpResult.result };
         },
@@ -168,7 +174,7 @@ export class TroubleshootService {
       {
         id: 'upstream-port-config',
         name: 'Upstream Switch Port Config',
-        skipWhen: (ctx) => !ctx.uplinkNeighbor,
+        skipWhen: (ctx) => !ctx.uplinkPort || !ctx.uplinkNeighbor,
         run: async (ctx) => {
           const upstreamResult = await this.lookupUpstreamPortConfig(ctx.uplinkNeighbor!);
           ctx.upstreamConfig = upstreamResult.config;
@@ -252,7 +258,7 @@ export class TroubleshootService {
 
     if (ipResult.result.status === 'fail') {
       skipRemaining('no management IP address', [
-        'DHCP Lease Details', 'ARP Table', 'Default Gateway',
+        'DHCP Lease Details', 'Default Routes', 'Gateway Reachability',
         'DNS Configuration', 'DNS Server Reachability', 'DNS Resolution',
         'Route to Mist Endpoints',
         'Mist Agent Version', 'Mist Agent Processes', 'Outbound SSH Config', 'Active Cloud Connections',
@@ -264,22 +270,23 @@ export class TroubleshootService {
     const dhcpResult = await this.checkDhcpLease();
     report(dhcpResult);
 
-    // 5. ARP
-    const arpResult = await this.checkArp();
-    report(arpResult);
-
-    // 6. Default Route — CRITICAL: no route means no cloud connectivity
+    // 5. Default Routes — CRITICAL: no route means no cloud connectivity
     const routeResult = await this.checkDefaultRoute();
     report(routeResult);
 
     if (routeResult.status === 'fail') {
       skipRemaining('no default route', [
+        'Gateway Reachability',
         'DNS Configuration', 'DNS Server Reachability', 'DNS Resolution',
         'Route to Mist Endpoints',
         'Mist Agent Version', 'Mist Agent Processes', 'Outbound SSH Config', 'Active Cloud Connections',
       ]);
       return results;
     }
+
+    // 6. Gateway Reachability
+    const arpResult = await this.checkArp();
+    report(arpResult);
 
     // 7. DNS Config
     const dnsConfigResult = await this.checkDnsConfig();
@@ -346,22 +353,18 @@ export class TroubleshootService {
       if (mgmtIp !== undefined) return mgmtIp;
       const ipResult = await this.checkInterfaceIp();
       mgmtIp = ipResult.mgmtIp;
-      if (!reportedIds.has(ipResult.result.id)) {
-        report(ipResult.result);
-      }
+      // Intentionally NOT reporting here — use case 'mgmt-ip' for explicit reporting.
+      // This prevents mgmt-ip from appearing as a side-effect when other checks (e.g.
+      // cloud-connections) call ensureMgmtIp() as a prerequisite.
       return mgmtIp;
     };
 
     const ensureUplink = async (): Promise<void> => {
-      if (ctx.uplinkPort) return;
+      if (!ctx.uplinkPort || ctx.uplinkNeighbor) return;
       const lldpResult = await this.checkLldp(ctx.uplinkPort);
-      if (!ctx.uplinkPort && lldpResult.detectedPort) {
-        ctx.uplinkPort = lldpResult.detectedPort;
-      }
       ctx.uplinkNeighbor = lldpResult.uplinkNeighbor;
-      if (!reportedIds.has('lldp')) {
-        report(lldpResult.result);
-      }
+      // Intentionally NOT reporting here — use case 'lldp' for explicit reporting.
+      // This only enriches the nominated uplink port with its LLDP neighbor.
     };
 
     const ensureUpstreamConfig = async (): Promise<void> => {
@@ -384,7 +387,7 @@ export class TroubleshootService {
         id,
         name,
         status: 'skip',
-        detail: 'Skipped — no uplink port was supplied or auto-detected from LLDP.',
+        detail: 'Skipped — no uplink port was nominated.',
       });
     };
 
@@ -395,7 +398,11 @@ export class TroubleshootService {
 
       switch (checkId) {
         case 'lldp': {
-          await ensureUplink();
+          // Always run the full LLDP check so we can surface the suggested uplink
+          // even when no specific port has been nominated.
+          const lldpResult = await this.checkLldp(ctx.uplinkPort ?? '');
+          ctx.uplinkNeighbor = lldpResult.uplinkNeighbor;
+          report(lldpResult.result);
           break;
         }
         case 'upstream-port-config': {
@@ -462,7 +469,11 @@ export class TroubleshootService {
           break;
         }
         case 'mgmt-ip': {
-          await ensureMgmtIp();
+          // Run directly and populate the cache so other checks (cloud-connections etc.)
+          // can call ensureMgmtIp() and get the IP without re-running the command.
+          const ipResult = await this.checkInterfaceIp();
+          mgmtIp = ipResult.mgmtIp;
+          report(ipResult.result);
           break;
         }
         case 'dhcp-lease': {
@@ -1281,18 +1292,27 @@ export class TroubleshootService {
       };
     }
 
-    const { neighbor: uplinkNeighbor, detectedPort } = selectUplinkNeighbor(neighbors, userPort);
+    const { neighbor: matchedNeighbor, detectedPort } = userPort
+      ? selectUplinkNeighbor(neighbors, userPort)
+      : { neighbor: null, detectedPort: null };
 
     const count = neighbors.length;
-    let detail = `${count} neighbor(s). Uplink: ${detectedPort || 'none'}`;
-    if (uplinkNeighbor) {
-      detail += ` → ${uplinkNeighbor.systemName || 'unknown'} (${uplinkNeighbor.portInfo || 'unknown port'})`;
+    let detail = `${count} neighbor(s)`;
+    if (userPort) {
+      if (detectedPort) {
+        detail += `. Matched nominated uplink: ${detectedPort}`;
+      } else {
+        detail += `. Nominated uplink ${userPort} not present in LLDP neighbors`;
+      }
+    }
+    if (matchedNeighbor) {
+      detail += ` → ${matchedNeighbor.systemName || 'unknown'} (${matchedNeighbor.portInfo || 'unknown port'})`;
     }
 
     return {
-      result: { id, name, status: 'pass', detail, raw: cmd.output },
+      result: { id, name, status: 'info', detail, raw: cmd.output },
       detectedPort,
-      uplinkNeighbor,
+      uplinkNeighbor: matchedNeighbor,
     };
   }
 
@@ -1384,9 +1404,10 @@ export class TroubleshootService {
 
   private async checkInterfaceIp(): Promise<{ result: CheckResult; mgmtIp: string | null }> {
     const id = 'mgmt-ip';
-    const name = 'Management IP Address';
+    const name = 'Interface IP Summary';
 
     const cmd = await this.runner.execute('show interfaces terse | match "inet "');
+    const cfgCmd = await this.runner.execute('show configuration interfaces | display set | match "family inet"', 20000, 3000);
     if (!cmd.success) {
       return {
         result: { id, name, status: 'fail', detail: cmd.error || 'Command failed', raw: cmd.output },
@@ -1407,79 +1428,95 @@ export class TroubleshootService {
       return true;
     };
 
-    // Parse all interface lines with IPs
-    const allLines = cmd.output.split('\n').filter((l) => /\d+\.\d+\.\d+\.\d+/.test(l));
+    const configLines = cfgCmd.success ? cfgCmd.output.split('\n').map((line) => line.trim()).filter(Boolean) : [];
+    const configByIface = new Map<string, { dhcp: boolean; static: boolean }>();
 
-    // Step 1: Look for preferred management interfaces (irb, vme, me0) that are up/up with a routable IP
-    const mgmtPrefixes = ['irb', 'vme', 'me0', 'vlan'];
-    const mgmtLines = allLines.filter((l) => {
-      const trimmed = l.trim();
-      const isMgmt = mgmtPrefixes.some((p) => trimmed.startsWith(p));
-      if (!isMgmt) return false;
-      // Check interface is up/up (admin up AND link up)
+    for (const line of configLines) {
+      const match = line.match(/^set interfaces (\S+) unit (\d+) family inet (dhcp|address)\b/);
+      if (!match) continue;
+      const iface = `${match[1]}.${match[2]}`;
+      const current = configByIface.get(iface) ?? { dhcp: false, static: false };
+      if (match[3] === 'dhcp') current.dhcp = true;
+      if (match[3] === 'address') current.static = true;
+      configByIface.set(iface, current);
+    }
+
+    type InterfaceSummary = {
+      iface: string;
+      admin: string;
+      oper: string;
+      ip: string | null;
+      source: 'dhcp' | 'static' | 'unknown';
+    };
+
+    const summaries: InterfaceSummary[] = [];
+
+    for (const line of cmd.output.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.includes('inet')) continue;
       const parts = trimmed.split(/\s+/);
-      if (parts.length >= 3 && parts[1] === 'up' && parts[2] === 'up') {
-        const ip = trimmed.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1];
-        return ip ? isRoutableIp(ip) : false;
-      }
-      return false;
-    });
+      if (parts.length < 4) continue;
+      const iface = parts[0];
+      if (internalPrefixes.some((p) => iface.startsWith(p))) continue;
 
-    if (mgmtLines.length > 0) {
-      const ip = mgmtLines[0].match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] || null;
-      const ipDisplay = mgmtLines[0].match(/(\d+\.\d+\.\d+\.\d+\/?\d*)/)?.[1] || 'unknown';
-      const iface = mgmtLines[0].trim().split(/\s+/)[0];
+      const ipDisplay = parts.find((part) => /\d+\.\d+\.\d+\.\d+(\/\d+)?/.test(part)) ?? null;
+      const ip = ipDisplay?.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] ?? null;
+      if (ip && !isRoutableIp(ip)) continue;
+
+      const cfg = configByIface.get(iface);
+      const source: 'dhcp' | 'static' | 'unknown' = cfg?.dhcp ? 'dhcp' : (cfg?.static ? 'static' : 'unknown');
+      summaries.push({
+        iface,
+        admin: parts[1],
+        oper: parts[2],
+        ip: ipDisplay,
+        source,
+      });
+    }
+
+    if (summaries.length === 0) {
       return {
-        result: { id, name, status: 'pass', detail: `Management IP: ${ipDisplay} (${iface})`, raw: cmd.output },
-        mgmtIp: ip,
+        result: {
+          id,
+          name,
+          status: 'fail',
+          detail: 'No relevant IPv4 interfaces found',
+          raw: [cmd.output, cfgCmd.output].filter(Boolean).join('\n\n=== interface config ===\n'),
+        },
+        mgmtIp: null,
       };
     }
 
-    // Step 2: Look for any non-internal interface with a routable IP and up/up status
-    const otherLines = allLines.filter((l) => {
-      const trimmed = l.trim();
-      const isInternal = internalPrefixes.some((p) => trimmed.startsWith(p));
-      if (isInternal) return false;
-      const parts = trimmed.split(/\s+/);
-      if (parts.length >= 3 && parts[1] === 'up' && parts[2] === 'up') {
-        const ip = trimmed.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1];
-        return ip ? isRoutableIp(ip) : false;
+    const detailLines = summaries.map((summary) => {
+      const state = `${summary.admin}/${summary.oper}`;
+      if (summary.ip) {
+        return `${summary.iface} — ${state} — ${summary.ip} — ${summary.source}`;
       }
-      return false;
+      if (summary.source === 'dhcp') {
+        return `${summary.iface} — ${state} — no IP — dhcp configured`;
+      }
+      return `${summary.iface} — ${state} — no IP — ${summary.source}`;
     });
 
-    if (otherLines.length > 0) {
-      const ip = otherLines[0].match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] || null;
-      const ipDisplay = otherLines[0].match(/(\d+\.\d+\.\d+\.\d+\/?\d*)/)?.[1] || 'unknown';
-      const iface = otherLines[0].trim().split(/\s+/)[0];
-      return {
-        result: { id, name, status: 'warn', detail: `IP ${ipDisplay} found on ${iface} (not a standard management interface)`, raw: cmd.output },
-        mgmtIp: ip,
-      };
-    }
-
-    // Step 3: Check if management interfaces exist but are down or have no IP
-    const mgmtDown = allLines.filter((l) => {
-      const trimmed = l.trim();
-      return mgmtPrefixes.some((p) => trimmed.startsWith(p));
-    });
-
-    // Also check for mgmt interfaces that are up/down (L2 up, L3 down — no IP assigned)
-    const rawLines = cmd.output.split('\n');
-    const mgmtUpDown = rawLines.filter((l) => {
-      const trimmed = l.trim();
-      return mgmtPrefixes.some((p) => trimmed.startsWith(p)) && /up\s+down/.test(trimmed);
-    });
-
-    let failDetail = 'No routable IP address found on any management interface';
-    if (mgmtUpDown.length > 0) {
-      const ifaces = mgmtUpDown.map((l) => l.trim().split(/\s+/)[0]).join(', ');
-      failDetail = `Management interface(s) ${ifaces} are up but have no IP — check DHCP or static config`;
-    }
+    const firstUsableIp = summaries.find((summary) => summary.admin === 'up' && summary.oper === 'up' && summary.ip)?.ip?.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] ?? null;
+    const hasAnyIp = summaries.some((summary) => Boolean(summary.ip));
+    const hasUpUpIp = summaries.some((summary) => summary.admin === 'up' && summary.oper === 'up' && Boolean(summary.ip));
+    const hasDhcpWithoutIp = summaries.some((summary) => summary.source === 'dhcp' && !summary.ip);
+    const status: CheckStatus = !hasAnyIp
+      ? 'warn'
+      : (!hasUpUpIp || hasDhcpWithoutIp)
+        ? 'warn'
+        : 'info';
 
     return {
-      result: { id, name, status: 'fail', detail: failDetail, raw: cmd.output },
-      mgmtIp: null,
+      result: {
+        id,
+        name,
+        status,
+        detail: detailLines.join('\n'),
+        raw: [cmd.output, cfgCmd.output].filter(Boolean).join('\n\n=== interface config ===\n'),
+      },
+      mgmtIp: firstUsableIp,
     };
   }
 
@@ -1515,92 +1552,207 @@ export class TroubleshootService {
       return { id, name, status: 'info' as CheckStatus, detail: 'DHCP client bound to 0.0.0.0 — management IP appears to be statically assigned', raw: cmd.output };
     }
 
-    // Parse DHCP lease details
-    const ipMatch = cmd.output.match(/(?:IP address|Address)\s*[:=]?\s*(\d+\.\d+\.\d+\.\d+)/i) ||
-                    cmd.output.match(/(\d+\.\d+\.\d+\.\d+\/\d+)/);
-    const maskMatch = cmd.output.match(/(?:Subnet mask|mask)\s*[:=]?\s*(\d+\.\d+\.\d+\.\d+)/i);
-    const gwMatch = cmd.output.match(/(?:Router|Gateway|Default gateway)\s*[:=]?\s*(\d+\.\d+\.\d+\.\d+)/i);
-    const dnsMatch = cmd.output.match(/(?:DNS|Name server|Domain name server)\s*[:=]?\s*([\d.\s,]+)/i);
-
-    // Also try 'show dhcp client binding detail' for more info
     const detailCmd = await this.runner.execute('show dhcp client binding detail');
     const allOutput = cmd.output + '\n' + (detailCmd.success ? detailCmd.output : '');
+    const summaryBindings = this.dhcpParser.parseSummary(cmd.output)
+      .filter((binding) => binding.ipAddress !== '0.0.0.0');
+    const detailMap = this.dhcpParser.parseDetail(detailCmd.success ? detailCmd.output : '');
 
-    // Re-parse from combined output
-    const ipAddr = ipMatch?.[1] ||
-      allOutput.match(/(?:IP address|Address)\s*[:=]?\s*(\d+\.\d+\.\d+\.\d+)/i)?.[1] ||
-      allOutput.match(/(\d+\.\d+\.\d+\.\d+\/\d+)/)?.[1] ||
-      'unknown';
-
-    const subnet = maskMatch?.[1] ||
-      allOutput.match(/(?:Subnet mask|mask)\s*[:=]?\s*(\d+\.\d+\.\d+\.\d+)/i)?.[1] ||
-      'not found';
-
-    const gateway = gwMatch?.[1] ||
-      allOutput.match(/(?:Router|Gateway|Default gateway|router)\s*[:=]?\s*(\d+\.\d+\.\d+\.\d+)/i)?.[1] ||
-      'not found';
-
-    const dnsRaw = dnsMatch?.[1] ||
-      allOutput.match(/(?:DNS|Name server|Domain name server|name-server)\s*[:=]?\s*([\d.\s,]+)/i)?.[1] ||
-      '';
-    const dnsServers = dnsRaw.match(/\d+\.\d+\.\d+\.\d+/g);
-    const dns = dnsServers ? dnsServers.join(', ') : 'not found';
-
-    const lines = [
-      `IP: ${ipAddr}`,
-      `Mask: ${subnet}`,
-      `Gateway: ${gateway}`,
-      `DNS: ${dns}`,
-    ];
+    const lines = summaryBindings.map((binding) => {
+      const detail = detailMap.get(binding.interface);
+      const dns = detail?.dnsServers?.length ? detail.dnsServers.join(', ') : 'not found';
+      return [
+        `${binding.interface}: ${binding.ipAddress}`,
+        `Mask ${detail?.subnetMask ?? 'not found'}`,
+        `Gateway ${detail?.router ?? 'not found'}`,
+        `DNS ${dns}`,
+      ].join(' | ');
+    });
 
     return {
       id,
       name,
       status: 'pass',
-      detail: lines.join(' | '),
+      detail: lines.join('\n'),
       raw: allOutput,
+    };
+  }
+
+  private async isMgmtJunosConfigured(): Promise<{ configured: boolean; raw: string }> {
+    const cmd = await this.runner.execute('show configuration | display set | match mgmt_junos', 15000, 3000);
+    if (!cmd.success) {
+      return { configured: false, raw: cmd.output || cmd.error || '' };
+    }
+    const lines = cmd.output.split('\n').map((line) => line.trim()).filter(Boolean);
+    return {
+      configured: lines.some((line) => line.includes('mgmt_junos')),
+      raw: cmd.output,
+    };
+  }
+
+  private parseActiveDefaultRoutes(routeOutput: string, table: string): DefaultRoutePath[] {
+    const lines = routeOutput.split('\n');
+    const paths: DefaultRoutePath[] = [];
+    let inDefaultBlock = false;
+
+    for (const line of lines) {
+      if (/^0\.0\.0\.0\/0\b/.test(line.trim())) {
+        inDefaultBlock = true;
+        continue;
+      }
+
+      if (inDefaultBlock && /^\S/.test(line) && !line.includes('0.0.0.0/0')) {
+        inDefaultBlock = false;
+      }
+
+      if (!inDefaultBlock) continue;
+
+      const match = line.match(/>\s+to\s+(\d+\.\d+\.\d+\.\d+)\s+via\s+(\S+)/);
+      if (match) {
+        paths.push({
+          table,
+          nextHop: match[1],
+          iface: match[2],
+        });
+      }
+    }
+
+    return paths;
+  }
+
+  private async getDefaultRoutePaths(): Promise<{
+    paths: DefaultRoutePath[];
+    mgmtJunosConfigured: boolean;
+    raw: string;
+    tablesChecked: string[];
+  }> {
+    const mgmtJunos = await this.isMgmtJunosConfigured();
+    const tablesChecked = ['inet.0'];
+    const sections: string[] = [];
+    const paths: DefaultRoutePath[] = [];
+
+    const inetCmd = await this.runner.execute('show route table inet.0 0.0.0.0/0', 20000, 3000);
+    sections.push(`=== inet.0 ===\n${inetCmd.output || inetCmd.error || ''}`.trim());
+    if (inetCmd.success) {
+      paths.push(...this.parseActiveDefaultRoutes(inetCmd.output, 'inet.0'));
+    }
+
+    if (mgmtJunos.configured) {
+      tablesChecked.push('mgmt_junos.inet.0');
+      const mgmtCmd = await this.runner.execute('show route table mgmt_junos.inet.0 0.0.0.0/0', 20000, 3000);
+      sections.push(`=== mgmt_junos.inet.0 ===\n${mgmtCmd.output || mgmtCmd.error || ''}`.trim());
+      if (mgmtCmd.success) {
+        paths.push(...this.parseActiveDefaultRoutes(mgmtCmd.output, 'mgmt_junos.inet.0'));
+      }
+    }
+
+    const raw = [
+      '=== mgmt_junos config ===',
+      mgmtJunos.raw || '(not configured)',
+      ...sections,
+    ].join('\n\n');
+
+    return {
+      paths,
+      mgmtJunosConfigured: mgmtJunos.configured,
+      raw,
+      tablesChecked,
     };
   }
 
   private async checkArp(): Promise<CheckResult> {
     const id = 'arp';
-    const name = 'ARP Table';
+    const name = 'Gateway Reachability';
 
-    const cmd = await this.runner.execute('show arp no-resolve', 30000, 3000);
-    if (!cmd.success) {
-      return { id, name, status: 'fail', detail: cmd.error || 'Command failed', raw: cmd.output };
+    const routeSnapshot = await this.getDefaultRoutePaths();
+    if (routeSnapshot.paths.length === 0) {
+      return {
+        id,
+        name,
+        status: 'skip',
+        detail: `Skipped — no active default routes were found in ${routeSnapshot.tablesChecked.join(' or ')}`,
+        raw: routeSnapshot.raw,
+      };
     }
 
-    const arpLines = cmd.output.split('\n').filter((l) => /\d+\.\d+\.\d+\.\d+/.test(l));
-
-    if (arpLines.length === 0) {
-      return { id, name, status: 'fail', detail: 'ARP table is empty', raw: cmd.output };
+    const arpCmd = await this.runner.execute('show arp no-resolve', 30000, 3000);
+    if (!arpCmd.success) {
+      return { id, name, status: 'fail', detail: arpCmd.error || 'Command failed', raw: arpCmd.output };
     }
 
-    return { id, name, status: 'pass', detail: `${arpLines.length} ARP entry/entries`, raw: cmd.output };
+    const arpOutput = arpCmd.output;
+    const summaries: string[] = [];
+    const pingEvidence: string[] = [];
+    let sawReachableEvidence = false;
+
+    for (const path of routeSnapshot.paths) {
+      const arpPresent = new RegExp(`\\b${path.nextHop.replace(/\./g, '\\.')}\\b`).test(arpOutput);
+      const pingCommand = path.table === 'mgmt_junos.inet.0'
+        ? `ping routing-instance mgmt_junos ${path.nextHop} count 1 rapid`
+        : `ping inet ${path.nextHop} count 1 rapid`;
+      const ping = await this.runner.execute(pingCommand, 15000, 2000);
+      const receivedMatch = ping.output.match(/(\d+) packets received/);
+      const received = receivedMatch ? parseInt(receivedMatch[1], 10) : 0;
+      const pingPass = received > 0;
+      const pingTimedOut = !ping.success && (ping.error || '').includes('timed out');
+
+      if (arpPresent || pingPass) {
+        sawReachableEvidence = true;
+      }
+
+      let statusText = '';
+      if (arpPresent && pingPass) {
+        statusText = 'ARP present, ping replies received';
+      } else if (arpPresent && pingTimedOut) {
+        statusText = 'ARP present, ping check timed out';
+      } else if (arpPresent) {
+        statusText = 'ARP present, no ping reply';
+      } else if (pingTimedOut) {
+        statusText = 'no ARP entry, ping check timed out';
+      } else if (pingPass) {
+        statusText = 'ping replies received, ARP entry not seen';
+      } else {
+        statusText = 'no ARP entry, no ping reply';
+      }
+
+      summaries.push(`${path.table}: ${path.nextHop} via ${path.iface} — ${statusText}`);
+      pingEvidence.push(`=== ${path.table} ${path.nextHop} via ${path.iface} ===\n${pingCommand}\n${ping.output || ping.error || '(no output)'}`);
+    }
+
+    return {
+      id,
+      name,
+      status: sawReachableEvidence ? 'pass' : 'fail',
+      detail: summaries.join('\n'),
+      raw: `${routeSnapshot.raw}\n\n=== ARP ===\n${arpOutput}\n\n${pingEvidence.join('\n\n')}`,
+    };
   }
 
   private async checkDefaultRoute(): Promise<CheckResult> {
     const id = 'default-route';
-    const name = 'Default Gateway';
+    const name = 'Default Routes';
 
-    const cmd = await this.runner.execute('show route 0.0.0.0/0', 20000, 3000);
-    if (!cmd.success) {
-      return { id, name, status: 'fail', detail: cmd.error || 'Command failed', raw: cmd.output };
+    const routeSnapshot = await this.getDefaultRoutePaths();
+    if (routeSnapshot.paths.length === 0) {
+      return {
+        id,
+        name,
+        status: 'fail',
+        detail: `No active default routes found in ${routeSnapshot.tablesChecked.join(' or ')}`,
+        raw: routeSnapshot.raw,
+      };
     }
 
-    const hasDefault = cmd.output.includes('0.0.0.0/0') || cmd.output.includes('default');
-    if (!hasDefault) {
-      return { id, name, status: 'fail', detail: 'No default route found', raw: cmd.output };
-    }
-
-    // Extract next-hop
-    const nhMatch = cmd.output.match(/to\s+(\d+\.\d+\.\d+\.\d+)/i) ||
-                    cmd.output.match(/via\s+(\d+\.\d+\.\d+\.\d+)/i) ||
-                    cmd.output.match(/>\s+(\d+\.\d+\.\d+\.\d+)/);
-    const nextHop = nhMatch ? nhMatch[1] : 'unknown';
-
-    return { id, name, status: 'pass', detail: `Default route via ${nextHop}`, raw: cmd.output };
+    const summaries = routeSnapshot.paths.map((path) => `${path.table}: ${path.nextHop} via ${path.iface}`);
+    return {
+      id,
+      name,
+      status: 'pass',
+      detail: summaries.length === 1
+        ? `Active default route: ${summaries[0]}`
+        : summaries.join('\n'),
+      raw: routeSnapshot.raw,
+    };
   }
 
   private async checkDnsConfig(): Promise<CheckResult> {
@@ -1662,7 +1814,7 @@ export class TroubleshootService {
       checks.push(`DNS server ${entry.ip} (${entry.source})\n${ping.output || ping.error || ''}`.trim());
       const receivedMatch = ping.output.match(/(\d+) packets received/);
       const received = receivedMatch ? parseInt(receivedMatch[1], 10) : 0;
-      const hasSuccess = received > 0 || ping.output.includes('!');
+      const hasSuccess = received > 0;
       if (hasSuccess) reachableServers.push(entry.ip);
     }
 
@@ -1750,6 +1902,10 @@ export class TroubleshootService {
       return /no servers could be reached|connection timed out/i.test(text);
     };
 
+    const indicatesUnknownHostFailure = (text: string): boolean => {
+      return /host name lookup failure|unknown host|not known|couldn't get address/i.test(text);
+    };
+
     const mistResolve = await this.runner.execute(`show host ${testHost}`, 35000, 3000);
     const publicResolve = await this.runner.execute(`show host ${publicHost}`, 35000, 3000);
 
@@ -1789,7 +1945,9 @@ export class TroubleshootService {
         id,
         name,
         status: 'warn',
-        detail: 'Hostname resolution failed for Mist domains only',
+        detail: indicatesUnknownHostFailure(mistResolveText)
+          ? 'Mist hostnames are unknown to the resolver'
+          : 'Hostname resolution failed for Mist domains only',
         raw,
       };
     }
@@ -1809,7 +1967,9 @@ export class TroubleshootService {
         id,
         name,
         status: 'fail',
-        detail: 'Hostname resolution failed',
+        detail: indicatesUnknownHostFailure(mistResolveText) && indicatesUnknownHostFailure(publicResolveText)
+          ? 'Resolver returned unknown host responses'
+          : 'Hostname resolution failed',
         raw,
       };
     }
@@ -1819,7 +1979,9 @@ export class TroubleshootService {
         id,
         name,
         status: 'fail',
-        detail: 'Mist hostname resolution failed',
+        detail: indicatesUnknownHostFailure(mistResolveText)
+          ? 'Mist hostname was unknown to the resolver'
+          : 'Mist hostname resolution failed',
         raw,
       };
     }
@@ -2331,49 +2493,34 @@ export class TroubleshootService {
     };
   }
 
-  private async checkActiveCloudConnections(mgmtIp: string | null, cloud?: MistCloud | null): Promise<CheckResult> {
+  private async checkActiveCloudConnections(_mgmtIp: string | null, _cloud?: MistCloud | null): Promise<CheckResult> {
     const id = 'cloud-connections';
     const name = 'Active Cloud Connections';
 
-    if (!mgmtIp) {
-      return { id, name, status: 'skip', detail: 'No management IP detected — cannot check connections' };
-    }
-
-    const cmd = await this.runner.execute(`show system connections | grep ${mgmtIp}`, 30000, 3000);
+    const cmd = await this.runner.execute('show system connections | match 443', 30000, 3000);
     if (!cmd.success) {
       return { id, name, status: 'fail', detail: 'Could not check system connections', raw: cmd.output };
     }
 
-    const lines = cmd.output.split('\n').filter((l) => l.trim().length > 0 && l.includes(mgmtIp));
+    const lines = cmd.output.split('\n').filter((l) => {
+      const trimmed = l.trim();
+      return trimmed.length > 0 && /\.(443)\b/.test(trimmed);
+    });
 
     if (lines.length === 0) {
       return {
         id,
         name,
         status: 'fail',
-        detail: `No outbound connections from ${mgmtIp}`,
+        detail: 'No TCP connections to port 443 found',
         raw: cmd.output,
       };
     }
 
-    // Parse all ESTABLISHED connections
     const established = lines.filter((l) => /ESTABLISHED/i.test(l));
     const other = lines.filter((l) => !(/ESTABLISHED/i.test(l)));
 
-    // Extract remote IP:port pairs from ESTABLISHED connections
-    const remoteEndpoints: { ip: string; port: string }[] = [];
-    for (const line of established) {
-      const parts = line.trim().split(/\s+/);
-      for (const part of parts) {
-        const match = part.match(/^(\d+\.\d+\.\d+\.\d+)\.(\d+)$/);
-        if (match && match[1] !== mgmtIp) {
-          remoteEndpoints.push({ ip: match[1], port: match[2] });
-        }
-      }
-    }
-
     if (established.length === 0) {
-      // No ESTABLISHED but some connections in other states
       const states = other.map((l) => {
         const stateMatch = l.match(/(SYN_SENT|CLOSE_WAIT|FIN_WAIT\S*|TIME_WAIT|LAST_ACK|LISTEN)/i);
         return stateMatch ? stateMatch[1] : 'unknown';
@@ -2383,99 +2530,28 @@ export class TroubleshootService {
         id,
         name,
         status: 'warn',
-        detail: `${other.length} connection(s) from ${mgmtIp} but none ESTABLISHED (states: ${uniqueStates.join(', ')})`,
+        detail: `${other.length} TCP/443 connection(s) found but none ESTABLISHED (states: ${uniqueStates.join(', ')})`,
         raw: cmd.output,
       };
     }
-
-    // Resolve cloud endpoint FQDNs to IPs using 'show host' for validation
-    // Output format varies:
-    //   "jma-terminator.mistsys.net is an alias for <cname>.elb.amazonaws.com."
-    //   "<cname>.elb.amazonaws.com has address 184.72.6.51"
-    // Or sometimes just: "jma-terminator.mistsys.net has address 184.72.6.51"
-    const resolvedMistIps: Map<string, string> = new Map(); // IP -> FQDN
-    if (cloud) {
-      for (const endpoint of cloud.switchEndpoints) {
-        const hostCmd = await this.runner.execute(`show host ${endpoint.host}`, 15000, 2000);
-        if (hostCmd.success && hostCmd.output.trim().length > 0) {
-          const hostLines = hostCmd.output.split('\n');
-          for (const hostLine of hostLines) {
-            // Match "has address X.X.X.X"
-            const addrMatch = hostLine.match(/has address\s+(\d+\.\d+\.\d+\.\d+)/);
-            if (addrMatch) {
-              resolvedMistIps.set(addrMatch[1], endpoint.host);
-            }
-          }
-          // Fallback: extract any IP from the output if "has address" didn't match
-          if (![...resolvedMistIps.values()].includes(endpoint.host)) {
-            const allIps = hostCmd.output.match(/\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/g);
-            if (allIps) {
-              for (const ip of allIps) {
-                // Skip common non-result IPs (loopback, DNS server)
-                if (!ip.startsWith('127.') && !ip.startsWith('0.')) {
-                  resolvedMistIps.set(ip, endpoint.host);
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Cross-reference established connections against resolved Mist IPs
-    const matched: string[] = [];
-    const unmatched: string[] = [];
-
-    for (const ep of remoteEndpoints) {
-      const fqdn = resolvedMistIps.get(ep.ip);
-      if (fqdn) {
-        matched.push(`${ep.ip}:${ep.port} (${fqdn})`);
-      } else {
-        unmatched.push(`${ep.ip}:${ep.port}`);
-      }
-    }
-
-    // Deduplicate
-    const uniqueMatched = [...new Set(matched)];
-    const uniqueUnmatched = [...new Set(unmatched)];
-
-    let detail = `${established.length} active connection(s)`;
-    if (uniqueMatched.length > 0) {
-      detail += ` | Mist: ${uniqueMatched.join(', ')}`;
-    }
-    if (uniqueUnmatched.length > 0) {
-      detail += ` | Other: ${uniqueUnmatched.join(', ')}`;
-    }
+    let detail = `${established.length} established TCP/443 connection(s)`;
     if (other.length > 0) {
-      detail += ` (+${other.length} non-established)`;
+      const states = other.map((l) => {
+        const stateMatch = l.match(/(SYN_SENT|CLOSE_WAIT|FIN_WAIT\S*|TIME_WAIT|LAST_ACK|LISTEN)/i);
+        return stateMatch ? stateMatch[1] : 'unknown';
+      });
+      const uniqueStates = [...new Set(states)];
+      detail += ` (+${other.length} non-established: ${uniqueStates.join(', ')})`;
     }
-
-    // Status: pass if at least one connection matches a Mist endpoint
-    // If we resolved endpoints but none matched, warn
-    // If we couldn't resolve any endpoints (no cloud config), pass on connection count alone
-    const status = uniqueMatched.length > 0 ? 'pass'
-      : (resolvedMistIps.size > 0 ? 'warn' : 'pass');
-
-    const warnDetail = uniqueMatched.length === 0 && resolvedMistIps.size > 0
-      ? ' — none matched known Mist endpoints'
-      : '';
-
-    // Build raw output including resolved IPs for debugging
-    const resolvedDebug = [...resolvedMistIps.entries()]
-      .map(([ip, fqdn]) => `  ${fqdn} -> ${ip}`)
-      .join('\n');
-    const rawOutput = cmd.output
-      + '\n--- Resolved Mist IPs ---\n'
-      + (resolvedDebug || '  (none resolved)')
-      + '\n--- Remote endpoints found ---\n'
-      + remoteEndpoints.map((e) => `  ${e.ip}:${e.port}`).join('\n');
 
     return {
       id,
       name,
-      status,
-      detail: detail + warnDetail,
-      raw: rawOutput,
+      status: established.length === 1 ? 'pass' : 'warn',
+      detail: established.length === 1
+        ? detail
+        : `${detail} — expected a single established TCP/443 connection when the switch is online`,
+      raw: cmd.output,
     };
   }
 
@@ -3004,7 +3080,8 @@ export class TroubleshootService {
       case 'arp': {
         if (failed('port-status')) return { text: 'Uplink port is down — fix physical connection first.' };
         if (failed('vlan-config')) return { text: 'VLAN config failed — gateway may be on a different VLAN.' };
-        return { text: 'ARP table is empty. Check STP blocking and Layer 2 connectivity.' };
+        if (failed('default-route')) return { text: 'No default routes were found — fix routing first.' };
+        return { text: 'No default-route gateway showed usable ARP or ping evidence. Check VLANs, gateway reachability, and upstream L3 path.' };
       }
 
       case 'default-route': {
@@ -3013,7 +3090,7 @@ export class TroubleshootService {
         if (failed('mgmt-ip')) return { text: 'Management IP failed — fix that first.' };
         if (hasDhcp) return { text: 'IP via DHCP but no gateway. Update DHCP scope with Option 3 (Router/Gateway).' };
         return {
-          text: 'No default route configured.',
+          text: 'No active default routes were found in inet.0 or mgmt_junos.inet.0.',
           commands: ['set routing-options static route 0.0.0.0/0 next-hop <gateway-ip>'],
         };
       }
@@ -3043,10 +3120,25 @@ export class TroubleshootService {
 
         if (rawText.includes('no servers could be reached') || rawText.includes('connection timed out')) {
           return {
-            text: `${reachableServers ? `Reachable DNS servers: ${reachableServers}\n` : ''}Ping to the DNS servers succeeded, but Junos reported "no servers could be reached" for hostname lookups.\nThis usually points to upstream DNS transport being blocked, for example firewall policy on UDP/TCP 53.\nIf any resolver IPs come from DHCP, consider refreshing them.`,
+            text: `${reachableServers ? `Reachable DNS servers: ${reachableServers}\n` : ''}Hostname resolution failed even though the configured DNS server IPs responded to ping.\nJunos reported "no servers could be reached" for the lookup attempt.\nConclusion: upstream DNS transport is likely being blocked, for example firewall policy on UDP/TCP 53 between the switch and its resolvers.\nIf any resolver IPs come from DHCP, consider refreshing them.`,
             commands: ['request dhcp client renew all'],
           };
         }
+        if ((rawText.includes('unknown host') || rawText.includes('host name lookup failure')) && rawText.includes('mist domains only'))
+          return {
+            text: 'The resolver is answering queries, but Mist hostnames are coming back as unknown while public DNS still works.\nConclusion: this is most likely split-DNS, selective filtering, or an internal resolver that does not know or forward Juniper Mist hostnames.',
+            commands: ['request dhcp client renew all'],
+          };
+        if (rawText.includes('resolver returned unknown host responses'))
+          return {
+            text: `${reachableServers ? `Reachable DNS servers: ${reachableServers}\n` : ''}The resolver answered the queries, but returned unknown-host responses for the names tested.\nConclusion: this is more likely a resolver content, recursion, or DNS policy issue than a pure transport block.`,
+            commands: ['request dhcp client renew all'],
+          };
+        if (rawText.includes('mist hostname was unknown to the resolver'))
+          return {
+            text: 'The resolver answered the lookup, but reported the Mist hostname as unknown.\nConclusion: the DNS server is reachable, but it does not know or will not resolve the Mist domain being queried.',
+            commands: ['request dhcp client renew all'],
+          };
         if (rawText.includes('generic dns works') || rawText.includes('mist domains only'))
           return {
             text: 'Generic public hostname resolution works, but Mist domains do not.\nFocus on selective filtering, split-DNS, or upstream policy affecting Mist hostnames.',
@@ -3054,7 +3146,7 @@ export class TroubleshootService {
           };
         if (rawText.includes('hostname lookups still fail') || rawText.includes('dns lookup failure') || rawText.includes('mist hostname resolution failed'))
           return {
-            text: `${reachableServers ? `Reachable DNS servers: ${reachableServers}\n` : ''}DNS is configured but hostname lookups are still failing.\nVerify the resolver IPs in use and confirm the upstream DNS service or policy allows DNS queries from this subnet.`,
+            text: `${reachableServers ? `Reachable DNS servers: ${reachableServers}\n` : ''}Hostname resolution failed even though DNS servers are configured.\nConclusion: DNS queries are still not succeeding from the switch.\nVerify the resolver IPs in use and confirm the upstream DNS service or policy allows DNS queries from this subnet.`,
             commands: ['request dhcp client renew all'],
           };
         if (result.detail.includes('not reachable from the switch'))
@@ -3065,7 +3157,7 @@ export class TroubleshootService {
       }
 
       case 'route-to-mist':
-        if (failed('default-route')) return { text: 'No default route — fix Default Gateway first.' };
+        if (failed('default-route')) return { text: 'No default routes — fix routing first.' };
         return { text: 'Default route exists but no path to Mist IP. Check policy routing or ACLs.' };
 
       case 'mist-agent-version':

@@ -27,6 +27,12 @@ State Reference
 [0] None
 `;
 
+const NOISY_OUTPUT_WITH_VALID_ROW = `
+cc-state   cc-message                                                cc-errno
+10         STATE10                                                   0
+108        Cloud connection attempt failed                           17
+`;
+
 describe('parseJmaConnectivityState', () => {
   it('parses a known connected state row', () => {
     const parsed = parseJmaConnectivityState(CONNECTED_OUTPUT);
@@ -85,5 +91,25 @@ describe('parseJmaConnectivityState', () => {
     expect(parsed.severity).toBe('info');
     expect(parsed.message).toBe('Future state');
     expect(parsed.errno).toBe(4);
+  });
+
+  it('prefers a later known state row over an earlier truncated noisy row', () => {
+    const parsed = parseJmaConnectivityState(NOISY_OUTPUT_WITH_VALID_ROW);
+
+    expect(parsed.code).toBe(108);
+    expect(parsed.name).toBe('CloudUnreachable');
+    expect(parsed.message).toBe('Cloud connection attempt failed');
+    expect(parsed.errno).toBe(17);
+  });
+
+  it('treats implausible low numeric states as unknown instead of rendering bogus labels', () => {
+    const parsed = parseJmaConnectivityState(
+      'cc-state   cc-message                                                cc-errno\n10         STATE10                                                   0\n',
+    );
+
+    expect(parsed.code).toBeNull();
+    expect(parsed.name).toBe('Unknown');
+    expect(parsed.label).toBe('Unknown');
+    expect(parsed.detail).toContain('implausible');
   });
 });

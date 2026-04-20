@@ -313,7 +313,7 @@ export class ConfigSyncService {
       const startingMode = await this.cmdRunner.detectMode();
       if (startingMode === 'config') {
         throw new Error(
-          'Config sync preview cannot run while already in configuration mode. Exit, commit, or roll back the current candidate first.',
+          'Config sync cannot run while already in configuration mode. Exit, commit, or roll back the current candidate first.',
         );
       }
 

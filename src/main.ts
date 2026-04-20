@@ -15,20 +15,31 @@ import { SwitchIdentityService } from './services/switch-identity.service';
 import { ConfigSyncService, isConfigSyncStagingWarning } from './services/config-sync.service';
 import type { ConfigSyncActionResult } from './services/config-sync.service';
 import { DhcpRefreshService } from './services/dhcp-refresh.service';
-import type { DhcpRefreshResult, DhcpBindingChange } from './services/dhcp-refresh.service';
+import type { DhcpRefreshResult, DhcpBindingChange, DhcpRefreshStep } from './services/dhcp-refresh.service';
+import { MistAgentRestartService } from './services/mist-agent-restart.service';
+import type { MistAgentRestartResult, MistAgentRestartStep, MistAgentProcessState } from './services/mist-agent-restart.service';
 import { RemoteSessionController } from './controllers/remote-session.controller';
 import { MistContextController } from './controllers/mist-context.controller';
 import { DeviceContextController } from './controllers/device-context.controller';
 import { CloudStatusController } from './controllers/cloud-status.controller';
 import type { CloudStatusState } from './types/cloud-status.types';
 import { MIST_CLOUDS, getCloudById } from './config/mist-clouds.config';
+import type { MistCloud } from './config/mist-clouds.config';
 import { getJmaRecommendation } from './config/jma-recommendations';
+import {
+  CATALOG_GROUPS,
+  ALL_CATALOG_CHECK_IDS,
+  getCatalogCheck,
+  getCatalogGroupChecks,
+  resultIdToCatalogId,
+} from './config/check-catalog.config';
 import './styles/main.css';
 
 const SERIAL_PREFS_STORAGE_KEY = 'junos-console.serial-prefs';
 const LAST_PORT_LABEL_STORAGE_KEY = 'junos-console.last-port-label';
 const MIST_CLOUD_STORAGE_KEY = 'junos-console.mist-cloud-id';
 const MIST_ORG_STORAGE_KEY = 'junos-console.mist-org-id';
+const REMOTE_SESSION_ENABLED_STORAGE_KEY = 'junos-console.remote-session-enabled';
 const BACKGROUND_CONSOLE_IDLE_MS = 5000;
 
 type StoredSerialPrefs = {
@@ -95,10 +106,8 @@ function init(): void {
 
     // Troubleshooting
     tsUplinkPort: document.getElementById('ts-uplink-port') as HTMLInputElement,
-    btnRunTroubleshoot: document.getElementById('btn-run-troubleshoot') as HTMLButtonElement,
-    btnMistStatus: document.getElementById('btn-mist-status') as HTMLButtonElement,
-    btnSslCheck: document.getElementById('btn-ssl-check') as HTMLButtonElement,
     btnDhcpRefresh: document.getElementById('btn-dhcp-refresh') as HTMLButtonElement,
+    btnRestartMistAgent: document.getElementById('btn-restart-mist-agent') as HTMLButtonElement,
     tsResults: document.getElementById('ts-results') as HTMLElement,
 
     // Device Identity & Config
@@ -129,6 +138,7 @@ function init(): void {
 
     // Device summary (workspace top strip)
     deviceSummary: document.getElementById('device-summary') as HTMLElement,
+    consoleTaskIndicator: document.getElementById('console-task-indicator') as HTMLElement,
 
     // Results panel (bottom horizontal panel)
     resultsPanel: document.getElementById('results-panel') as HTMLElement,
@@ -137,6 +147,7 @@ function init(): void {
     guidanceResizeHandle: document.getElementById('guidance-resize-handle') as HTMLElement,
     resultsTabs: document.querySelectorAll<HTMLButtonElement>('.results-tab'),
     resultsPanes: document.querySelectorAll<HTMLElement>('.results-pane'),
+    actionsContent: document.getElementById('actions-content') as HTMLElement,
   };
 
   // ---- Populate Mist cloud dropdown ----
@@ -221,8 +232,17 @@ function init(): void {
     return window.localStorage.getItem(LAST_PORT_LABEL_STORAGE_KEY);
   }
 
+  function saveRemoteSessionEnabled(enabled: boolean): void {
+    window.localStorage.setItem(REMOTE_SESSION_ENABLED_STORAGE_KEY, enabled ? 'true' : 'false');
+  }
+
+  function shouldAutoStartRemoteSession(): boolean {
+    return window.localStorage.getItem(REMOTE_SESSION_ENABLED_STORAGE_KEY) === 'true';
+  }
+
   restoreSerialPrefs();
   restoreSelectedMistCloud();
+  ui.remoteSessionEnabled.checked = shouldAutoStartRemoteSession();
 
   // ---- Create instances ----
   const serial = new SerialService();
@@ -233,6 +253,7 @@ function init(): void {
   const switchIdentity = new SwitchIdentityService(cmdRunner, mistApi);
   const configSync = new ConfigSyncService(cmdRunner, mistApi);
   const dhcpRefresh = new DhcpRefreshService(cmdRunner);
+  const mistAgentRestart = new MistAgentRestartService(cmdRunner);
   const promptDecoder = new TextDecoder();
   let recentConsoleTail = '';
   let cloudStatusLoopStarted = false;
@@ -244,6 +265,70 @@ function init(): void {
   let cloudStatusRefreshInFlight = false;
   let latestJmaCode: number | null = null;
   let lastUserConsoleInputAt = 0;
+  let pendingInitialShellToCli = false;
+  let initialShellToCliInFlight = false;
+  let latestCloudStatusState: CloudStatusState | null = null;
+  interface GuidedAnalysisCard {
+    eyebrow: string;
+    title: string;
+    summary: string;
+    conclusion?: string;
+    findings?: string[];
+  }
+  interface AgentCatalogCheckState {
+    id: string;
+    name: string;
+    desc: string;
+    requiresCloud: boolean;
+    requiresMistApi: boolean;
+    available: boolean;
+    reason: string | null;
+  }
+  interface AgentCatalogGroupState {
+    id: string;
+    name: string;
+    available: boolean;
+    reason: string | null;
+    checks: AgentCatalogCheckState[];
+  }
+  interface PendingAgentAction {
+    id: string;
+    type:
+      | 'run_check'
+      | 'run_check_group'
+      | 'run_all_catalog_checks'
+      | 'run_full_baseline'
+      | 'run_recommended_checks'
+      | 'run_dhcp_refresh'
+      | 'run_restart_mist_agent'
+      | 'run_config_sync_preview'
+      | 'get_effective_config'
+      | 'search_log_file'
+      | 'list_log_files';
+    params?: Record<string, unknown>;
+  }
+  let latestAgentCheckResults: {
+    workflowStatus: 'running' | 'completed';
+    runAt: string;
+    checks: Array<{
+      id: string;
+      name: string;
+      status: CheckStatus;
+      summary: string;
+      remediation: string | null;
+      rawExcerpt: string | null;
+    }>;
+  } | null = null;
+  let latestAgentGuidedAnalysis: GuidedAnalysisCard | null = null;
+  const latestAgentCheckResultMap = new Map<string, CheckResult>();
+  let lastAgentContextSessionId: string | null = null;
+  let agentContextPushTimer: number | null = null;
+  let agentActionPollTimer: number | null = null;
+  let agentActionPollInFlight = false;
+  let authorizedPortsCache: SerialPort[] = [];
+  type ConsoleTaskKind = 'background' | 'user' | 'exclusive';
+  type ConsoleTaskOwner = { id: string; kind: ConsoleTaskKind; label: string; depth: number };
+  let consoleTaskOwner: ConsoleTaskOwner | null = null;
 
   // ---- Mist context controller ----
   const mistContext = new MistContextController(mistApi, {
@@ -309,18 +394,21 @@ function init(): void {
     onIdentifyStarted(options) {
       identifyInFlight = true;
       renderJmaRecommendation(latestJmaCode);
+      refreshCatalogRunButtons(false);
       const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
       if (identity) {
         renderDeviceSummary(identity);
       } else {
         renderDeviceSummaryPlaceholder();
       }
+      scheduleAgentContextPush();
       if (options?.silent) return;
       // loading state set by caller before runIdentify()
     },
     onIdentified(result, options) {
       identifyInFlight = false;
       renderJmaRecommendation(latestJmaCode);
+      refreshCatalogRunButtons(false);
       const { identity, mistDevice, matchedBy } = result;
       resolvedMatchedSiteName = result.mistSiteName ?? null;
       // Update the top-strip summary with the freshest identity data.
@@ -401,25 +489,32 @@ function init(): void {
       ui.deviceIdentity.innerHTML = '';
       cloudStatusRefreshInFlight = true;
       renderJmaRecommendation(latestJmaCode);
+      refreshCatalogRunButtons(false);
       renderDeviceSummary(identity);
+      scheduleAgentContextPush();
       void startLoggedInCloudStatusLoop(true).finally(() => {
         cloudStatusRefreshInFlight = false;
         renderJmaRecommendation(latestJmaCode);
+        refreshCatalogRunButtons(false);
         renderDeviceSummary(identity);
+        scheduleAgentContextPush();
       });
     },
     onIdentifyFailed(error, options) {
       identifyInFlight = false;
       cloudStatusRefreshInFlight = false;
       renderJmaRecommendation(latestJmaCode);
+      refreshCatalogRunButtons(false);
       if (!options?.silent) {
         term.writeError(`Identification failed: ${error.message}`);
       }
       ui.deviceIdentity.innerHTML = '';
       cloudStatus.reset();
+      scheduleAgentContextPush();
     },
     onLocalIdentityAvailable(identity) {
       renderDeviceSummary(identity);
+      scheduleAgentContextPush();
       if (mistContext.isConfigured) {
         maybeAutoMatchAfterMistSave();
       }
@@ -430,27 +525,473 @@ function init(): void {
     onSessionStarted(sessionId) {
       ui.remoteSessionId.value = sessionId;
       ui.remoteSessionPanel.classList.remove('is-hidden');
+      lastAgentContextSessionId = sessionId;
       term.writeSystem('— Remote session active —');
+      scheduleAgentContextPush({ sessionId, enabled: true });
+      scheduleAgentActionPoll(250);
     },
     onSessionEnded(reason) {
+      const endedSessionId = remoteSession.sessionId ?? lastAgentContextSessionId;
       term.writeSystem(`— Remote session ended (${reason}) —`);
       ui.remoteSessionEnabled.checked = false;
       ui.remoteSessionPanel.classList.add('is-hidden');
       ui.remoteSessionId.value = '';
+      scheduleAgentContextPush({ sessionId: endedSessionId, enabled: false });
+      clearAgentActionPoll();
     },
     onError(message) {
+      const endedSessionId = remoteSession.sessionId ?? lastAgentContextSessionId;
       term.writeError(`Remote session: ${message}`);
       ui.remoteSessionEnabled.checked = false;
       ui.remoteSessionPanel.classList.add('is-hidden');
       ui.remoteSessionId.value = '';
+      scheduleAgentContextPush({ sessionId: endedSessionId, enabled: false });
+      clearAgentActionPoll();
     },
   });
 
   const cloudStatus = new CloudStatusController(switchIdentity, troubleshooter, {
     onStatusUpdated(state) {
+      latestCloudStatusState = state;
       renderCloudStatus(state);
+      scheduleAgentContextPush();
+    },
+    onRefreshStateChange(inFlight) {
+      cloudStatusRefreshInFlight = inFlight;
+      renderJmaRecommendation(latestJmaCode);
+      refreshCatalogRunButtons(false);
     },
   });
+
+  function sanitizeAgentRawExcerpt(raw: string | undefined): string | null {
+    if (!raw) return null;
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    return trimmed.length > 400 ? `${trimmed.slice(0, 397)}...` : trimmed;
+  }
+
+  function setLatestAgentCheckResults(
+    results: CheckResult[] | null,
+    workflowStatus: 'running' | 'completed' = 'completed',
+  ): void {
+    latestAgentCheckResults = results
+      ? {
+          workflowStatus,
+          runAt: new Date().toISOString(),
+          checks: results.map((result) => ({
+            id: result.id,
+            name: result.name,
+            status: result.status,
+            summary: result.detail,
+            remediation: result.remediation ?? null,
+            rawExcerpt: sanitizeAgentRawExcerpt(result.raw),
+          })),
+        }
+      : null;
+    scheduleAgentContextPush();
+  }
+
+  function setLatestAgentGuidedAnalysis(card: GuidedAnalysisCard | null): void {
+    latestAgentGuidedAnalysis = card
+      ? {
+          eyebrow: card.eyebrow,
+          title: card.title,
+          summary: card.summary,
+          conclusion: card.conclusion,
+          findings: card.findings ? [...card.findings] : [],
+        }
+      : null;
+    scheduleAgentContextPush();
+  }
+
+  function beginLatestAgentCheckRun(): void {
+    latestAgentCheckResultMap.clear();
+    latestAgentCheckResults = {
+      workflowStatus: 'running',
+      runAt: new Date().toISOString(),
+      checks: [],
+    };
+    scheduleAgentContextPush();
+  }
+
+  function buildAgentContextPayload(sessionId: string, agentAccessEnabled: boolean): Record<string, unknown> {
+    const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
+    const mistDevice = deviceContext.matchResult?.mistDevice ?? null;
+    const cloudState = latestCloudStatusState ?? cloudStatus.state;
+    const recommendation = getJmaRecommendation(latestJmaCode);
+    const selectedCloud = getCloudById(ui.mistCloud.value);
+    const selectedOrgName = getSelectedOrgName();
+    const selectedSiteName = getSelectedSiteName();
+    const promptMode = getRecentPromptMode();
+    const recentTail = recentConsoleTail.trim();
+    const blockingConsoleTask = getBlockingConsoleTask();
+    const catalogGroups: AgentCatalogGroupState[] = CATALOG_GROUPS.map((group) => {
+      const checks = group.checks.map((check) => {
+        const availability = getCatalogCheckAvailability(check.id);
+        return {
+          id: check.id,
+          name: check.name,
+          desc: check.desc,
+          requiresCloud: check.requiresCloud,
+          requiresMistApi: check.requiresMistApi,
+          available: availability.available,
+          reason: availability.reason,
+        };
+      });
+      const unavailableChecks = checks.filter((check) => !check.available);
+      return {
+        id: group.id,
+        name: group.name,
+        available: unavailableChecks.length === 0,
+        reason: unavailableChecks.length > 0 ? unavailableChecks[0].reason : null,
+        checks,
+      };
+    });
+
+    return {
+      sessionId,
+      agentAccessEnabled,
+      serialConnected: serial.isConnected,
+      deviceIdentified: Boolean(identity),
+      mistStatus: cloudState.mist.label.toLowerCase(),
+      configSyncState: configSync.sessionState,
+      prompt: {
+        mode: promptMode,
+        operationalVisible: promptMode === 'operational',
+        recentConsoleTail: recentTail || null,
+      },
+      consoleTask: blockingConsoleTask
+        ? {
+            kind: blockingConsoleTask.kind,
+            label: blockingConsoleTask.label,
+          }
+        : null,
+      mistContext: {
+        configured: mistContext.isConfigured,
+        cloudId: selectedCloud?.id ?? null,
+        cloudName: selectedCloud?.name ?? null,
+        apiHost: selectedCloud?.apiHost ?? null,
+        orgId: mistContext.state.orgId || null,
+        orgName: selectedOrgName,
+        siteId: deviceContext.matchResult?.mistDevice?.site_id ?? mistContext.state.siteId ?? null,
+        siteName: selectedSiteName,
+        orgCount: mistContext.state.orgs.length,
+        siteCount: mistContext.state.sites.length,
+      },
+      troubleshooting: {
+        uplinkPort: ui.tsUplinkPort.value.trim() || null,
+      },
+      guidance: {
+        jmaRecommendation: recommendation
+          ? {
+              code: recommendation.code,
+              label: recommendation.label,
+              title: recommendation.title,
+              summary: recommendation.summary,
+              implication: recommendation.implication,
+              severity: recommendation.severity,
+              workflowRecommendation: recommendation.workflowRecommendation,
+              workflowNote: recommendation.workflowNote,
+              checks: recommendation.checks.map((check) => ({
+                id: check.id,
+                label: check.label,
+                why: check.why,
+              })),
+              remediation: [...recommendation.remediation],
+            }
+          : null,
+        guidedAnalysis: latestAgentGuidedAnalysis,
+      },
+      actions: {
+        runRecommendedChecks: {
+          available: Boolean(recommendation) && serial.isConnected && !Boolean(getBlockingConsoleTask('jma-recommended-checks')),
+          reason: recommendation
+            ? (serial.isConnected
+              ? (getBlockingConsoleTask('jma-recommended-checks')?.label ?? null)
+              : 'Serial session is not connected.')
+            : 'No current JMA recommendation is available.',
+        },
+        runFullBaseline: {
+          available: canRunFullBaseline(),
+          reason: canRunFullBaseline() ? null : 'Full baseline is not currently available.',
+        },
+        dhcpRefresh: {
+          available: !ui.btnDhcpRefresh.disabled,
+          reason: ui.btnDhcpRefresh.disabled ? 'DHCP Refresh is not currently available.' : null,
+        },
+        restartMistAgent: {
+          available: !ui.btnRestartMistAgent.disabled,
+          reason: ui.btnRestartMistAgent.disabled ? 'Restart Mist Agent is not currently available.' : null,
+        },
+        configSync: {
+          available: !ui.btnConfigSyncPreview.disabled,
+          reason: ui.btnConfigSyncPreview.disabled ? 'Config Sync is not currently available.' : null,
+        },
+        adoptSwitch: {
+          available: !ui.btnAdopt.disabled,
+          reason: ui.btnAdopt.disabled ? 'Adopt Switch is not currently available.' : null,
+        },
+        offlineTimeline: {
+          available: !ui.btnOfflineTimeline.disabled,
+          reason: ui.btnOfflineTimeline.disabled ? 'Offline Timeline is not currently available.' : null,
+        },
+      },
+      checkCatalog: {
+        groups: catalogGroups,
+        runAllCatalogChecks: {
+          available: !document.getElementById('catalog-btn-run-all')?.hasAttribute('disabled'),
+          reason: document.getElementById('catalog-btn-run-all')?.hasAttribute('disabled')
+            ? 'Run All Catalog Checks is not currently available.'
+            : null,
+        },
+        runFullBaseline: {
+          available: canRunFullBaseline(),
+          reason: canRunFullBaseline() ? null : 'Run Full Baseline is not currently available.',
+        },
+      },
+      identity: identity
+        ? {
+            hostname: identity.hostname,
+            serial: identity.serial,
+            mac: identity.mac,
+            model: identity.model,
+            junosVersion: identity.junosVersion,
+            mistMatch: mistDevice
+              ? {
+                  matched: true,
+                  matchConfidence: deviceContext.matchResult?.matchedBy ?? null,
+                  orgId: mistDevice.org_id ?? null,
+                  siteId: mistDevice.site_id ?? null,
+                  deviceId: mistDevice.id ?? null,
+                  deviceName: mistDevice.name ?? null,
+                }
+              : {
+                  matched: false,
+                  matchConfidence: null,
+                  orgId: null,
+                  siteId: null,
+                  deviceId: null,
+                  deviceName: null,
+                },
+          }
+        : null,
+      jma: {
+        stateCode: cloudState.jma.code,
+        stateLabel: cloudState.jma.label,
+        stateDescription: cloudState.jma.detail,
+        rawValue: cloudState.jma.code != null ? String(cloudState.jma.code) : null,
+        checkedAt: cloudState.lastUpdatedUtcIso,
+      },
+      checkResults: latestAgentCheckResults,
+    };
+  }
+
+  async function pushAgentContextNow(sessionId: string, agentAccessEnabled: boolean): Promise<void> {
+    try {
+      await fetch('http://127.0.0.1:3333/mcp/agent-context', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(buildAgentContextPayload(sessionId, agentAccessEnabled)),
+      });
+      lastAgentContextSessionId = sessionId;
+    } catch (err) {
+      console.warn('Failed to push MCP agent context', err);
+    }
+  }
+
+  function scheduleAgentContextPush(options?: { sessionId?: string | null; enabled?: boolean }): void {
+    const sessionId = options?.sessionId ?? remoteSession.sessionId ?? lastAgentContextSessionId;
+    if (!sessionId) return;
+    const enabled = options?.enabled ?? (ui.remoteSessionEnabled.checked && remoteSession.isActive);
+    if (agentContextPushTimer != null) {
+      window.clearTimeout(agentContextPushTimer);
+    }
+    agentContextPushTimer = window.setTimeout(() => {
+      agentContextPushTimer = null;
+      void pushAgentContextNow(sessionId, enabled);
+    }, 150);
+  }
+
+  function clearAgentActionPoll(): void {
+    if (agentActionPollTimer != null) {
+      window.clearTimeout(agentActionPollTimer);
+      agentActionPollTimer = null;
+    }
+  }
+
+  async function postAgentActionStatus(
+    actionId: string,
+    status: 'running' | 'completed' | 'failed',
+    payload?: { result?: unknown; error?: string | null },
+  ): Promise<void> {
+    try {
+      await fetch(`http://127.0.0.1:3333/mcp/actions/${actionId}/status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          status,
+          result: payload?.result,
+          error: payload?.error ?? null,
+        }),
+      });
+    } catch (err) {
+      console.warn('Failed to post MCP action status', err);
+    }
+  }
+
+  function buildAgentActionResultPayload(): Record<string, unknown> {
+    return {
+      checkResults: latestAgentCheckResults,
+      guidedAnalysis: latestAgentGuidedAnalysis,
+      jmaStateCode: latestJmaCode,
+      completedAt: new Date().toISOString(),
+    };
+  }
+
+  async function executePendingAgentAction(action: PendingAgentAction): Promise<void> {
+    await postAgentActionStatus(action.id, 'running');
+
+    try {
+      let actionResult: Record<string, unknown> | undefined;
+      switch (action.type) {
+        case 'run_check': {
+          const checkId = typeof action.params?.checkId === 'string' ? action.params.checkId : '';
+          if (!checkId || !getCatalogCheck(checkId)) {
+            throw new Error('Unknown or missing checkId.');
+          }
+          const availability = getCatalogCheckAvailability(checkId);
+          if (!availability.available) {
+            throw new Error(availability.reason ?? 'Check is not currently available.');
+          }
+          await runSingleCheck(checkId);
+          break;
+        }
+        case 'run_check_group': {
+          const groupId = typeof action.params?.groupId === 'string' ? action.params.groupId : '';
+          const checks = getCatalogGroupChecks(groupId);
+          if (!groupId || checks.length === 0) {
+            throw new Error('Unknown or missing groupId.');
+          }
+          const blocked = checks.map((check) => getCatalogCheckAvailability(check.id)).find((item) => !item.available);
+          if (blocked && !blocked.available) {
+            throw new Error(blocked.reason ?? 'Check group is not currently available.');
+          }
+          await runCheckGroup(groupId);
+          break;
+        }
+        case 'run_all_catalog_checks': {
+          if (ALL_CATALOG_CHECK_IDS.some((checkId) => !canRunCatalogCheck(checkId))) {
+            throw new Error('Run All Catalog Checks is not currently available.');
+          }
+          await runAllChecks();
+          break;
+        }
+        case 'run_full_baseline': {
+          if (!canRunFullBaseline()) {
+            throw new Error('Run Full Baseline is not currently available.');
+          }
+          await runFullBaseline();
+          break;
+        }
+        case 'run_recommended_checks': {
+          const recommendation = getJmaRecommendation(latestJmaCode);
+          if (!recommendation) {
+            throw new Error('No current JMA recommendation is available.');
+          }
+          if (!serial.isConnected) {
+            throw new Error('Serial session is not connected.');
+          }
+          const blocking = getBlockingConsoleTask('jma-recommended-checks');
+          if (blocking) {
+            throw new Error(`Recommended checks are unavailable while ${blocking.label} is using the console.`);
+          }
+          await runRecommendedChecksFromJma();
+          break;
+        }
+        case 'run_dhcp_refresh': {
+          if (ui.btnDhcpRefresh.disabled) {
+            throw new Error('DHCP Refresh is not currently available.');
+          }
+          await runDhcpRefresh();
+          break;
+        }
+        case 'run_restart_mist_agent': {
+          if (ui.btnRestartMistAgent.disabled) {
+            throw new Error('Restart Mist Agent is not currently available.');
+          }
+          await runMistAgentRestart();
+          break;
+        }
+        case 'run_config_sync_preview': {
+          if (ui.btnConfigSyncPreview.disabled) {
+            throw new Error('Config Sync is not currently available.');
+          }
+          await previewConfigSync();
+          break;
+        }
+        case 'get_effective_config': {
+          actionResult = await fetchEffectiveConfigForAgent();
+          break;
+        }
+        case 'search_log_file': {
+          const logFile = typeof action.params?.logFile === 'string' ? action.params.logFile : '';
+          const findText = typeof action.params?.findText === 'string' ? action.params.findText : '';
+          actionResult = await searchLogFileForAgent(logFile, findText, action.params?.maxLines);
+          break;
+        }
+        case 'list_log_files': {
+          const family = typeof action.params?.family === 'string' ? action.params.family : '';
+          actionResult = await listLogFilesForAgent(family);
+          break;
+        }
+        default:
+          throw new Error(`Unsupported action type: ${action.type}`);
+      }
+
+      await postAgentActionStatus(action.id, 'completed', {
+        result: actionResult ?? buildAgentActionResultPayload(),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await postAgentActionStatus(action.id, 'failed', {
+        error: message,
+        result: buildAgentActionResultPayload(),
+      });
+    }
+  }
+
+  async function pollAgentActionsNow(): Promise<void> {
+    if (agentActionPollInFlight) return;
+    const sessionId = remoteSession.sessionId;
+    if (!sessionId || !remoteSession.isActive || !ui.remoteSessionEnabled.checked) return;
+
+    agentActionPollInFlight = true;
+    try {
+      const res = await fetch(`http://127.0.0.1:3333/mcp/actions/next?sessionId=${encodeURIComponent(sessionId)}`);
+      if (!res.ok) return;
+      const payload = await res.json() as { action?: PendingAgentAction | null };
+      if (payload.action) {
+        term.writeSystem(`— Agent requested action: ${payload.action.type} —`);
+        await executePendingAgentAction(payload.action);
+      }
+    } catch (err) {
+      console.warn('Failed to poll MCP agent actions', err);
+    } finally {
+      agentActionPollInFlight = false;
+    }
+  }
+
+  function scheduleAgentActionPoll(delayMs = 1000): void {
+    clearAgentActionPoll();
+    if (!ui.remoteSessionEnabled.checked || !remoteSession.isActive) return;
+    agentActionPollTimer = window.setTimeout(async () => {
+      agentActionPollTimer = null;
+      await pollAgentActionsNow();
+      scheduleAgentActionPoll();
+    }, delayMs);
+  }
 
   // ---- Results panel tab switching ----
   /**
@@ -464,6 +1005,18 @@ function init(): void {
     ui.resultsPanes.forEach((p) => {
       const isTarget = p.id === `${pane}-results`;
       p.classList.toggle('results-pane-hidden', !isTarget);
+    });
+  }
+
+  /**
+   * Yield to the browser so recent DOM updates can paint before we continue
+   * with heavier synchronous terminal rendering work.
+   */
+  async function waitForUiPaint(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => resolve());
+      });
     });
   }
 
@@ -623,24 +1176,25 @@ function init(): void {
     // Workflows that would conflict with an open config-mode session.
     // Anything that mutates config must stay disabled for the full staged window.
     if (staged) {
-      ui.btnRunTroubleshoot.disabled = true;
-      ui.btnSslCheck.disabled = true;
+      refreshCatalogRunButtons(true);
       ui.btnDhcpRefresh.disabled = true;
+      ui.btnRestartMistAgent.disabled = true;
       ui.btnOfflineTimeline.disabled = true;
       ui.btnAdopt.disabled = true;
     } else if (serial.isConnected) {
       // Restore normal connected-state enabling; identification guards apply separately
-      ui.btnRunTroubleshoot.disabled = false;
-      ui.btnMistStatus.disabled = false;
-      ui.btnSslCheck.disabled = false;
+      refreshCatalogRunButtons(false);
       ui.btnDhcpRefresh.disabled = false;
+      ui.btnRestartMistAgent.disabled = false;
       // Offline timeline re-enabled only if device is identified with a site
       const hasSite = !!deviceContext.matchResult?.mistDevice?.site_id;
       ui.btnOfflineTimeline.disabled = !hasSite;
       ui.btnAdopt.disabled = !serial.isConnected;
     }
 
+    renderConsoleTaskIndicator();
     renderJmaRecommendation(latestJmaCode);
+    scheduleAgentContextPush();
   }
 
   // ---- UI state helpers ----
@@ -656,6 +1210,68 @@ function init(): void {
     return 'Browser-selected serial port';
   }
 
+  function getPreferredAuthorizedPort(ports = authorizedPortsCache): SerialPort | null {
+    const lastPortLabel = getLastPortLabel();
+    if (lastPortLabel) {
+      const matched = ports.find((port) => formatPortLabel(port) === lastPortLabel);
+      if (matched) return matched;
+    }
+    return ports.length === 1 ? ports[0] : null;
+  }
+
+  async function refreshAuthorizedPortsCache(): Promise<void> {
+    if (!SerialService.isSupported()) return;
+    try {
+      authorizedPortsCache = await navigator.serial.getPorts();
+    } catch {
+      authorizedPortsCache = [];
+    }
+
+    if (serial.isConnected) return;
+    const preferredPort = getPreferredAuthorizedPort();
+    ui.btnConnect.textContent = preferredPort ? 'Reconnect' : 'Choose Serial Port';
+    if (preferredPort) {
+      ui.selectedPort.textContent = `Selected Port: ${formatPortLabel(preferredPort)}`;
+    } else {
+      const lastPortLabel = getLastPortLabel();
+      ui.selectedPort.textContent = `Selected Port: ${lastPortLabel ?? 'None selected'}`;
+    }
+  }
+
+  async function openChosenPort(port: SerialPort): Promise<void> {
+    const portLabel = formatPortLabel(port);
+    ui.selectedPort.textContent = `Selected Port: ${portLabel}`;
+    saveLastPortLabel(portLabel);
+    saveSerialPrefs();
+
+    ui.connectionBadge.textContent = 'Connecting…';
+    ui.connectionBadge.className = 'badge badge-connecting';
+    setConnectionStatePill('connecting');
+    ui.btnConnect.disabled = true;
+
+    await serial.openPort(port, {
+      baudRate: parseInt(ui.baudRate.value, 10),
+      dataBits: parseInt(ui.dataBits.value, 10) as 7 | 8,
+      parity: ui.parity.value as ParityType,
+      stopBits: parseInt(ui.stopBits.value, 10) as 1 | 2,
+      flowControl: ui.flowControl.value as FlowControlType,
+    });
+  }
+
+  async function tryAutoReconnectAuthorizedPort(): Promise<void> {
+    const preferredPort = getPreferredAuthorizedPort();
+    if (!preferredPort || serial.isConnected) return;
+
+    term.writeSystem('Attempting to reconnect to previously authorized serial port…');
+    try {
+      await openChosenPort(preferredPort);
+    } catch (err) {
+      setConnectedState(false);
+      term.writeError(`Auto-reconnect failed: ${err instanceof Error ? err.message : String(err)}`);
+      void refreshAuthorizedPortsCache();
+    }
+  }
+
   function setConnectedState(connected: boolean): void {
     ui.btnConnect.disabled = connected;
     ui.btnDisconnect.disabled = !connected;
@@ -665,10 +1281,9 @@ function init(): void {
     ui.parity.disabled = connected;
     ui.stopBits.disabled = connected;
     ui.flowControl.disabled = connected;
-    ui.btnRunTroubleshoot.disabled = !connected;
-    ui.btnMistStatus.disabled = !connected;
-    ui.btnSslCheck.disabled = !connected;
+    refreshCatalogRunButtons(!connected);
     ui.btnDhcpRefresh.disabled = !connected;
+    ui.btnRestartMistAgent.disabled = !connected;
     ui.btnIdentify.disabled = !connected;
     ui.btnLogin.disabled = !connected;
     ui.btnAdopt.disabled = !connected;
@@ -677,6 +1292,7 @@ function init(): void {
       ui.btnConfigSyncPreview.disabled = true;
       ui.btnRootPassword.disabled = true;
       ui.btnOfflineTimeline.disabled = true;
+      clearCatalog();
       deviceContext.clear();
       cloudStatus.reset();
       // If the serial connection drops while a candidate is staged, the switch
@@ -707,13 +1323,15 @@ function init(): void {
       setConnectionStatePill('connected');
       term.focus();
     } else {
-      ui.btnConnect.textContent = 'Choose Serial Port';
+      ui.btnConnect.textContent = getPreferredAuthorizedPort() ? 'Reconnect' : 'Choose Serial Port';
       ui.connectionBadge.textContent = 'Disconnected';
       ui.connectionBadge.className = 'badge badge-disconnected';
       setConnectionStatePill('disconnected');
-      const lastPortLabel = getLastPortLabel();
+      const preferredPort = getPreferredAuthorizedPort();
+      const lastPortLabel = preferredPort ? formatPortLabel(preferredPort) : getLastPortLabel();
       ui.selectedPort.textContent = `Selected Port: ${lastPortLabel ?? 'None selected'}`;
     }
+    renderConsoleTaskIndicator();
   }
 
   function setMistStatus(text: string, type: 'success' | 'error' | 'info' = 'info'): void {
@@ -820,6 +1438,7 @@ function init(): void {
     if (deviceContext.localIdentity !== null) return Promise.resolve();
     localIdentifyInFlight = true;
     renderJmaRecommendation(latestJmaCode);
+    refreshCatalogRunButtons(false);
     const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
     if (identity) {
       renderDeviceSummary(identity);
@@ -828,11 +1447,14 @@ function init(): void {
     }
     localIdentifyPromise = (async () => {
       await waitForConsoleIdle();
-      if (!serial.isConnected || configSync.hasStagedCandidate()) return;
-      await deviceContext.runLocalIdentify();
+      if (!canRunBackgroundConsoleTask()) return;
+      await withConsoleTask('background-identify', 'background', 'background identify', async () => {
+        await deviceContext.runLocalIdentify();
+      });
     })().finally(() => {
       localIdentifyInFlight = false;
       renderJmaRecommendation(latestJmaCode);
+      refreshCatalogRunButtons(false);
       localIdentifyPromise = null;
       if (mistContext.isConfigured) {
         maybeAutoMatchAfterMistSave();
@@ -855,6 +1477,7 @@ function init(): void {
 
     loggedInBootstrapPromise = (async () => {
       renderJmaRecommendation(latestJmaCode);
+      refreshCatalogRunButtons(false);
       if (!cloudStatusLoopStarted) {
         await startLoggedInCloudStatusLoop();
       }
@@ -862,6 +1485,7 @@ function init(): void {
     })().finally(() => {
       loggedInBootstrapPromise = null;
       renderJmaRecommendation(latestJmaCode);
+      refreshCatalogRunButtons(false);
     });
 
     await loggedInBootstrapPromise;
@@ -878,7 +1502,10 @@ function init(): void {
         if (!serial.isConnected) return;
         if (configSync.hasStagedCandidate()) return;
         if (identifyInFlight) return;
-        return deviceContext.runIdentify({ silent: true });
+        if (!isOperationalPromptVisible()) return;
+        return withConsoleTask('background-auto-match', 'background', 'background Mist match', async () => {
+          await deviceContext.runIdentify({ silent: true });
+        });
       })
       .catch(() => {});
   }
@@ -890,6 +1517,28 @@ function init(): void {
 
   function isConsoleIdle(minIdleMs = BACKGROUND_CONSOLE_IDLE_MS): boolean {
     return msSinceLastUserConsoleInput() >= minIdleMs;
+  }
+
+  function getRecentPromptMode(): 'operational' | 'config' | 'shell' | 'login' | 'password' | 'unknown' {
+    const trimmed = recentConsoleTail.trimEnd();
+    if (!trimmed) return 'unknown';
+    if (/[Pp]assword:\s*$/.test(trimmed)) return 'password';
+    if (/login:\s*$/i.test(trimmed)) return 'login';
+    if (/(?:\{[^}\n]+\}\s*\n)?[\w\-@.:]+%\s*$/.test(trimmed)) return 'shell';
+    if (/(?:\{[^}\n]+\}\s*\n)?[\w\-@.:]+#\s*$/.test(trimmed)) return 'config';
+    if (/(?:\{[^}\n]+\}\s*\n)?[\w\-@.:]+>\s*$/.test(trimmed)) return 'operational';
+    return 'unknown';
+  }
+
+  function isOperationalPromptVisible(): boolean {
+    return getRecentPromptMode() === 'operational';
+  }
+
+  function canRunBackgroundConsoleTask(): boolean {
+    if (!serial.isConnected || configSync.hasStagedCandidate()) return false;
+    if (!isConsoleIdle()) return false;
+    if (getBlockingConsoleTask('background-task')) return false;
+    return isOperationalPromptVisible();
   }
 
   async function waitForConsoleIdle(minIdleMs = BACKGROUND_CONSOLE_IDLE_MS, maxWaitMs = 15000): Promise<void> {
@@ -985,8 +1634,107 @@ function init(): void {
     }
   }
 
+  function getBlockingConsoleTask(ownerId?: string): { kind: ConsoleTaskKind; label: string } | null {
+    if (configSync.hasStagedCandidate() && !ownerId?.startsWith('config-sync')) {
+      return { kind: 'exclusive', label: 'staged config sync' };
+    }
+    if (consoleTaskOwner && consoleTaskOwner.id !== ownerId) {
+      return { kind: consoleTaskOwner.kind, label: consoleTaskOwner.label };
+    }
+    return null;
+  }
+
+  function renderConsoleTaskIndicator(): void {
+    const blocking = getBlockingConsoleTask();
+    if (!blocking) {
+      ui.consoleTaskIndicator.textContent = '';
+      ui.consoleTaskIndicator.className = 'console-task-indicator is-hidden';
+      ui.consoleTaskIndicator.removeAttribute('title');
+      return;
+    }
+
+    const prefix = blocking.kind === 'exclusive'
+      ? 'Console locked'
+      : blocking.kind === 'user'
+        ? 'Console busy'
+        : 'Background task';
+    const text = `${prefix}: ${blocking.label}`;
+    ui.consoleTaskIndicator.textContent = text;
+    ui.consoleTaskIndicator.title = text;
+    ui.consoleTaskIndicator.className = `console-task-indicator kind-${blocking.kind}`;
+  }
+
+  function tryAcquireConsoleTask(ownerId: string, kind: ConsoleTaskKind, label: string): boolean {
+    if (getBlockingConsoleTask(ownerId)) return false;
+    if (consoleTaskOwner && consoleTaskOwner.id === ownerId) {
+      consoleTaskOwner.depth += 1;
+      return true;
+    }
+    consoleTaskOwner = { id: ownerId, kind, label, depth: 1 };
+    return true;
+  }
+
+  function releaseConsoleTask(ownerId: string): void {
+    if (!consoleTaskOwner || consoleTaskOwner.id !== ownerId) return;
+    consoleTaskOwner.depth -= 1;
+    if (consoleTaskOwner.depth <= 0) {
+      consoleTaskOwner = null;
+    }
+  }
+
+  function onConsoleTaskOwnershipChanged(): void {
+    renderConsoleTaskIndicator();
+    renderJmaRecommendation(latestJmaCode);
+    refreshCatalogRunButtons(false);
+  }
+
+  async function withConsoleTask<T>(
+    ownerId: string,
+    kind: ConsoleTaskKind,
+    label: string,
+    fn: () => Promise<T>,
+  ): Promise<T | undefined> {
+    if (!tryAcquireConsoleTask(ownerId, kind, label)) return undefined;
+    onConsoleTaskOwnershipChanged();
+    try {
+      return await fn();
+    } finally {
+      releaseConsoleTask(ownerId);
+      onConsoleTaskOwnershipChanged();
+    }
+  }
+
+  function ensureConsoleTaskAvailable(actionLabel: string, ownerId: string): boolean {
+    const blocking = getBlockingConsoleTask(ownerId);
+    if (!blocking) return true;
+    term.writeError(`${actionLabel} is unavailable while ${blocking.label} is using the console.`);
+    refreshCatalogRunButtons(false);
+    return false;
+  }
+
   function isConsoleBackgroundWorkInFlight(): boolean {
-    return localIdentifyInFlight || identifyInFlight || cloudStatusRefreshInFlight || Boolean(loggedInBootstrapPromise);
+    return localIdentifyInFlight
+      || identifyInFlight
+      || cloudStatusRefreshInFlight
+      || Boolean(loggedInBootstrapPromise)
+      || consoleTaskOwner?.kind === 'background';
+  }
+
+  type CatalogRunOptions = {
+    cloud: MistCloud;
+    uplinkPort: string;
+    siteId?: string;
+    deviceId?: string;
+    checkIds: string[];
+    onProgress: typeof handleProgressResult;
+  };
+
+  function jmaSupportsMistAgentRestart(code: number | null): boolean {
+    return code === 109 || code === 110 || code === 112;
+  }
+
+  function canRunMistAgentRestart(): boolean {
+    return serial.isConnected && !Boolean(getBlockingConsoleTask('mist-agent-restart'));
   }
 
   function renderJmaRecommendation(code: number | null): void {
@@ -1000,7 +1748,9 @@ function init(): void {
     const buttonLabel = recommendation.workflowRecommendation === 'skip'
       ? 'Run Checks Anyway'
       : 'Run Recommended Checks';
-    const buttonDisabled = !serial.isConnected || configSync.hasStagedCandidate() || isConsoleBackgroundWorkInFlight();
+    const buttonDisabled = !serial.isConnected || Boolean(getBlockingConsoleTask('jma-recommended-checks'));
+    const showRestartMistAgent = jmaSupportsMistAgentRestart(code);
+    const restartButtonDisabled = !canRunMistAgentRestart();
 
     ui.jmaRecommendation.className = `jma-recommendation-card severity-${recommendation.severity}`;
     ui.jmaRecommendation.innerHTML = `
@@ -1052,6 +1802,16 @@ function init(): void {
         >
           ${escapeHtml(buttonLabel)}
         </button>
+        ${showRestartMistAgent ? `
+          <button
+            type="button"
+            class="btn btn-secondary btn-sm"
+            data-action="restart-mist-agent"
+            ${restartButtonDisabled ? 'disabled' : ''}
+          >
+            Restart Mist Agent
+          </button>
+        ` : ''}
       </div>
     `;
     ui.jmaRecommendation.classList.remove('jma-recommendation-hidden');
@@ -1081,12 +1841,17 @@ function init(): void {
     }
     if (cloudStatusLoopStarted) return;
     await waitForConsoleIdle();
+    if (!canRunBackgroundConsoleTask()) return;
+    const refreshed = await withConsoleTask('cloud-status-initial-refresh', 'background', 'cloud status refresh', async () => {
+      await cloudStatus.refresh(deviceContext.matchResult, serial.isConnected);
+      return true;
+    });
+    if (!refreshed) return;
     cloudStatusLoopStarted = true;
-    await cloudStatus.refresh(deviceContext.matchResult, serial.isConnected);
     cloudStatus.startPolling(
       () => deviceContext.matchResult,
       () => serial.isConnected,
-      () => isConsoleIdle() && !configSync.hasStagedCandidate(),
+      () => canRunBackgroundConsoleTask(),
       30000,
     );
   }
@@ -1097,6 +1862,35 @@ function init(): void {
     const cliPromptDetected = /(?:\{[^}\n]+\}\s*\n)?[\w\-@.:]+[>#]$/.test(trimmed);
     if (!cliPromptDetected) return;
     void ensureLoggedInBootstrap();
+  }
+
+  function maybeEnterCliOnInitialShellPrompt(): void {
+    if (!pendingInitialShellToCli || initialShellToCliInFlight) return;
+    if (!serial.isConnected || serial.isUiDataSuppressed) return;
+
+    const mode = getRecentPromptMode();
+    if (mode === 'unknown' || mode === 'password') return;
+
+    if (mode === 'shell') {
+      pendingInitialShellToCli = false;
+      initialShellToCliInFlight = true;
+      term.writeSystem('Detected shell prompt on connect — entering Junos CLI…');
+      void withConsoleTask('initial-shell-to-cli', 'background', 'enter Junos CLI', async () => {
+        const result = await cmdRunner.sendAndWaitFor('cli\n', />\s*$|#\s*$|login:/i, 5000);
+        if (result.matched) {
+          term.writeSystem('Entered Junos CLI.');
+        } else {
+          term.writeError('Could not enter Junos CLI automatically from shell prompt.');
+        }
+      }).finally(() => {
+        initialShellToCliInFlight = false;
+      });
+      return;
+    }
+
+    if (mode === 'operational' || mode === 'config' || mode === 'login') {
+      pendingInitialShellToCli = false;
+    }
   }
 
   function setConnectionStatePill(state: 'connected' | 'connecting' | 'disconnected'): void {
@@ -1131,6 +1925,7 @@ function init(): void {
       term.write(data);
       remoteSession.mirrorSerialRx(data);
       recentConsoleTail = (recentConsoleTail + promptDecoder.decode(data, { stream: true })).slice(-512);
+      maybeEnterCliOnInitialShellPrompt();
       maybeStartCloudStatusFromPrompt();
     }
   });
@@ -1141,17 +1936,27 @@ function init(): void {
 
   serial.on('connect', () => {
     setConnectedState(true);
+    pendingInitialShellToCli = true;
+    initialShellToCliInFlight = false;
     const baudRate = ui.baudRate.value;
     const dataBits = ui.dataBits.value;
     const parity = ui.parity.value[0].toUpperCase();
     const stopBits = ui.stopBits.value;
     term.writeSystem(`— Connected (${baudRate} baud, ${dataBits}${parity}${stopBits}) —`);
     void serial.writeString('\r').catch(() => {});
+    if (ui.remoteSessionEnabled.checked && !remoteSession.isActive) {
+      remoteSession.startAsOperator();
+    }
+    scheduleAgentContextPush();
   });
 
   serial.on('disconnect', () => {
+    pendingInitialShellToCli = false;
+    initialShellToCliInFlight = false;
     setConnectedState(false);
     term.writeSystem('— Disconnected —');
+    void refreshAuthorizedPortsCache();
+    scheduleAgentContextPush();
   });
 
   serial.on('error', (err: Error) => {
@@ -1172,9 +1977,12 @@ function init(): void {
 
   ui.remoteSessionEnabled.addEventListener('change', () => {
     if (!serial.isConnected) return;
+    saveRemoteSessionEnabled(ui.remoteSessionEnabled.checked);
     if (ui.remoteSessionEnabled.checked) {
       remoteSession.startAsOperator();
     } else {
+      clearAgentActionPoll();
+      scheduleAgentContextPush({ enabled: false });
       remoteSession.tearDown();
       ui.remoteSessionPanel.classList.add('is-hidden');
       ui.remoteSessionId.value = '';
@@ -1201,38 +2009,30 @@ function init(): void {
         return;
       }
 
-      let port: SerialPort;
       try {
-        // First await after click must be requestPort() — required for user-gesture / some embedded browsers.
-        port = await navigator.serial.requestPort();
-      } catch (err) {
-        if (err instanceof DOMException && err.name === 'NotFoundError') {
+        const authorizedPort = getPreferredAuthorizedPort();
+        if (authorizedPort) {
+          await openChosenPort(authorizedPort);
           return;
         }
-        term.writeError(`Serial picker failed: ${err instanceof Error ? err.message : String(err)}`);
-        return;
-      }
-      const portLabel = formatPortLabel(port);
-      ui.selectedPort.textContent = `Selected Port: ${portLabel}`;
-      saveLastPortLabel(portLabel);
-      saveSerialPrefs();
 
-      ui.connectionBadge.textContent = 'Connecting…';
-      ui.connectionBadge.className = 'badge badge-connecting';
-      setConnectionStatePill('connecting');
-      ui.btnConnect.disabled = true;
-
-      try {
-        await serial.openPort(port, {
-          baudRate: parseInt(ui.baudRate.value, 10),
-          dataBits: parseInt(ui.dataBits.value, 10) as 7 | 8,
-          parity: ui.parity.value as ParityType,
-          stopBits: parseInt(ui.stopBits.value, 10) as 1 | 2,
-          flowControl: ui.flowControl.value as FlowControlType,
-        });
+        let port: SerialPort;
+        try {
+          // First await after click must be requestPort() — required for user-gesture / some embedded browsers.
+          port = await navigator.serial.requestPort();
+        } catch (err) {
+          if (err instanceof DOMException && err.name === 'NotFoundError') {
+            return;
+          }
+          term.writeError(`Serial picker failed: ${err instanceof Error ? err.message : String(err)}`);
+          return;
+        }
+        await openChosenPort(port);
       } catch (err) {
         setConnectedState(false);
         term.writeError(`Connection failed: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        void refreshAuthorizedPortsCache();
       }
     });
   }
@@ -1274,6 +2074,633 @@ function init(): void {
   // Accumulated check results for context-aware remediation
   let accumulatedResults: CheckResult[] = [];
 
+  // ---- Check catalog state ----
+  const catalogResults = new Map<string, CheckResult[]>();
+  const catalogExpanded = new Set<string>();
+  let catalogRunning = false;
+
+  // ---- Check Catalog --------------------------------------------------------
+
+  const CHEVRON_SVG = `<svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+  function catalogWorstStatus(results: CheckResult[]): string {
+    const priority: Record<string, number> = { fail: 5, warn: 4, info: 3, skip: 2, pass: 1, pending: 0 };
+    return results.reduce((worst, r) => {
+      const p = priority[r.status] ?? 0;
+      return p > (priority[worst] ?? 0) ? r.status : worst;
+    }, 'pass');
+  }
+
+  function catalogBadgeText(catalogId: string, results: CheckResult[]): string {
+    if (results.length === 0) return '—';
+    if (catalogId === 'fw-check') {
+      const pass = results.filter(r => r.status === 'pass').length;
+      const fail = results.filter(r => r.status === 'fail').length;
+      const total = results.length;
+      if (fail === 0) return `${total}/${total} ok`;
+      return `${fail} blocked`;
+    }
+    if (catalogId === 'mist-last-seen') {
+      const seen = results.find(r => r.id === 'mist-last-seen');
+      if (seen) return seen.detail.length > 40 ? seen.detail.slice(0, 38) + '…' : seen.detail;
+    }
+    const last = results[results.length - 1];
+    const text = last.detail;
+    return text.length > 42 ? text.slice(0, 40) + '…' : text;
+  }
+
+  function catalogBadgeTooltipText(catalogId: string, results: CheckResult[]): string {
+    if (results.length === 0) return '';
+    if (catalogId === 'fw-check') {
+      return results.map((result) => result.detail).filter(Boolean).join('\n');
+    }
+    const last = [...results]
+      .reverse()
+      .find((result) => result.status !== 'running' && result.status !== 'pending') ?? results[results.length - 1];
+    const parts = [last.detail, last.remediation].filter(Boolean);
+    return parts.join('\n\n');
+  }
+
+  function setCatalogBadgeState(badge: HTMLElement, status: string, text: string, title = ''): void {
+    badge.className = status ? `check-result-badge ${status}` : 'check-result-badge';
+    badge.textContent = text;
+    badge.title = title;
+    if (title) {
+      badge.setAttribute('aria-label', title);
+    } else {
+      badge.removeAttribute('aria-label');
+    }
+  }
+
+  function renderGuidedCheckAnalysis(card: GuidedAnalysisCard | null): void {
+    const container = document.getElementById('guided-check-analysis') as HTMLElement | null;
+    if (!container) return;
+    if (!card) {
+      container.innerHTML = '';
+      container.classList.add('is-hidden');
+      setLatestAgentGuidedAnalysis(null);
+      return;
+    }
+
+    const findingsHtml = card.findings && card.findings.length > 0
+      ? `
+        <div class="guided-analysis-findings">
+          ${card.findings.map((finding) => `<div class="guided-analysis-finding">${escapeHtml(finding)}</div>`).join('')}
+        </div>
+      `
+      : '';
+
+    const conclusionHtml = card.conclusion
+      ? `
+        <div class="guided-analysis-conclusion">
+          <div class="guided-analysis-section-title">Conclusion</div>
+          <div class="guided-analysis-conclusion-copy">${escapeHtml(card.conclusion)}</div>
+        </div>
+      `
+      : '';
+
+    container.innerHTML = `
+      <div class="guided-analysis-card">
+        <div class="guided-analysis-eyebrow">${escapeHtml(card.eyebrow)}</div>
+        <div class="guided-analysis-title">${escapeHtml(card.title)}</div>
+        <div class="guided-analysis-summary">${escapeHtml(card.summary)}</div>
+        ${findingsHtml}
+        ${conclusionHtml}
+      </div>
+    `;
+    container.classList.remove('is-hidden');
+    setLatestAgentGuidedAnalysis(card);
+  }
+
+  function buildGuidedAnalysisForJma(code: number | null, results: CheckResult[]): GuidedAnalysisCard | null {
+    if (!code || results.length === 0) return null;
+
+    if (code === 106) {
+      const dnsConfig = results.find((result) => result.id === 'dns-config');
+      const dnsReachability = results.find((result) => result.id === 'dns-server-reachability');
+      const dnsResolution = results.find((result) => result.id === 'dns-resolution');
+      if (!dnsResolution) return null;
+
+      const raw = `${dnsResolution.raw || ''}`.toLowerCase();
+      const findings: string[] = [];
+      if (dnsConfig?.detail) findings.push(dnsConfig.detail);
+      if (dnsReachability?.detail) findings.push(dnsReachability.detail);
+      findings.push(dnsResolution.detail);
+
+      let conclusion = 'DNS resolution failed, so the switch still cannot resolve the hostnames it needs for cloud connectivity.';
+      if ((dnsConfig?.detail || '').toLowerCase().includes('no dns servers found')) {
+        conclusion = 'No DNS resolvers are currently available to the switch. There are no usable entries in the runtime resolver configuration, so DNS cannot work until resolvers are supplied via static configuration or DHCP.';
+      } else if ((dnsReachability?.detail || '').toLowerCase().includes('no dns servers were available to test')) {
+        conclusion = 'No DNS resolvers are currently available to the switch, so hostname resolution could not even be attempted. Restore resolver entries first, then retry the lookup.';
+      } else if ((dnsReachability?.detail || '').toLowerCase().includes('reachable dns servers')
+        && (raw.includes('no servers could be reached') || raw.includes('connection timed out'))) {
+        conclusion = 'Configured DNS servers respond to ping, but Junos cannot reach them for actual DNS queries. This strongly suggests upstream DNS transport is being blocked, most likely firewall policy on UDP/TCP 53 between the switch and its resolvers.';
+      } else if (dnsResolution.detail === 'Mist hostnames are unknown to the resolver') {
+        conclusion = 'Public DNS still works, but the resolver reported the Mist hostname as unknown. This suggests split-DNS, selective filtering, or an internal DNS server that does not know or forward Juniper Mist domains.';
+      } else if (dnsResolution.detail === 'Resolver returned unknown host responses') {
+        conclusion = 'The resolver answered the queries, but returned unknown-host responses for both public and Mist names. That points to a resolver content, recursion, or DNS policy problem rather than pure transport blocking.';
+      } else if (dnsResolution.detail === 'Mist hostname was unknown to the resolver') {
+        conclusion = 'The resolver answered the lookup, but it does not know the Mist hostname being queried. This points to a resolver content or forwarding problem rather than a raw connectivity issue.';
+      } else if (raw.includes('unknown host') || raw.includes('host name lookup failure')) {
+        conclusion = 'The resolver answered the lookup, but reported the hostname as unknown. That points to a DNS content or hostname problem rather than pure transport blocking.';
+      }
+
+      return {
+        eyebrow: 'Guided Analysis',
+        title: 'DNS lookup is failing',
+        summary: 'The switch can see configured DNS servers, but name resolution is still failing. Use the findings below to decide whether the issue is transport, resolver content, or stale DHCP-supplied DNS settings.',
+        findings,
+        conclusion,
+      };
+    }
+
+    const recommendation = getJmaRecommendation(code);
+    if (!recommendation) return null;
+    const failing = results.filter((result) => result.status === 'fail' || result.status === 'warn');
+    const findings = failing.slice(0, 3).map((result) => `${result.name}: ${result.detail}`);
+    return {
+      eyebrow: 'Guided Analysis',
+      title: recommendation.title,
+      summary: recommendation.summary,
+      findings,
+    };
+  }
+
+  function buildCatalogDetailHtml(results: CheckResult[]): string {
+    if (results.length === 0) return '';
+    let html = '';
+    for (const result of results) {
+      if (result.commands && result.commands.length > 0) {
+        for (const cmd of result.commands) {
+          html += `<div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">${escapeHtml(cmd)}</span></div>`;
+        }
+      }
+      if (result.detail) {
+        html += `<div class="detail-output ${result.status}">${escapeHtml(result.detail)}</div>`;
+      }
+      if (result.raw && result.raw.trim() && result.raw.trim() !== result.detail.trim()) {
+        html += `
+          <details class="detail-raw-toggle">
+            <summary>Raw console output</summary>
+            <div class="detail-output ${result.status}">${escapeHtml(result.raw)}</div>
+          </details>
+        `;
+      }
+      if (result.remediation && (result.status === 'fail' || result.status === 'warn' || result.status === 'info')) {
+        const remClass = result.status === 'fail' ? 'fail' : result.status === 'info' ? 'info' : '';
+        const icon = result.status === 'fail' ? '✕' : '⚠';
+        html += `<div class="detail-remediation ${remClass}"><span class="detail-remediation-icon">${icon}</span><span>${escapeHtml(result.remediation)}</span></div>`;
+      }
+    }
+    return html;
+  }
+
+  function updateCatalogRow(catalogId: string, results: CheckResult[]): void {
+    const dot = document.getElementById(`catalog-dot-${catalogId}`);
+    const badge = document.getElementById(`catalog-badge-${catalogId}`);
+    const detail = document.getElementById(`catalog-detail-${catalogId}`);
+    const item = document.getElementById(`catalog-item-${catalogId}`);
+    if (!dot || !badge || !detail || !item) return;
+
+    const isRunning = results.some(r => r.status === 'running' || r.status === 'pending');
+    const status = isRunning ? 'running' : catalogWorstStatus(results);
+    const badgeText = isRunning ? '…' : catalogBadgeText(catalogId, results);
+    const badgeTitle = isRunning ? '' : catalogBadgeTooltipText(catalogId, results);
+
+    dot.className = `check-status-dot ${status}`;
+    setCatalogBadgeState(badge, status, badgeText, badgeTitle);
+
+    item.classList.remove('no-detail');
+    detail.innerHTML = buildCatalogDetailHtml(results);
+
+    // Auto-expand on failure/warning if not manually closed
+    if (!catalogExpanded.has(catalogId) && (status === 'fail' || status === 'warn') && !isRunning) {
+      item.classList.add('is-open');
+      catalogExpanded.add(catalogId);
+    }
+  }
+
+  function handleProgressResult(result: CheckResult): void {
+    const catalogId = resultIdToCatalogId(result.id);
+    const existing = catalogResults.get(catalogId) ?? [];
+    const updated = [...existing, result];
+    catalogResults.set(catalogId, updated);
+    updateCatalogRow(catalogId, updated);
+    latestAgentCheckResultMap.set(result.id, result);
+    setLatestAgentCheckResults([...latestAgentCheckResultMap.values()], 'running');
+    term.writeSystem(`  [${statusIcon(result.status)}] ${result.name}: ${result.detail}`);
+  }
+
+  function resetCatalogRows(catalogIds: string[]): void {
+    [...new Set(catalogIds)].forEach((catalogId) => {
+      catalogResults.delete(catalogId);
+      updateCatalogRow(catalogId, []);
+    });
+  }
+
+  function getCatalogCheckAvailability(checkId: string): { available: boolean; reason: string | null } {
+    const check = getCatalogCheck(checkId);
+    if (!check) return { available: false, reason: 'Unknown check.' };
+    if (!serial.isConnected) {
+      return { available: false, reason: 'Serial session is not connected.' };
+    }
+    if (catalogRunning) {
+      return { available: false, reason: 'Another troubleshooting workflow is already running.' };
+    }
+    const blocking = getBlockingConsoleTask(`catalog-check:${checkId}`);
+    if (blocking) {
+      return { available: false, reason: `${blocking.label} is using the console.` };
+    }
+    if (check.requiresCloud && !getCloudById(ui.mistCloud.value)) {
+      return { available: false, reason: 'Select a Mist cloud region first.' };
+    }
+    if (check.requiresMistApi) {
+      const hasSite = !!deviceContext.matchResult?.mistDevice?.site_id;
+      const hasDevice = !!deviceContext.matchResult?.mistDevice?.id;
+      if (!hasSite || !hasDevice) {
+        return { available: false, reason: 'Identify and match the switch in Mist first.' };
+      }
+    }
+    return { available: true, reason: null };
+  }
+
+  function canRunCatalogCheck(checkId: string): boolean {
+    return getCatalogCheckAvailability(checkId).available;
+  }
+
+  function canRunFullBaseline(): boolean {
+    return serial.isConnected
+      && !catalogRunning
+      && !getBlockingConsoleTask('full-baseline')
+      && Boolean(getCloudById(ui.mistCloud.value));
+  }
+
+  function refreshCatalogRunButtons(forceDisabled = false): void {
+    ui.tsResults.querySelectorAll<HTMLButtonElement>('.check-run-btn').forEach((btn) => {
+      const checkId = btn.dataset.catalogId || '';
+      btn.disabled = forceDisabled || !canRunCatalogCheck(checkId);
+    });
+
+    ui.tsResults.querySelectorAll<HTMLButtonElement>('.check-group-run-btn').forEach((btn) => {
+      const groupId = btn.dataset.groupId || '';
+      const checks = getCatalogGroupChecks(groupId);
+      btn.disabled = forceDisabled || checks.length === 0 || checks.some((check) => !canRunCatalogCheck(check.id));
+    });
+
+    const runAllBtn = document.getElementById('catalog-btn-run-all') as HTMLButtonElement | null;
+    if (runAllBtn) {
+      runAllBtn.disabled = forceDisabled || ALL_CATALOG_CHECK_IDS.some((checkId) => !canRunCatalogCheck(checkId));
+    }
+
+    const runBaselineBtn = document.getElementById('catalog-btn-run-baseline') as HTMLButtonElement | null;
+    if (runBaselineBtn) {
+      runBaselineBtn.disabled = forceDisabled || !canRunFullBaseline();
+    }
+  }
+
+  function resolveCatalogRunOptions(checkIds: string[]): { options: CatalogRunOptions } | { error: string } {
+    for (const checkId of checkIds) {
+      const check = getCatalogCheck(checkId);
+      if (!check) {
+        return { error: `Unknown check: ${checkId}` };
+      }
+      if (check.requiresCloud && !getCloudById(ui.mistCloud.value)) {
+        return { error: `Select a Mist cloud region before running ${check.name}.` };
+      }
+      if (check.requiresMistApi) {
+        const hasSite = !!deviceContext.matchResult?.mistDevice?.site_id;
+        const hasDevice = !!deviceContext.matchResult?.mistDevice?.id;
+        if (!hasSite || !hasDevice) {
+          return { error: `${check.name} requires the switch to be identified and matched in Mist first.` };
+        }
+      }
+    }
+
+    const cloud = getCloudById(ui.mistCloud.value);
+    if (!cloud) {
+      return { error: 'Select a Mist cloud region first.' };
+    }
+
+    return {
+      options: {
+        cloud,
+        uplinkPort: ui.tsUplinkPort.value.trim(),
+        siteId: deviceContext.matchResult?.mistDevice?.site_id || undefined,
+        deviceId: deviceContext.matchResult?.mistDevice?.id || undefined,
+        checkIds,
+        onProgress: handleProgressResult,
+      },
+    };
+  }
+
+  function clearCatalog(): void {
+    catalogResults.clear();
+    catalogExpanded.clear();
+    latestAgentCheckResultMap.clear();
+    setLatestAgentCheckResults(null);
+    renderGuidedCheckAnalysis(null);
+    // Reset each row to idle state
+    CATALOG_GROUPS.forEach(group => {
+      group.checks.forEach(check => {
+        const dot = document.getElementById(`catalog-dot-${check.id}`);
+        const badge = document.getElementById(`catalog-badge-${check.id}`);
+        const detail = document.getElementById(`catalog-detail-${check.id}`);
+        const item = document.getElementById(`catalog-item-${check.id}`);
+        if (dot) dot.className = 'check-status-dot idle';
+        if (badge) setCatalogBadgeState(badge, '', '—', '');
+        if (detail) detail.innerHTML = '';
+        if (item) { item.classList.add('no-detail'); item.classList.remove('is-open'); }
+      });
+    });
+  }
+
+  function ensureCatalogCanRun(actionLabel: string): boolean {
+    const blocking = getBlockingConsoleTask('catalog-checks');
+    if (blocking) {
+      term.writeError(`${actionLabel} is unavailable while ${blocking.label} is using the console.`);
+      refreshCatalogRunButtons(false);
+      return false;
+    }
+    return true;
+  }
+
+  function handleCatalogClick(event: Event): void {
+    const target = event.target as HTMLElement;
+
+    if ((target as HTMLButtonElement).id === 'catalog-btn-run-all') {
+      void runAllChecks();
+      return;
+    }
+    if ((target as HTMLButtonElement).id === 'catalog-btn-run-baseline') {
+      void runFullBaseline();
+      return;
+    }
+    if ((target as HTMLButtonElement).id === 'catalog-btn-clear') {
+      clearCatalog();
+      return;
+    }
+
+    const groupBtn = target.closest<HTMLButtonElement>('.check-group-run-btn');
+    if (groupBtn) {
+      const groupId = groupBtn.dataset.groupId;
+      if (groupId) void runCheckGroup(groupId);
+      return;
+    }
+
+    const runBtn = target.closest<HTMLButtonElement>('[data-action="run-check"]');
+    if (runBtn) {
+      event.stopPropagation();
+      const catalogId = runBtn.dataset.catalogId;
+      if (catalogId) void runSingleCheck(catalogId);
+      return;
+    }
+
+    const row = target.closest<HTMLElement>('.check-row');
+    if (row) {
+      const item = row.closest<HTMLElement>('.check-item');
+      if (!item || item.classList.contains('no-detail')) return;
+      const catalogId = item.dataset.catalogId;
+      if (!catalogId) return;
+      item.classList.toggle('is-open');
+      if (item.classList.contains('is-open')) {
+        catalogExpanded.add(catalogId);
+      } else {
+        catalogExpanded.delete(catalogId);
+      }
+    }
+  }
+
+  function renderCheckCatalog(): void {
+    ui.tsResults.innerHTML = '';
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'catalog-toolbar';
+    toolbar.innerHTML = `
+      <span class="catalog-toolbar-title">Run recommended checks from JMA, run individual catalog checks, or run a broader baseline when needed.</span>
+      <button class="btn btn-primary btn-sm" id="catalog-btn-run-all" disabled>&#9654; Run All Catalog Checks</button>
+      <button class="btn btn-secondary btn-sm" id="catalog-btn-run-baseline" disabled>&#9654; Run Full Baseline</button>
+      <button class="btn btn-secondary btn-sm" id="catalog-btn-clear">&#x2715; Clear</button>
+    `;
+    ui.tsResults.appendChild(toolbar);
+
+    const analysis = document.createElement('div');
+    analysis.id = 'guided-check-analysis';
+    analysis.className = 'guided-check-analysis is-hidden';
+    ui.tsResults.appendChild(analysis);
+
+    for (const group of CATALOG_GROUPS) {
+      const groupEl = document.createElement('div');
+      groupEl.className = 'check-group';
+      groupEl.dataset.groupId = group.id;
+
+      const header = document.createElement('div');
+      header.className = 'check-group-header';
+      header.innerHTML = `
+        <span class="check-group-name">${group.name}</span>
+        <button class="check-group-run-btn" data-group-id="${group.id}" disabled>Run group</button>
+      `;
+      groupEl.appendChild(header);
+
+      for (const check of group.checks) {
+        const item = document.createElement('div');
+        item.className = 'check-item no-detail';
+        item.id = `catalog-item-${check.id}`;
+        item.dataset.catalogId = check.id;
+
+        item.innerHTML = `
+          <div class="check-row">
+            <span class="check-chevron">${CHEVRON_SVG}</span>
+            <div class="check-status-dot idle" id="catalog-dot-${check.id}"></div>
+            <div class="check-info">
+              <span class="check-name">${check.name}</span>
+              <span class="check-desc" title="${check.desc}">${check.desc}</span>
+            </div>
+            <span class="check-result-badge" id="catalog-badge-${check.id}">—</span>
+            ${check.requiresMistApi ? '<span class="mist-badge">Mist + site</span>' : ''}
+            <button class="check-run-btn" data-action="run-check" data-catalog-id="${check.id}" disabled>Run</button>
+          </div>
+          <div class="check-detail" id="catalog-detail-${check.id}"></div>
+        `;
+        groupEl.appendChild(item);
+      }
+
+      ui.tsResults.appendChild(groupEl);
+    }
+
+    ui.tsResults.addEventListener('click', handleCatalogClick);
+  }
+
+  async function runSingleCheck(catalogId: string): Promise<void> {
+    if (catalogRunning) return;
+    if (!ensureCatalogCanRun('This check')) return;
+    renderGuidedCheckAnalysis(null);
+    const resolved = resolveCatalogRunOptions([catalogId]);
+    if ('error' in resolved) {
+      term.writeError(resolved.error);
+      refreshCatalogRunButtons(false);
+      return;
+    }
+    await withCloudStatusPollingPaused(async () => {
+      await withConsoleTask('catalog-single-check', 'user', 'catalog check', async () => {
+        catalogRunning = true;
+        beginLatestAgentCheckRun();
+        refreshCatalogRunButtons(true);
+        activateResultsTab('checks');
+
+        const dot = document.getElementById(`catalog-dot-${catalogId}`);
+        const badge = document.getElementById(`catalog-badge-${catalogId}`);
+        resetCatalogRows([catalogId]);
+        if (dot) dot.className = 'check-status-dot running';
+        if (badge) setCatalogBadgeState(badge, 'running', '…', '');
+
+        term.writeSystem(`— Running check: ${getCatalogCheck(catalogId)?.name ?? catalogId} —`);
+
+        try {
+          const results = await troubleshooter.runRecommendedChecks(resolved.options);
+          setLatestAgentCheckResults(results);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          term.writeError(`Check failed: ${msg}`);
+          if (dot) dot.className = 'check-status-dot fail';
+          if (badge) setCatalogBadgeState(badge, 'fail', 'error', msg);
+        } finally {
+          catalogRunning = false;
+          refreshCatalogRunButtons(false);
+        }
+      });
+    });
+  }
+
+  async function runCheckGroup(groupId: string): Promise<void> {
+    if (catalogRunning) return;
+    if (!ensureCatalogCanRun('This check group')) return;
+    renderGuidedCheckAnalysis(null);
+    const checks = getCatalogGroupChecks(groupId);
+    if (checks.length === 0) return;
+    const resolved = resolveCatalogRunOptions(checks.map(c => c.id));
+    if ('error' in resolved) {
+      term.writeError(resolved.error);
+      refreshCatalogRunButtons(false);
+      return;
+    }
+    await withCloudStatusPollingPaused(async () => {
+      await withConsoleTask('catalog-group-checks', 'user', 'catalog check group', async () => {
+        catalogRunning = true;
+        beginLatestAgentCheckRun();
+        refreshCatalogRunButtons(true);
+        activateResultsTab('checks');
+
+        resetCatalogRows(checks.map((check) => check.id));
+        checks.forEach(check => {
+          const dot = document.getElementById(`catalog-dot-${check.id}`);
+          const badge = document.getElementById(`catalog-badge-${check.id}`);
+          if (dot) dot.className = 'check-status-dot running';
+          if (badge) setCatalogBadgeState(badge, 'running', '…', '');
+        });
+
+        const groupName = CATALOG_GROUPS.find(g => g.id === groupId)?.name ?? groupId;
+        term.writeSystem(`— Running group: ${groupName} —`);
+
+        try {
+          const results = await troubleshooter.runRecommendedChecks(resolved.options);
+          setLatestAgentCheckResults(results);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          term.writeError(`Group checks failed: ${msg}`);
+        } finally {
+          catalogRunning = false;
+          refreshCatalogRunButtons(false);
+        }
+      });
+    });
+  }
+
+  async function runAllChecks(): Promise<void> {
+    if (catalogRunning) return;
+    if (!ensureCatalogCanRun('All catalog checks')) return;
+    renderGuidedCheckAnalysis(null);
+    const resolved = resolveCatalogRunOptions(ALL_CATALOG_CHECK_IDS);
+    if ('error' in resolved) {
+      term.writeError(resolved.error);
+      refreshCatalogRunButtons(false);
+      return;
+    }
+    await withCloudStatusPollingPaused(async () => {
+      await withConsoleTask('catalog-all-checks', 'user', 'all catalog checks', async () => {
+        catalogRunning = true;
+        beginLatestAgentCheckRun();
+        refreshCatalogRunButtons(true);
+        activateResultsTab('checks');
+
+        resetCatalogRows(ALL_CATALOG_CHECK_IDS);
+        CATALOG_GROUPS.forEach(group => {
+          group.checks.forEach(check => {
+            const dot = document.getElementById(`catalog-dot-${check.id}`);
+            const badge = document.getElementById(`catalog-badge-${check.id}`);
+            if (dot) dot.className = 'check-status-dot running';
+            if (badge) setCatalogBadgeState(badge, 'running', '…', '');
+          });
+        });
+
+        term.writeSystem('— Running all catalog checks —');
+
+        try {
+          const results = await troubleshooter.runRecommendedChecks(resolved.options);
+          setLatestAgentCheckResults(results);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          term.writeError(`Check suite failed: ${msg}`);
+        } finally {
+          catalogRunning = false;
+          refreshCatalogRunButtons(false);
+          term.writeSystem('— All catalog checks complete —');
+        }
+      });
+    });
+  }
+
+  async function runFullBaseline(): Promise<void> {
+    if (catalogRunning) return;
+    if (!ensureCatalogCanRun('The full baseline')) return;
+    renderGuidedCheckAnalysis(null);
+    const cloud = getCloudById(ui.mistCloud.value);
+    if (!cloud) {
+      term.writeError('Select a Mist cloud region before running the full baseline.');
+      refreshCatalogRunButtons(false);
+      return;
+    }
+
+    await withCloudStatusPollingPaused(async () => {
+      await withConsoleTask('full-baseline', 'user', 'full baseline troubleshooting', async () => {
+        catalogRunning = true;
+        beginLatestAgentCheckRun();
+        refreshCatalogRunButtons(true);
+        activateResultsTab('checks');
+        resetCatalogRows(ALL_CATALOG_CHECK_IDS);
+
+        term.writeSystem('— Running full baseline troubleshooting workflow —');
+
+        try {
+          const results = await troubleshooter.runAll({
+            cloud,
+            uplinkPort: ui.tsUplinkPort.value.trim(),
+            siteId: deviceContext.matchResult?.mistDevice?.site_id || undefined,
+            deviceId: deviceContext.matchResult?.mistDevice?.id || undefined,
+            onProgress: handleProgressResult,
+          });
+          setLatestAgentCheckResults(results);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          term.writeError(`Full baseline failed: ${msg}`);
+        } finally {
+          catalogRunning = false;
+          refreshCatalogRunButtons(false);
+          term.writeSystem('— Full baseline complete —');
+        }
+      });
+    });
+  }
+
   function renderCheckResult(result: CheckResult, allResults?: CheckResult[]): HTMLElement {
     const el = document.createElement('div');
     el.className = `ts-check ${result.status}`;
@@ -1309,6 +2736,326 @@ function init(): void {
     }
 
     return el;
+  }
+
+  function renderActionResult(
+    title: string,
+    status: 'info' | 'success' | 'warn' | 'error',
+    summary: string,
+    bodyHtml = '',
+  ): void {
+    const statusLabel = {
+      info: 'Info',
+      success: 'Completed',
+      warn: 'Attention',
+      error: 'Error',
+    }[status];
+
+    ui.actionsContent.innerHTML = `
+      <div class="action-result-card">
+        <div class="action-result-header">
+          <span class="action-result-title">${escapeHtml(title)}</span>
+          <span class="action-result-pill ${status}">${statusLabel}</span>
+        </div>
+        <div class="action-result-summary">${summary}</div>
+        ${bodyHtml}
+      </div>
+    `;
+  }
+
+  function renderActionProgress(
+    title: string,
+    summary: string,
+    steps: DhcpRefreshStep[],
+  ): void {
+    const stepsHtml = steps.length > 0
+      ? `
+        <div class="action-steps">
+          <div class="action-steps-title">Current Steps</div>
+          <div class="action-steps-list">
+            ${steps.map((step) => `
+              <div class="action-step-item ${step.status}">
+                <span class="action-step-icon">${step.status === 'completed' ? '✓' : '…'}</span>
+                <span class="action-step-label">${escapeHtml(step.label)}</span>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `
+      : '';
+
+    renderActionResult(title, 'info', summary, stepsHtml);
+  }
+
+  function renderAgentCommandResult(
+    title: string,
+    summary: string,
+    command: string,
+    output: string,
+    status: 'info' | 'success' | 'warn' | 'error' = 'success',
+    note?: string,
+  ): void {
+    let bodyHtml = '<div class="action-steps">';
+    bodyHtml += '<div class="action-steps-title">Command</div>';
+    bodyHtml += `<pre class="check-modal-raw">${escapeHtml(command)}</pre>`;
+    bodyHtml += '</div>';
+    if (note) {
+      bodyHtml += `<div class="check-result-remediation">${escapeHtml(note)}</div>`;
+    }
+    bodyHtml += '<div class="action-steps">';
+    bodyHtml += '<div class="action-steps-title">Output</div>';
+    bodyHtml += `<pre class="check-modal-raw">${escapeHtml(output || '(no output)')}</pre>`;
+    bodyHtml += '</div>';
+    renderActionResult(title, status, summary, bodyHtml);
+  }
+
+  function sanitizeAgentLogFindText(value: string): string {
+    const trimmed = value.trim();
+    if (!trimmed) throw new Error('Missing log search text.');
+    if (/[\r\n]/.test(trimmed)) throw new Error('Log search text must be a single line.');
+    if (trimmed.length > 80) throw new Error('Log search text is too long.');
+    return trimmed.replace(/"/g, '\\"');
+  }
+
+  function escapeForShellDoubleQuotes(value: string): string {
+    return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$').replace(/`/g, '\\`');
+  }
+
+  function sanitizeAgentLogFile(value: string): string {
+    const trimmed = value.trim();
+    if (/^(?:mcd|jmd)(?:-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9.\-]+)?\.log(?:\.gz)?$/.test(trimmed)) return trimmed;
+    if (/^messages(?:\.[0-9]+)?(?:\.gz)?$/.test(trimmed)) return trimmed;
+    throw new Error('Unsupported log file. Use a current or rotated mcd, jmd, or messages log filename.');
+  }
+
+  function sanitizeAgentLogFamily(value: string): 'mcd' | 'jmd' | 'messages' {
+    const trimmed = value.trim();
+    if (trimmed === 'mcd' || trimmed === 'jmd' || trimmed === 'messages') return trimmed;
+    throw new Error('Unsupported log family. Use mcd, jmd, or messages.');
+  }
+
+  function sanitizeAgentLogLineCount(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return 20;
+    const rounded = Math.trunc(value);
+    return Math.max(1, Math.min(100, rounded));
+  }
+
+  async function fetchEffectiveConfigForAgent(): Promise<Record<string, unknown>> {
+    const command = 'show configuration | display set | display inheritance';
+    if (!ensureConsoleTaskAvailable('Effective config fetch', 'agent-effective-config')) {
+      throw new Error('Effective config fetch is not currently available.');
+    }
+
+    const actionResult = await withCloudStatusPollingPaused(async () => withConsoleTask(
+      'agent-effective-config',
+      'user',
+      'effective config fetch',
+      async () => {
+        activateResultsTab('actions');
+        renderActionResult('Effective Config', 'info', 'Fetching effective running config from the switch…');
+
+        const result = await cmdRunner.execute(command, 60000, 5000, { silent: true });
+        if (!result.success) {
+          const errorMessage = result.error || 'Command failed.';
+          renderAgentCommandResult('Effective Config', 'Failed to fetch effective config.', command, result.output, 'error', errorMessage);
+          throw new Error(errorMessage);
+        }
+
+        const lineCount = result.output ? result.output.split('\n').length : 0;
+        const summary = lineCount > 0
+          ? `Fetched effective config (${lineCount} line${lineCount === 1 ? '' : 's'}).`
+          : 'Fetched effective config.';
+        renderAgentCommandResult('Effective Config', summary, command, result.output);
+        term.writeSystem('— Agent fetched effective config —');
+        return {
+          command,
+          output: result.output,
+          lineCount,
+          fetchedAt: new Date().toISOString(),
+        };
+      },
+    ));
+    if (!actionResult) {
+      throw new Error('Effective config fetch did not start.');
+    }
+    return actionResult;
+  }
+
+  async function listLogFilesForAgent(family: string): Promise<Record<string, unknown>> {
+    const safeFamily = sanitizeAgentLogFamily(family);
+    const command = `/bin/sh -c "ls -1t /var/log/${safeFamily}* 2>/dev/null | sed 's#.*/##'"`;
+    if (!ensureConsoleTaskAvailable(`${safeFamily} log listing`, `agent-list-log-files-${safeFamily}`)) {
+      throw new Error(`${safeFamily} log listing is not currently available.`);
+    }
+
+    const actionResult = await withCloudStatusPollingPaused(async () => withConsoleTask(
+      `agent-list-log-files-${safeFamily}`,
+      'user',
+      `${safeFamily} log listing`,
+      async () => {
+        activateResultsTab('actions');
+        renderActionResult(
+          `${safeFamily} Log Files`,
+          'info',
+          `Listing available ${safeFamily} log files…`,
+        );
+
+        try {
+          await cmdRunner.ensureShellMode({ silent: true });
+        } catch (err) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          renderAgentCommandResult(`${safeFamily} Log Files`, `Failed to list ${safeFamily} log files.`, command, '', 'error', errorMessage);
+          throw new Error(errorMessage);
+        }
+
+        const result = await cmdRunner.execute(command, 30000, 3000, { silent: true });
+        await cmdRunner.ensureOperationalMode({ silent: true });
+
+        if (!result.success) {
+          const errorMessage = result.error || 'Command failed.';
+          renderAgentCommandResult(`${safeFamily} Log Files`, `Failed to list ${safeFamily} log files.`, command, result.output, 'error', errorMessage);
+          throw new Error(errorMessage);
+        }
+
+        const files = result.output
+          .split('\n')
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0)
+          .filter((line) => {
+            try {
+              return sanitizeAgentLogFile(line).length > 0;
+            } catch {
+              return false;
+            }
+          })
+          .map((file) => ({
+            name: file,
+            current: safeFamily === 'messages' ? file === 'messages' : file === `${safeFamily}.log`,
+            compressed: file.endsWith('.gz'),
+          }));
+
+        const summary = files.length > 0
+          ? `Found ${files.length} ${safeFamily} log file${files.length === 1 ? '' : 's'}.`
+          : `No ${safeFamily} log files found.`;
+        const body = files.length > 0
+          ? `<div class="action-steps"><div class="action-steps-title">Files</div><pre class="check-modal-raw">${escapeHtml(files.map((file) => file.name).join('\n'))}</pre></div>`
+          : '';
+        renderActionResult(`${safeFamily} Log Files`, files.length > 0 ? 'success' : 'warn', summary, body);
+        term.writeSystem(`— Agent listed ${safeFamily} log files —`);
+        return {
+          family: safeFamily,
+          files,
+          listedAt: new Date().toISOString(),
+        };
+      },
+    ));
+    if (!actionResult) {
+      throw new Error(`${safeFamily} log listing did not start.`);
+    }
+    return actionResult;
+  }
+
+  async function searchLogFileForAgent(logFile: string, findText?: string, requestedLineCount?: unknown): Promise<Record<string, unknown>> {
+    const safeLogFile = sanitizeAgentLogFile(logFile);
+    const trimmedFindText = (findText ?? '').trim();
+    const hasFindText = trimmedFindText.length > 0;
+    const safeFindText = hasFindText ? sanitizeAgentLogFindText(trimmedFindText) : '';
+    const lineWindow = sanitizeAgentLogLineCount(requestedLineCount);
+    const timeoutMs = safeLogFile === 'mcd.log' ? 90000 : 60000;
+    if (!ensureConsoleTaskAvailable(`${safeLogFile} search`, `agent-log-search-${safeLogFile}`)) {
+      throw new Error(`${safeLogFile} search is not currently available.`);
+    }
+
+    const actionResult = await withCloudStatusPollingPaused(async () => withConsoleTask(
+      `agent-log-search-${safeLogFile}`,
+      'user',
+      `${safeLogFile} search`,
+      async () => {
+        activateResultsTab('actions');
+        renderActionResult(
+          `${safeLogFile} Search`,
+          'info',
+          hasFindText
+            ? `Searching ${safeLogFile} for "${trimmedFindText}" and returning the next ${lineWindow} lines…`
+            : `Returning the last ${lineWindow} lines from ${safeLogFile}…`,
+        );
+        let executedCommand = '';
+        let output = '';
+        let matched = false;
+        let lineCount = 0;
+
+        try {
+          await cmdRunner.ensureShellMode({ silent: true });
+        } catch (err) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          renderAgentCommandResult(`${safeLogFile} Search`, `Failed to search ${safeLogFile}.`, hasFindText ? `show log ${safeLogFile} | find "${safeFindText}"` : `show log ${safeLogFile} | last ${lineWindow}`, '', 'error', errorMessage);
+          throw new Error(errorMessage);
+        }
+
+        if (hasFindText) {
+          const shellPattern = escapeForShellDoubleQuotes(trimmedFindText);
+          executedCommand = `zcat -f /var/log/${safeLogFile} | awk -v pat="${shellPattern}" -v limit=${lineWindow} 'BEGIN{found=0;count=0} { if (found==0 && index($0, pat)) found=1; if (found==1 && count < limit) { print; count++ } } END{ if (found==0) print "Pattern not found" }'; echo "__CODEX_LOG_SEARCH_DONE__"`;
+        } else {
+          executedCommand = `zcat -f /var/log/${safeLogFile} | tail -n ${lineWindow}`;
+        }
+
+        const shellResult = await cmdRunner.execute(executedCommand, timeoutMs, 3000, { silent: true });
+        await cmdRunner.ensureOperationalMode({ silent: true });
+
+        if (!shellResult.success) {
+          const errorMessage = shellResult.error || 'Command failed.';
+          renderAgentCommandResult(`${safeLogFile} Search`, `Failed to search ${safeLogFile}.`, executedCommand, shellResult.output, 'error', errorMessage);
+          throw new Error(errorMessage);
+        }
+
+        output = shellResult.output;
+        if (hasFindText) {
+          output = output
+            .split('\n')
+            .filter((line) => !line.includes('__CODEX_LOG_SEARCH_DONE__'))
+            .join('\n')
+            .trim();
+          matched = output.length > 0;
+        } else {
+          matched = output.trim().length > 0;
+        }
+        lineCount = output
+          ? output
+              .split('\n')
+              .map((line) => line.trimEnd())
+              .filter((line) => line.trim().length > 0).length
+          : 0;
+
+        const summary = hasFindText
+          ? matched
+            ? `Found the first match in ${safeLogFile} and returned ${lineCount} line${lineCount === 1 ? '' : 's'} from that point.`
+            : `No matching lines found in ${safeLogFile}.`
+          : lineCount > 0
+            ? `Returned the last ${lineCount} line${lineCount === 1 ? '' : 's'} from ${safeLogFile}.`
+            : `No recent lines were returned from ${safeLogFile}.`;
+        renderAgentCommandResult(`${safeLogFile} Search`, summary, executedCommand, output, matched ? 'success' : 'warn');
+        term.writeSystem(
+          hasFindText
+            ? `— Agent searched ${safeLogFile} for "${trimmedFindText}" —`
+            : `— Agent fetched the last ${lineWindow} lines from ${safeLogFile} —`,
+        );
+        return {
+          command: executedCommand,
+          logFile: safeLogFile,
+          findText: hasFindText ? trimmedFindText : null,
+          requestedLineCount: lineWindow,
+          output,
+          lineCount,
+          matched,
+          mode: hasFindText ? 'window-from-match' : 'tail',
+          searchedAt: new Date().toISOString(),
+        };
+      },
+    ));
+    if (!actionResult) {
+      throw new Error(`${safeLogFile} search did not start.`);
+    }
+    return actionResult;
   }
 
   /** Show a floating modal with check details, remediation, run fix, and raw output */
@@ -1673,318 +3420,101 @@ function init(): void {
     return el;
   }
 
-  /**
-   * Create a results container with a live-updating summary header.
-   * Returns helpers to add results and finalise.
-   */
-  function createResultsContainer(title: string): {
-    container: HTMLElement;
-    addResult: (result: CheckResult) => void;
-    finalise: (results: CheckResult[]) => void;
-    allResults: CheckResult[];
-  } {
-    const allResults: CheckResult[] = [];
 
-    // Summary bar at the top
-    const summaryEl = document.createElement('div');
-    summaryEl.className = 'ts-results-summary-header';
-    summaryEl.innerHTML = `<span class="ts-results-title">${title}</span><span class="ts-results-running">Running…</span>`;
-
-    // Consolidated log box — all result lines in one place
-    const logBox = document.createElement('pre');
-    logBox.className = 'ts-results-log-box';
-    logBox.style.cursor = 'pointer';
-    logBox.title = 'Click to expand';
-
-    logBox.addEventListener('click', () => {
-      // Build all result lines for the modal
-      const lines = allResults.map((r) =>
-        `[${statusIcon(r.status)}] ${r.name}: ${r.detail}`
-      );
-
-      const summaryResult: CheckResult = {
-        id: 'summary-log',
-        name: title,
-        status: 'info',
-        detail: `${allResults.length} checks completed`,
-        raw: lines.join('\n'),
-      };
-
-      showCheckModal(summaryResult);
-    });
-
-    // Individual results container (clickable items with detail modals)
-    const resultsEl = document.createElement('div');
-    resultsEl.className = 'ts-results-list';
-
-    // Wrapper
-    const container = document.createElement('div');
-    container.className = 'ts-results-container';
-    container.appendChild(summaryEl);
-    container.appendChild(logBox);
-    container.appendChild(resultsEl);
-
-    const updateSummary = () => {
-      const counts = { pass: 0, fail: 0, warn: 0, skip: 0, info: 0 };
-      allResults.forEach((r) => {
-        if (r.status in counts) counts[r.status as keyof typeof counts]++;
-      });
-      summaryEl.innerHTML = `
-        <span class="ts-results-title">${title}</span>
-        <span class="ts-summary-pass">✓${counts.pass}</span>
-        <span class="ts-summary-fail">✗${counts.fail}</span>
-        <span class="ts-summary-warn">⚠${counts.warn}</span>
-        <span class="ts-summary-skip">—${counts.skip}</span>
-      `;
-    };
-
-    const addResult = (result: CheckResult) => {
-      allResults.push(result);
-
-      // Add to the consolidated log box
-      const line = document.createElement('div');
-      line.className = `ts-log-line ${result.status}`;
-      line.textContent = `[${statusIcon(result.status)}] ${result.name}: ${result.detail}`;
-      logBox.appendChild(line);
-      logBox.scrollTop = logBox.scrollHeight;
-
-      // Add to the clickable results list
-      const existing = document.getElementById(`ts-check-${result.id}`);
-      const rendered = renderCheckResult(result, allResults);
-      if (existing) {
-        existing.replaceWith(rendered);
-      } else {
-        resultsEl.appendChild(rendered);
-      }
-      updateSummary();
-    };
-
-    const finalise = (results: CheckResult[]) => {
-      const counts = { pass: 0, fail: 0, warn: 0, skip: 0, info: 0 };
-      results.forEach((r) => {
-        if (r.status in counts) counts[r.status as keyof typeof counts]++;
-      });
-      const total = results.length;
-      summaryEl.innerHTML = `
-        <span class="ts-results-title">${title} — ${total} checks</span>
-        <span class="ts-summary-pass">✓${counts.pass}</span>
-        <span class="ts-summary-fail">✗${counts.fail}</span>
-        <span class="ts-summary-warn">⚠${counts.warn}</span>
-        <span class="ts-summary-skip">—${counts.skip}</span>
-      `;
-      if (counts.fail === 0 && counts.warn === 0) {
-        summaryEl.classList.add('all-pass');
-      } else if (counts.fail > 0) {
-        summaryEl.classList.add('has-fail');
-      }
-    };
-
-    return { container, addResult, finalise, allResults };
-  }
-
-  // ---- Troubleshoot: Run ----
-  async function runTroubleshoot(): Promise<void> {
-    await withCloudStatusPollingPaused(async () => {
-      const cloudId = ui.mistCloud.value;
-      const cloud = getCloudById(cloudId);
-      if (!cloud) {
-        term.writeError('Please select a Mist cloud region.');
-        return;
-      }
-
-      const siteId = ui.mistSite.value;
-      const uplinkPort = ui.tsUplinkPort.value.trim();
-
-      activateResultsTab('checks');
-      ui.tsResults.innerHTML = '';
-      ui.btnRunTroubleshoot.disabled = true;
-
-      const rc = createResultsContainer('Cloud Connectivity Check');
-      ui.tsResults.appendChild(rc.container);
-
-      term.writeSystem('— Starting cloud connectivity check —');
-
-      // Attempt login via Mist API root password
-      if (siteId && mistApi.isConfigured) {
-        term.writeSystem('Fetching root password from Mist API…');
-        const rootPw = await mistApi.getRootPassword(siteId);
-        if (rootPw) {
-          term.writeSystem('Root password retrieved. Attempting login…');
-          const loginResult = await cmdRunner.login('root', rootPw);
-          if (loginResult.success) {
-            term.writeSystem('Login successful.');
-          } else {
-            term.writeError(`Login failed: ${loginResult.error}. You may need to log in manually.`);
-          }
-        } else {
-          term.writeSystem('Root password not available from API. Assuming already logged in.');
-        }
-      } else {
-        term.writeSystem('Mist API not configured or no site selected. Assuming already logged in.');
-      }
-
-      // Run checks
-      accumulatedResults = [];
-
-      const results = await troubleshooter.runAll({
-        cloud,
-        uplinkPort,
-        siteId: siteId || undefined,
-        deviceId: deviceContext.matchResult?.mistDevice?.id || undefined,
-        onProgress: (result: CheckResult) => {
-          accumulatedResults.push(result);
-          rc.addResult(result);
-          term.writeSystem(`  [${statusIcon(result.status)}] ${result.name}: ${result.detail}`);
-        },
-      });
-
-      rc.finalise(results);
-      term.writeSystem('— Cloud connectivity check complete —');
-      ui.btnRunTroubleshoot.disabled = false;
-    });
-  }
 
   async function runRecommendedChecksFromJma(): Promise<void> {
     const recommendation = getJmaRecommendation(latestJmaCode);
     if (!recommendation) return;
+    if (!ensureCatalogCanRun('Recommended checks')) return;
 
     await withCloudStatusPollingPaused(async () => {
-      const cloudId = ui.mistCloud.value;
-      const cloud = getCloudById(cloudId);
-      if (!cloud) {
-        term.writeError('Please select a Mist cloud region.');
-        return;
-      }
+      await withConsoleTask('jma-recommended-checks', 'user', 'recommended checks', async () => {
+        const cloudId = ui.mistCloud.value;
+        const cloud = getCloudById(cloudId);
+        if (!cloud) {
+          term.writeError('Please select a Mist cloud region.');
+          return;
+        }
 
-      activateResultsTab('checks');
-      ui.tsResults.innerHTML = '';
+        activateResultsTab('checks');
+        catalogRunning = true;
+        beginLatestAgentCheckRun();
+        refreshCatalogRunButtons(true);
 
-      const title = `Recommended Checks — ${recommendation.title}`;
-      const rc = createResultsContainer(title);
-      ui.tsResults.appendChild(rc.container);
+        term.writeSystem(`— Running recommended checks for JMA ${recommendation.code} ${recommendation.label} —`);
 
-      ui.btnRunTroubleshoot.disabled = true;
-      ui.btnMistStatus.disabled = true;
-      ui.btnSslCheck.disabled = true;
+        try {
+          const results = await troubleshooter.runRecommendedChecks({
+            cloud,
+            uplinkPort: ui.tsUplinkPort.value.trim(),
+            siteId: deviceContext.matchResult?.mistDevice?.site_id || undefined,
+            deviceId: deviceContext.matchResult?.mistDevice?.id || undefined,
+            checkIds: recommendation.checks.map((check) => check.id),
+            onProgress: handleProgressResult,
+          });
+          setLatestAgentCheckResults(results);
+          renderGuidedCheckAnalysis(buildGuidedAnalysisForJma(recommendation.code, results));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          term.writeError(`Recommended checks failed: ${msg}`);
+        } finally {
+          catalogRunning = false;
+          updateConfigSyncUIState();
+          refreshCatalogRunButtons(false);
+        }
 
-      term.writeSystem(`— Running recommended checks for JMA ${recommendation.code} ${recommendation.label} —`);
-
-      accumulatedResults = [];
-
-      try {
-        const results = await troubleshooter.runRecommendedChecks({
-          cloud,
-          uplinkPort: ui.tsUplinkPort.value.trim(),
-          siteId: deviceContext.matchResult?.mistDevice?.site_id || undefined,
-          deviceId: deviceContext.matchResult?.mistDevice?.id || undefined,
-          checkIds: recommendation.checks.map((check) => check.id),
-          onProgress: (result: CheckResult) => {
-            accumulatedResults.push(result);
-            rc.addResult(result);
-            term.writeSystem(`  [${statusIcon(result.status)}] ${result.name}: ${result.detail}`);
-          },
-        });
-
-        rc.finalise(results);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ui.tsResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
-        term.writeError(`Recommended checks failed: ${msg}`);
-      } finally {
-        updateConfigSyncUIState();
-      }
-
-      term.writeSystem('— Recommended checks complete —');
-    });
-  }
-
-  // ---- Mist Status (standalone) ----
-  async function runMistStatus(): Promise<void> {
-    await withCloudStatusPollingPaused(async () => {
-      activateResultsTab('checks');
-      ui.tsResults.innerHTML = '';
-      ui.btnMistStatus.disabled = true;
-
-      const rc = createResultsContainer('Mist Cloud Status');
-      ui.tsResults.appendChild(rc.container);
-
-      term.writeSystem('— Checking Mist cloud status —');
-
-      const results = await troubleshooter.checkMistCloudStatus(
-        null, null,
-        ui.mistSite.value || undefined,
-        deviceContext.matchResult?.mistDevice?.id || undefined,
-      );
-      for (const result of results) {
-        rc.addResult(result);
-        term.writeSystem(`  [${statusIcon(result.status)}] ${result.name}: ${result.detail}`);
-      }
-
-      rc.finalise(results);
-      term.writeSystem('— Mist status check complete —');
-      ui.btnMistStatus.disabled = false;
-    });
-  }
-
-  // ---- Firewall Policy Check (standalone) ----
-  async function runSslCheck(): Promise<void> {
-    await withCloudStatusPollingPaused(async () => {
-      const cloudId = ui.mistCloud.value;
-      const cloud = getCloudById(cloudId);
-      if (!cloud) {
-        ui.tsResults.innerHTML = '<div class="status-text error">Select a Mist cloud region first.</div>';
-        return;
-      }
-
-      activateResultsTab('checks');
-      ui.tsResults.innerHTML = '';
-      ui.btnSslCheck.disabled = true;
-
-      const rc = createResultsContainer('Firewall Policy Check');
-      ui.tsResults.appendChild(rc.container);
-
-      term.writeSystem('— Running firewall policy check —');
-
-      const results = await troubleshooter.checkFirewallPolicy(cloud);
-      for (const result of results) {
-        rc.addResult(result);
-        term.writeSystem(`  [${statusIcon(result.status)}] ${result.name}: ${result.detail}`);
-      }
-
-      rc.finalise(results);
-      term.writeSystem('— Firewall policy check complete —');
-      ui.btnSslCheck.disabled = false;
+        term.writeSystem('— Recommended checks complete —');
+      });
     });
   }
 
   // ---- DHCP Refresh ----
   async function runDhcpRefresh(): Promise<void> {
+    if (!ensureConsoleTaskAvailable('DHCP refresh', 'dhcp-refresh')) return;
     await withCloudStatusPollingPaused(async () => {
-      ui.tsResults.innerHTML = '';
-      ui.btnDhcpRefresh.disabled = true;
+      await withConsoleTask('dhcp-refresh', 'user', 'DHCP refresh', async () => {
+        activateResultsTab('actions');
+        const steps: DhcpRefreshStep[] = [];
+        renderActionProgress('DHCP Refresh', 'Refreshing DHCP leases and comparing before/after bindings…', steps);
+        ui.btnDhcpRefresh.disabled = true;
 
-      term.writeSystem('— Starting DHCP refresh (disable → commit → rollback → commit) —');
+        term.writeSystem('— Starting DHCP refresh (disable → commit → rollback → commit) —');
 
-      let result: DhcpRefreshResult;
-      try {
-        result = await dhcpRefresh.refresh();
-      } catch (err) {
-        ui.tsResults.innerHTML = `<div class="check-result-item check-status-fail"><span class="check-result-name">DHCP Refresh</span><span class="check-result-detail">${err instanceof Error ? err.message : String(err)}</span></div>`;
-        // Switch to Checks pane so the error is visible
-        activateResultsTab('checks');
+        let result: DhcpRefreshResult;
+        try {
+          result = await dhcpRefresh.refresh((step) => {
+            const existingIndex = steps.findIndex((entry) => entry.key === step.key);
+            if (existingIndex >= 0) {
+              steps[existingIndex] = step;
+            } else {
+              steps.push(step);
+            }
+            renderActionProgress('DHCP Refresh', 'Refreshing DHCP leases and comparing before/after bindings…', steps);
+          });
+        } catch (err) {
+          renderActionResult(
+            'DHCP Refresh',
+            'error',
+            err instanceof Error ? err.message : String(err),
+          );
+          ui.btnDhcpRefresh.disabled = false;
+          return;
+        }
+
+        const summary = result.errors.length > 0
+          ? `completed with errors: ${result.errors[0]}`
+          : `completed — ${result.changes.filter((c) => c.outcome === 'renewed' || c.outcome === 'acquired').length}/${result.targetInterfaces.length} interface(s) refreshed`;
+        const status: 'success' | 'warn' | 'error' =
+          result.errors.length > 0 ? 'warn' : 'success';
+        renderActionResult(
+          'DHCP Refresh',
+          status,
+          summary,
+          renderDhcpRefreshResult(result),
+        );
+        term.writeSystem(`— DHCP refresh ${summary} —`);
         ui.btnDhcpRefresh.disabled = false;
-        return;
-      }
-
-      ui.tsResults.innerHTML = renderDhcpRefreshResult(result);
-      // Switch to Checks pane *after* results are rendered so the tab
-      // highlights at the moment the user can actually see the content.
-      activateResultsTab('checks');
-      const summary = result.errors.length > 0
-        ? `completed with errors: ${result.errors[0]}`
-        : `completed — ${result.changes.filter((c) => c.outcome === 'renewed' || c.outcome === 'acquired').length}/${result.targetInterfaces.length} interface(s) refreshed`;
-      term.writeSystem(`— DHCP refresh ${summary} —`);
-      ui.btnDhcpRefresh.disabled = false;
+      });
     });
   }
 
@@ -2012,7 +3542,7 @@ function init(): void {
 
     // Per-interface comparison table
     html += '<table class="dhcp-refresh-table">';
-    html += '<thead><tr><th>Interface</th><th>Before</th><th>After</th><th>Result</th></tr></thead>';
+    html += '<thead><tr><th>Interface</th><th>Before</th><th>After</th><th class="dhcp-result-col">Result</th></tr></thead>';
     html += '<tbody>';
 
     for (const change of result.changes) {
@@ -2023,20 +3553,28 @@ function init(): void {
       const afterState = change.after?.state ?? '—';
       const beforeLease = change.before?.leaseStart ? formatDhcpTime(change.before.leaseStart) : '—';
       const afterLease = change.after?.leaseStart ? formatDhcpTime(change.after.leaseStart) : '—';
+      const beforeDns = formatDhcpDnsServers(change.before?.dnsServers ?? []);
+      const afterDns = formatDhcpDnsServers(change.after?.dnsServers ?? []);
 
       html += `<tr>
         <td class="dhcp-iface"><code>${change.interface}</code></td>
-        <td class="dhcp-binding-cell">
-          <span class="dhcp-ip">${beforeIp}</span>
-          <span class="dhcp-state ${beforeState.toLowerCase()}">${beforeState}</span>
-          ${change.before?.leaseStart ? `<span class="dhcp-lease-time">lease ${beforeLease}</span>` : ''}
+        <td>
+          <div class="dhcp-binding-cell">
+            <span class="dhcp-ip">${beforeIp}</span>
+            <span class="dhcp-state ${beforeState.toLowerCase()}">${beforeState}</span>
+            ${change.before?.leaseStart ? `<span class="dhcp-lease-time">lease ${beforeLease}</span>` : ''}
+            <span class="dhcp-dns">DNS ${beforeDns}</span>
+          </div>
         </td>
-        <td class="dhcp-binding-cell">
-          <span class="dhcp-ip">${afterIp}</span>
-          <span class="dhcp-state ${afterState.toLowerCase()}">${afterState}</span>
-          ${change.after?.leaseStart ? `<span class="dhcp-lease-time">lease ${afterLease}</span>` : ''}
+        <td>
+          <div class="dhcp-binding-cell">
+            <span class="dhcp-ip">${afterIp}</span>
+            <span class="dhcp-state ${afterState.toLowerCase()}">${afterState}</span>
+            ${change.after?.leaseStart ? `<span class="dhcp-lease-time">lease ${afterLease}</span>` : ''}
+            <span class="dhcp-dns">DNS ${afterDns}</span>
+          </div>
         </td>
-        <td><span class="dhcp-outcome dhcp-outcome-${oc.status}">${oc.label}</span></td>
+        <td class="dhcp-result-cell"><span class="dhcp-outcome dhcp-outcome-${oc.status}">${oc.label}</span></td>
       </tr>`;
     }
 
@@ -2051,6 +3589,128 @@ function init(): void {
     return html;
   }
 
+  function formatMistAgentProcessState(state: MistAgentProcessState): string {
+    return state.detail;
+  }
+
+  function classifyMistAgentRestartOutcome(result: MistAgentRestartResult): { label: string; status: 'pass' | 'warn' | 'fail' | 'info' } {
+    const beforeHealthy = result.before.hasMcd && result.before.hasJmd;
+    const afterHealthy = result.after.hasMcd && result.after.hasJmd;
+
+    if (afterHealthy && !beforeHealthy) {
+      return { label: 'Recovered', status: 'pass' };
+    }
+    if (afterHealthy && beforeHealthy) {
+      return { label: 'Restarted', status: 'pass' };
+    }
+    if (result.after.hasMcd && !result.after.hasJmd) {
+      return { label: 'Partial', status: 'warn' };
+    }
+    if (result.restartAccepted) {
+      return { label: 'No change', status: 'warn' };
+    }
+    return { label: 'Failed', status: 'fail' };
+  }
+
+  function renderMistAgentRestartResult(result: MistAgentRestartResult): string {
+    const outcome = classifyMistAgentRestartOutcome(result);
+    let html = '<div class="dhcp-refresh-result">';
+    html += '<table class="dhcp-refresh-table">';
+    html += '<thead><tr><th>Before</th><th>After</th><th class="dhcp-result-col">Result</th></tr></thead>';
+    html += '<tbody>';
+    html += `<tr>
+      <td><div class="dhcp-binding-cell">${escapeHtml(formatMistAgentProcessState(result.before))}</div></td>
+      <td><div class="dhcp-binding-cell">${escapeHtml(formatMistAgentProcessState(result.after))}</div></td>
+      <td class="dhcp-result-cell"><span class="dhcp-outcome dhcp-outcome-${outcome.status}">${outcome.label}</span></td>
+    </tr>`;
+    html += '</tbody></table>';
+    html += '<div class="action-steps">';
+    html += '<div class="action-steps-title">Restart Command</div>';
+    html += `<pre class="check-modal-raw">${escapeHtml(result.restartCommand)}</pre>`;
+    html += '</div>';
+    html += '<div class="action-steps">';
+    html += '<div class="action-steps-title">Restart Output</div>';
+    html += `<pre class="check-modal-raw">${escapeHtml(result.restartOutput || '(no output)')}</pre>`;
+    html += '</div>';
+    for (const err of result.errors) {
+      html += `<div class="check-result-remediation">${escapeHtml(err)}</div>`;
+    }
+    html += '</div>';
+    return html;
+  }
+
+  async function runMistAgentRestart(): Promise<void> {
+    if (!ensureConsoleTaskAvailable('Restart Mist Agent', 'mist-agent-restart')) return;
+    await withCloudStatusPollingPaused(async () => {
+      await withConsoleTask('mist-agent-restart', 'user', 'Mist agent restart', async () => {
+        activateResultsTab('actions');
+        ui.btnRestartMistAgent.disabled = true;
+        try {
+          const steps: MistAgentRestartStep[] = [];
+          const renderProgress = () => renderActionProgress(
+            'Restart Mist Agent',
+            'Checking Mist agent state, restarting mcd, and verifying process state…',
+            steps.map((step) => ({
+              key: step.key as DhcpRefreshStep['key'],
+              label: step.label,
+              status: step.status,
+            })),
+          );
+          renderProgress();
+
+          term.writeSystem('— Restarting Mist agent daemon (mcd) —');
+
+          let result: MistAgentRestartResult;
+          try {
+            result = await mistAgentRestart.restart((step) => {
+              const existingIndex = steps.findIndex((entry) => entry.key === step.key);
+              if (existingIndex >= 0) {
+                steps[existingIndex] = step;
+              } else {
+                steps.push(step);
+              }
+              renderProgress();
+            });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            renderActionResult(
+              'Restart Mist Agent',
+              'error',
+              'Mist agent restart failed.',
+              `<div class="check-result-remediation">${escapeHtml(message)}</div>`,
+            );
+            term.writeError(`Mist agent restart failed: ${message}`);
+            return;
+          }
+
+          const summary = result.errors.length === 0
+            ? 'completed — mcd is running after restart'
+            : `completed with warnings: ${result.errors[0]}`;
+          const status: 'success' | 'warn' | 'error' =
+            result.errors.length === 0 ? 'success' : (result.restartAccepted ? 'warn' : 'error');
+          renderActionResult(
+            'Restart Mist Agent',
+            status,
+            summary,
+            renderMistAgentRestartResult(result),
+          );
+
+          if (result.errors.length > 0) {
+            term.writeError(`Mist agent restart ${summary}`);
+          } else {
+            term.writeSystem(`— Mist agent restart ${summary} —`);
+          }
+
+          if (serial.isConnected && isOperationalPromptVisible() && !configSync.hasStagedCandidate()) {
+            await cloudStatus.refresh(deviceContext.matchResult, serial.isConnected);
+          }
+        } finally {
+          ui.btnRestartMistAgent.disabled = !serial.isConnected || configSync.hasStagedCandidate();
+        }
+      });
+    });
+  }
+
   function formatDhcpTime(utcString: string): string {
     // Input: "2026-04-18 11:17:13 UTC" — convert to browser local timezone
     // Normalise to an ISO-8601 string the Date constructor understands
@@ -2063,6 +3723,11 @@ function init(): void {
       second: '2-digit',
       timeZoneName: 'short',
     }).format(date);
+  }
+
+  function formatDhcpDnsServers(servers: string[]): string {
+    if (servers.length === 0) return '—';
+    return servers.join(', ');
   }
 
   // ---- Login to Switch ----
@@ -2218,174 +3883,203 @@ function init(): void {
     if (localIdentifyPromise) {
       await localIdentifyPromise;
     }
+    if (!ensureConsoleTaskAvailable('Switch identification', 'identify-switch')) return;
     await withCloudStatusPollingPaused(async () => {
-      ui.btnIdentify.disabled = true;
-      ui.deviceIdentity.innerHTML = '';
-      term.writeSystem('— Identifying connected switch —');
-      await deviceContext.runIdentify({ silent: false });
-      ui.btnIdentify.disabled = false;
-      term.writeSystem('— Identification complete —');
+      await withConsoleTask('identify-switch', 'user', 'switch identification', async () => {
+        ui.btnIdentify.disabled = true;
+        ui.deviceIdentity.innerHTML = '';
+        term.writeSystem('— Identifying connected switch —');
+        await deviceContext.runIdentify({ silent: false });
+        ui.btnIdentify.disabled = false;
+        term.writeSystem('— Identification complete —');
+      });
     });
   }
 
   // ---- Config Sync Preview ----
   async function previewConfigSync(): Promise<void> {
+    if (!ensureConsoleTaskAvailable('Config sync', 'config-sync-preview')) return;
     await withCloudStatusPollingPaused(async () => {
-      const matchResult = deviceContext.matchResult;
-      if (!matchResult?.mistDevice?.site_id || !matchResult.mistDevice.id) {
-        ui.configSyncResults.innerHTML =
-          '<div class="status-text error">Identify the switch first and ensure it is found in Mist with a site assignment.</div>';
-        return;
-      }
+      await withConsoleTask('config-sync-preview', 'exclusive', 'config sync preview', async () => {
+        const matchResult = deviceContext.matchResult;
+        if (!matchResult?.mistDevice?.site_id || !matchResult.mistDevice.id) {
+          ui.configSyncResults.innerHTML =
+            '<div class="status-text error">Identify the switch first and ensure it is found in Mist with a site assignment.</div>';
+          return;
+        }
 
-      ui.btnConfigSyncPreview.disabled = true;
-      activateResultsTab('config-sync');
-      ui.configSyncResults.innerHTML = '<div class="status-text info">Fetching Mist intended config…</div>';
+        ui.btnConfigSyncPreview.disabled = true;
+        activateResultsTab('config-sync');
+        ui.configSyncResults.innerHTML = '<div class="status-text info">Fetching Mist intended config…</div>';
 
-      const siteId = matchResult.mistDevice.site_id;
-      const deviceId = matchResult.mistDevice.id;
+        const siteId = matchResult.mistDevice.site_id;
+        const deviceId = matchResult.mistDevice.id;
 
-      term.writeSystem('— Starting config sync preview —');
+        term.writeSystem('— Starting config sync —');
 
-      try {
-        const result = await configSync.previewSync(siteId, deviceId);
+        try {
+          const result = await configSync.previewSync(siteId, deviceId);
 
-        term.writeSystem(
-          `  Candidate: ${result.candidateCommandCount} commands ` +
-          `(${result.cleanupCommandCount} cleanup + ${result.mistCliCommandCount} from Mist intent)`,
-        );
+          let html = '';
 
-        let html = '';
+          // Candidate summary
+          html += '<div class="config-sync-section-title">Config to Apply</div>';
+          html += `<div class="config-sync-summary">` +
+            `${result.candidateCommandCount} total commands — ` +
+            `${result.cleanupCommandCount} cleanup deletes + ` +
+            `${result.mistCliCommandCount} from Mist intent` +
+            `</div>`;
 
-        // Candidate summary
-        html += '<div class="config-sync-section-title">Config to Apply</div>';
-        html += `<div class="config-sync-summary">` +
-          `${result.candidateCommandCount} total commands — ` +
-          `${result.cleanupCommandCount} cleanup deletes + ` +
-          `${result.mistCliCommandCount} from Mist intent` +
-          `</div>`;
+          // Classify staging issues: warnings vs errors
+          const stagingWarnings = result.stagingErrors.filter(isConfigSyncStagingWarning);
+          const stagingErrors = result.stagingErrors.filter((e) => !isConfigSyncStagingWarning(e));
 
-        // Classify staging issues: warnings vs errors
-        const stagingWarnings = result.stagingErrors.filter(isConfigSyncStagingWarning);
-        const stagingErrors = result.stagingErrors.filter((e) => !isConfigSyncStagingWarning(e));
+          if (stagingWarnings.length > 0) {
+            html += `<div class="config-sync-section-title">Load Warnings (${stagingWarnings.length})</div>`;
+            for (const w of stagingWarnings) {
+              html +=
+                `<div class="config-sync-warning">` +
+                `<span class="config-sync-warning-cmd">${escapeHtml(w.command)}</span>` +
+                `<span class="config-sync-warning-msg">${escapeHtml(w.error)}</span>` +
+                `</div>`;
+            }
+          }
 
-        if (stagingWarnings.length > 0) {
-          html += `<div class="config-sync-section-title">Load Warnings (${stagingWarnings.length})</div>`;
-          for (const w of stagingWarnings) {
+          if (stagingErrors.length > 0) {
+            html += `<div class="config-sync-section-title">Load Errors (${stagingErrors.length})</div>`;
+            for (const err of stagingErrors) {
+              html +=
+                `<div class="config-sync-error">` +
+                `<span class="config-sync-error-cmd">${escapeHtml(err.command)}</span>` +
+                `<span class="config-sync-error-msg">${escapeHtml(err.error)}</span>` +
+                `</div>`;
+            }
+          }
+
+          // Compare diff (shown in the live console; bottom panel keeps the summary)
+          const checkLabel = result.commitCheckPassed
+            ? '<span class="config-sync-check-status pass">✓ Passed</span>'
+            : '<span class="config-sync-check-status fail">✗ Failed</span>';
+          if (result.compareOutput.trim()) {
             html +=
-              `<div class="config-sync-warning">` +
-              `<span class="config-sync-warning-cmd">${escapeHtml(w.command)}</span>` +
-              `<span class="config-sync-warning-msg">${escapeHtml(w.error)}</span>` +
-              `</div>`;
+              '<div class="config-sync-section-title">Diff Review</div>' +
+              '<div class="config-sync-summary">Review the highlighted <code>show | compare</code> output in the main console above.</div>';
+          } else {
+            html +=
+              '<div class="config-sync-section-title">Diff Review</div>' +
+              '<div class="config-sync-summary">No changes detected — config is already aligned with Mist intent.</div>';
+          }
+
+          // Commit check (plain — output is already plain text, not a diff)
+          html += `<div class="config-sync-section-title">Pre-commit Validation ${checkLabel}</div>`;
+          if (result.commitCheckOutput.trim()) {
+            html += `<pre class="config-sync-pre">${escapeHtml(result.commitCheckOutput)}</pre>`;
+          }
+
+          if (result.staged) {
+            // Candidate is staged — show decision prompt, enable action buttons
+            html +=
+              '<div class="config-sync-section-title" style="margin-top:12px;">Decision Required</div>' +
+              '<div class="config-sync-summary">Candidate config is staged on the switch. ' +
+              'Review the diff above, then choose an action in the panel below.</div>';
+          } else {
+            // Preview failed to stage (exception was thrown and caught cleanly)
+            html +=
+              '<div class="config-sync-error" style="margin-top:8px;">⚠ Staging did not complete — candidate was not left on the switch.</div>';
+          }
+
+          ui.configSyncResults.innerHTML = html;
+          ui.configSyncResults.scrollTop = 0;
+          updateConfigSyncUIState();
+          await waitForUiPaint();
+
+          term.writeSystem(
+            `  Candidate: ${result.candidateCommandCount} commands ` +
+            `(${result.cleanupCommandCount} cleanup + ${result.mistCliCommandCount} from Mist intent)`,
+          );
+
+          for (const w of stagingWarnings) {
             term.writeSystem(`  Staging warning: ${w.command} — ${w.error}`);
           }
-        }
 
-        if (stagingErrors.length > 0) {
-          html += `<div class="config-sync-section-title">Load Errors (${stagingErrors.length})</div>`;
           for (const err of stagingErrors) {
-            html +=
-              `<div class="config-sync-error">` +
-              `<span class="config-sync-error-cmd">${escapeHtml(err.command)}</span>` +
-              `<span class="config-sync-error-msg">${escapeHtml(err.error)}</span>` +
-              `</div>`;
             term.writeError(`  Staging error: ${err.command} — ${err.error}`);
           }
-        }
 
-        // Compare diff (shown in the live console; bottom panel keeps the summary)
-        const checkLabel = result.commitCheckPassed
-          ? '<span class="config-sync-check-status pass">✓ Passed</span>'
-          : '<span class="config-sync-check-status fail">✗ Failed</span>';
-        if (result.compareOutput.trim()) {
-          html +=
-            '<div class="config-sync-section-title">Diff Review</div>' +
-            '<div class="config-sync-summary">Review the highlighted <code>show | compare</code> output in the main console above.</div>';
-          // Mirror the diff to the live terminal with ANSI colours
-          term.writeSystem('  ── Diff (show | compare) ──');
-          term.writeJunosHighlighted(result.compareOutput);
-        } else {
-          html +=
-            '<div class="config-sync-section-title">Diff Review</div>' +
-            '<div class="config-sync-summary">No changes detected — config is already aligned with Mist intent.</div>';
-          term.writeSystem('  No diff detected — config already aligned with Mist intent.');
-        }
+          if (result.compareOutput.trim()) {
+            term.writeSystem('  ── Diff (show | compare) ──');
+            term.writeJunosHighlighted(result.compareOutput);
+          } else {
+            term.writeSystem('  No diff detected — config already aligned with Mist intent.');
+          }
 
-        // Commit check (plain — output is already plain text, not a diff)
-        html += `<div class="config-sync-section-title">Pre-commit Validation ${checkLabel}</div>`;
-        if (result.commitCheckOutput.trim()) {
-          html += `<pre class="config-sync-pre">${escapeHtml(result.commitCheckOutput)}</pre>`;
-        }
-        term.writeSystem(`  Commit check: ${result.commitCheckPassed ? 'passed' : 'FAILED'}`);
+          term.writeSystem(`  Commit check: ${result.commitCheckPassed ? 'passed' : 'FAILED'}`);
 
-        if (result.staged) {
-          // Candidate is staged — show decision prompt, enable action buttons
-          html +=
-            '<div class="config-sync-section-title" style="margin-top:12px;">Decision Required</div>' +
-            '<div class="config-sync-summary">Candidate config is staged on the switch. ' +
-            'Review the diff above, then choose an action in the panel below.</div>';
-          term.writeSystem('  Candidate staged — choose Commit or Rollback below.');
-        } else {
-          // Preview failed to stage (exception was thrown and caught cleanly)
-          html +=
-            '<div class="config-sync-error" style="margin-top:8px;">⚠ Staging did not complete — candidate was not left on the switch.</div>';
-          term.writeError('  Warning: staging did not complete cleanly.');
-        }
+          if (result.staged) {
+            term.writeSystem('  Candidate staged — choose Commit or Rollback below.');
+          } else {
+            term.writeError('  Warning: staging did not complete cleanly.');
+          }
 
-        ui.configSyncResults.innerHTML = html;
-        term.writeSystem('— Config sync preview complete —');
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
-        term.writeError(`Config sync preview error: ${msg}`);
-      } finally {
-        // Update staged state UI regardless of success or failure
-        updateConfigSyncUIState();
-      }
+          term.writeSystem('— Config sync complete —');
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
+          term.writeError(`Config sync error: ${msg}`);
+        } finally {
+          updateConfigSyncUIState();
+        }
+      });
     });
   }
 
   // ---- Config Sync: Commit ----
   async function doCommitSync(): Promise<void> {
+    if (!ensureConsoleTaskAvailable('Config sync commit', 'config-sync-commit')) return;
     await withCloudStatusPollingPaused(async () => {
-      ui.btnCommitSync.disabled = true;
-      ui.btnRollbackSync.disabled = true;
+      await withConsoleTask('config-sync-commit', 'exclusive', 'config sync commit', async () => {
+        ui.btnCommitSync.disabled = true;
+        ui.btnRollbackSync.disabled = true;
 
-      term.writeSystem('— Committing config sync candidate —');
-      ui.configSyncResults.innerHTML = '<div class="status-text info">Running commit…</div>';
+        term.writeSystem('— Committing config sync candidate —');
+        ui.configSyncResults.innerHTML = '<div class="status-text info">Running commit…</div>';
 
-      try {
-        const result = await configSync.commitSync();
-        renderConfigSyncActionOutcome(result, 'commit');
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
-        term.writeError(`Commit error: ${msg}`);
-      } finally {
-        updateConfigSyncUIState();
-      }
+        try {
+          const result = await configSync.commitSync();
+          renderConfigSyncActionOutcome(result, 'commit');
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
+          term.writeError(`Commit error: ${msg}`);
+        } finally {
+          updateConfigSyncUIState();
+        }
+      });
     });
   }
 
   // ---- Config Sync: Rollback ----
   async function doRollbackSync(): Promise<void> {
+    if (!ensureConsoleTaskAvailable('Config sync rollback', 'config-sync-rollback')) return;
     await withCloudStatusPollingPaused(async () => {
-      ui.btnCommitSync.disabled = true;
-      ui.btnRollbackSync.disabled = true;
+      await withConsoleTask('config-sync-rollback', 'exclusive', 'config sync rollback', async () => {
+        ui.btnCommitSync.disabled = true;
+        ui.btnRollbackSync.disabled = true;
 
-      term.writeSystem('— Rolling back config sync candidate —');
-      ui.configSyncResults.innerHTML = '<div class="status-text info">Running rollback 0…</div>';
+        term.writeSystem('— Rolling back config sync candidate —');
+        ui.configSyncResults.innerHTML = '<div class="status-text info">Running rollback 0…</div>';
 
-      try {
-        const result = await configSync.rollbackSync();
-        renderConfigSyncActionOutcome(result, 'rollback');
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
-        term.writeError(`Rollback error: ${msg}`);
-      } finally {
-        updateConfigSyncUIState();
-      }
+        try {
+          const result = await configSync.rollbackSync();
+          renderConfigSyncActionOutcome(result, 'rollback');
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
+          term.writeError(`Rollback error: ${msg}`);
+        } finally {
+          updateConfigSyncUIState();
+        }
+      });
     });
   }
 
@@ -2422,11 +4116,19 @@ function init(): void {
   async function getRootPassword(): Promise<void> {
     await withCloudStatusPollingPaused(async () => {
       if (!deviceContext.matchResult?.mistDevice?.site_id) {
+        activateResultsTab('actions');
+        renderActionResult(
+          'Get Root Password',
+          'error',
+          'Identify the switch first and ensure it is assigned to a site in Mist.',
+        );
         ui.rootPasswordResult.innerHTML = '<div class="status-text error">Identify the switch first and ensure it is assigned to a site in Mist.</div>';
         return;
       }
 
       ui.btnRootPassword.disabled = true;
+      activateResultsTab('actions');
+      renderActionResult('Get Root Password', 'info', 'Fetching root password from Mist…');
       ui.rootPasswordResult.innerHTML = '<div class="status-text info">Fetching root password from Mist…</div>';
 
       try {
@@ -2444,6 +4146,8 @@ function init(): void {
           html += 'Password: <code>' + escapeHtml(rootPw) + '</code>';
           html += '</div>';
           term.writeSystem(`  Root password retrieved for site.`);
+          renderActionResult('Get Root Password', 'success', 'Retrieved root password from Mist site settings.', html);
+          ui.rootPasswordResult.innerHTML = '<div class="status-text success">Root password loaded — see Actions tab.</div>';
         } else {
           html += '<div class="device-mist-match not-found" style="margin-top:6px;">';
           html += '<strong>No root password set in Mist site settings.</strong><br><br>';
@@ -2453,11 +4157,13 @@ function init(): void {
           html += '3. <strong>Mist user account:</strong> If the switch was adopted via CLI, try username <code>mist</code> with the device claim code as the password';
           html += '</div>';
           term.writeSystem('  Root password not set in Mist site settings.');
+          renderActionResult('Get Root Password', 'warn', 'No root password is set in Mist site settings for this site.', html);
+          ui.rootPasswordResult.innerHTML = '<div class="status-text warn">No root password found — see Actions tab.</div>';
         }
 
-        ui.rootPasswordResult.innerHTML = html;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        renderActionResult('Get Root Password', 'error', msg);
         ui.rootPasswordResult.innerHTML = `<div class="status-text error">Error: ${msg}</div>`;
         term.writeError(`Failed to fetch root password: ${msg}`);
       } finally {
@@ -2702,6 +4408,7 @@ function init(): void {
   });
   ui.mistCloud.addEventListener('change', () => {
     saveSelectedMistCloud();
+    refreshCatalogRunButtons(false);
   });
   [ui.baudRate, ui.dataBits, ui.parity, ui.stopBits, ui.flowControl].forEach((el) => {
     el.addEventListener('change', saveSerialPrefs);
@@ -2709,6 +4416,7 @@ function init(): void {
   ui.mistOrg.addEventListener('change', () => {
     mistContext.selectOrg(ui.mistOrg.value);
     saveSelectedMistOrg(ui.mistOrg.value);
+    refreshCatalogRunButtons(false);
     const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
     if (identity) renderDeviceSummary(identity);
   });
@@ -2738,10 +4446,8 @@ function init(): void {
     const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
     if (identity) renderDeviceSummary(identity);
   });
-  ui.btnRunTroubleshoot.addEventListener('click', runTroubleshoot);
-  ui.btnMistStatus.addEventListener('click', runMistStatus);
-  ui.btnSslCheck.addEventListener('click', runSslCheck);
   ui.btnDhcpRefresh.addEventListener('click', runDhcpRefresh);
+  ui.btnRestartMistAgent.addEventListener('click', runMistAgentRestart);
   ui.btnIdentify.addEventListener('click', identifySwitch);
   ui.btnLogin.addEventListener('click', loginToSwitch);
   ui.btnRootPassword.addEventListener('click', getRootPassword);
@@ -2753,6 +4459,11 @@ function init(): void {
   ui.jmaRecommendation.addEventListener('click', (event) => {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
+    const restartButton = target.closest<HTMLButtonElement>('[data-action="restart-mist-agent"]');
+    if (restartButton && !restartButton.disabled) {
+      void runMistAgentRestart();
+      return;
+    }
     const button = target.closest<HTMLButtonElement>('[data-action="run-recommended-checks"]');
     if (!button || button.disabled) return;
     void runRecommendedChecksFromJma();
@@ -2784,11 +4495,18 @@ function init(): void {
       setConnectedState(false);
       term.writeError('— Port disconnected (cable removed?) —');
     }
+    void refreshAuthorizedPortsCache();
+  });
+
+  navigator.serial.addEventListener('connect', () => {
+    void refreshAuthorizedPortsCache();
   });
 
   // ---- Initial state ----
+  renderCheckCatalog();
   activateResultsTab('checks');
   setConnectedState(false);
   term.writeSystem('Junos Console ready. Click "Connect" to select a serial port.');
   term.focus();
+  void refreshAuthorizedPortsCache().then(() => tryAutoReconnectAuthorizedPort());
 }

@@ -87,6 +87,35 @@ Recommended rule:
 - silent background actions should still be captured in the backend event stream as system or backend events
 - if silent actions are ever exposed in transcript rendering, they should be clearly labeled as system-generated rather than operator-entered terminal traffic
 
+### Hybrid action visibility
+
+Some operator-invoked remediation workflows are easier to understand when they
+mix:
+
+- visible console mutations
+- silent evidence-gathering reads
+
+Example:
+
+- DHCP refresh may keep disruptive config-changing steps visible in the live
+  terminal while keeping pre/post binding reads out of the terminal transcript
+  to avoid noise.
+
+Recommended rule for this pattern:
+
+- if a user-invoked action mixes visible and silent steps, the action must own
+  a structured narrative elsewhere in the UI
+- the `Actions` pane should explicitly show:
+  - what was checked before the change
+  - what was changed on the switch
+  - what was checked afterward
+  - the final interpretation
+- the operator should not have to reconstruct the missing silent steps from
+  terminal output alone
+
+This keeps the live console readable without making operator actions feel hidden
+or overly magical.
+
 ## What Counts As A Transcript Entry
 
 The transcript should include any event that helps the operator understand the session story.

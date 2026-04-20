@@ -30,6 +30,21 @@ export const JMA_CONNECTIVITY_STATE_MAP: Record<number, JmaConnectivityDefinitio
   151: { name: 'DuplicateIPAddress', severity: 'fail', detail: 'The switch reports a duplicate IP condition.' },
 };
 
+function parseJmaCandidateLine(line: string): { code: number; message: string; errno: number | null } | null {
+  const exactMatch = line.match(/^(\d+)\s+(.+?)\s+(-?\d+)\s*$/);
+  const parts = exactMatch ? [exactMatch[1], exactMatch[2], exactMatch[3]] : line.trim().split(/\s{2,}/);
+  const code = Number(parts[0]);
+  const message = parts[1]?.trim() || '';
+  const errno = parts[2] != null ? Number(parts[2]) : null;
+
+  if (!Number.isFinite(code)) return null;
+  return {
+    code,
+    message,
+    errno: Number.isFinite(errno) ? errno : null,
+  };
+}
+
 export function parseJmaConnectivityState(output: string): JmaConnectivityStatus {
   const lines = output.split('\n').map((line) => line.trimEnd());
   const headerIndex = lines.findIndex((line) => /\bcc-state\b/i.test(line) && /\bcc-message\b/i.test(line));
@@ -45,10 +60,11 @@ export function parseJmaConnectivityState(output: string): JmaConnectivityStatus
     };
   }
 
-  const valueLine = lines
+  const candidateLines = lines
     .slice(headerIndex + 1)
-    .find((line) => /^\s*\d+\s+/.test(line));
-  if (!valueLine) {
+    .filter((line) => /^\s*\d+\s+/.test(line));
+
+  if (candidateLines.length === 0) {
     return {
       code: null,
       name: 'Unknown',
@@ -60,24 +76,38 @@ export function parseJmaConnectivityState(output: string): JmaConnectivityStatus
     };
   }
 
-  const exactMatch = valueLine.match(/^(\d+)\s+(.+?)\s+(-?\d+)\s*$/);
-  const parts = exactMatch ? [exactMatch[1], exactMatch[2], exactMatch[3]] : valueLine.trim().split(/\s{2,}/);
-  const code = Number(parts[0]);
-  const message = parts[1]?.trim() || '';
-  const errno = parts[2] != null ? Number(parts[2]) : null;
+  const parsedCandidates = candidateLines
+    .map(parseJmaCandidateLine)
+    .filter((candidate): candidate is NonNullable<typeof candidate> => candidate != null);
 
-  if (!Number.isFinite(code)) {
+  if (parsedCandidates.length === 0) {
     return {
       code: null,
       name: 'Unknown',
       severity: 'unknown',
       label: 'Unknown',
-      message,
-      errno: Number.isFinite(errno) ? errno : null,
+      message: '',
+      errno: null,
       detail: 'Could not parse the JMA connectivity state value row.',
     };
   }
 
+  const preferred = parsedCandidates.find((candidate) => candidate.code in JMA_CONNECTIVITY_STATE_MAP)
+    ?? parsedCandidates[parsedCandidates.length - 1];
+
+  if (preferred.code !== 0 && preferred.code < 100) {
+    return {
+      code: null,
+      name: 'Unknown',
+      severity: 'unknown',
+      label: 'Unknown',
+      message: preferred.message,
+      errno: preferred.errno,
+      detail: `Parsed implausible JMA connectivity state value ${preferred.code} from command output.`,
+    };
+  }
+
+  const { code, message, errno } = preferred;
   const mapped = JMA_CONNECTIVITY_STATE_MAP[code];
   const name = mapped?.name ?? `State${code}`;
   return {

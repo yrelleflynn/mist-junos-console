@@ -2,9 +2,9 @@
 
 ## What This Is
 
-A minimal, read-only MCP server that lets an AI agent safely consume live session and Mist-proxy context from the `junos-console` backend — without any direct serial access, config mutation, or command execution.
+A minimal MCP server that lets an AI agent safely consume live session and Mist-proxy context from the `junos-console` backend, and trigger a small set of bounded troubleshooting workflows through the operator page.
 
-This is a first-slice proof-of-concept, not a full agent integration. Its purpose is to establish the tool shapes, trust boundary, and data paths that a Phase 2 implementation would build on.
+This is still a proof-of-concept rather than a full agent integration. Its purpose is to establish the tool shapes, trust boundary, data paths, and bounded action relay that a fuller agent workflow can build on.
 
 Related docs:
 
@@ -34,10 +34,14 @@ Mist cloud
 
 The MCP server is a **separate process** that talks to the existing backend over HTTP. It does not have direct access to the serial port, the WebSocket session, or the frontend.
 
-The backend exposes two new endpoints for this POC:
+The backend exposes these POC-oriented endpoints:
 
 - `GET /mcp/session-state` — returns the last agent-context state pushed by the frontend
 - `POST /mcp/agent-context` — accepts session state pushes from the frontend
+- `POST /mcp/actions` — enqueues a bounded operator-page action
+- `GET /mcp/actions/next` — lets the operator page claim the next queued action
+- `GET /mcp/actions/:id` — lets the MCP server poll action status
+- `POST /mcp/actions/:id/status` — lets the operator page report progress / completion
 
 ---
 
@@ -72,8 +76,91 @@ Returns the JMA Connectivity State as self-reported by the switch — the switch
 Returns structured results from the last cloud-connectivity troubleshoot workflow run in the current session. Each check includes status, summary, remediation guidance, and raw evidence excerpt.
 
 - **Source**: `live_console` (via backend session state)
-- **Status**: Tool shape complete. Returns stub until frontend wires up the push.
+- **Status**: Live when the operator has enabled agent access for the current session.
 - **Arguments**: none
+
+### `get_console_context`
+
+Returns the current console-oriented context for the operator session:
+
+- prompt mode
+- whether an operational prompt is visible
+- a bounded recent console tail
+- the current console task owner if any
+- the nominated uplink port used by troubleshooting
+
+- **Source**: `live_console` / `backend_session_state`
+- **Status**: Live when the operator has enabled agent access for the current session.
+- **Arguments**: none
+
+### `get_mist_context`
+
+Returns the currently selected Mist cloud, org, and site context from the app, along with the current matched Mist device identity when available.
+
+- **Source**: `backend_session_state` / `switch_reported`
+- **Status**: Live when the operator has enabled agent access for the current session.
+- **Arguments**: none
+
+### `get_recovery_guidance`
+
+Returns the current JMA-driven recovery guidance:
+
+- the switch-reported JMA state
+- the current deterministic recommendation shown in the UI
+- the latest guided-analysis card from a JMA-driven run
+- which bounded remediation actions are currently available
+
+- **Source**: `backend_session_state` / `live_console`
+- **Status**: Live when the operator has enabled agent access for the current session.
+- **Arguments**: none
+
+### `list_checks`
+
+Returns the live troubleshooting catalog as currently available in the operator UI, including:
+
+- check id / name / description
+- group membership
+- current availability
+- requirement flags such as `requiresCloud` and `requiresMistApi`
+
+- **Source**: `backend_session_state`
+- **Status**: Live when the operator has enabled agent access for the current session.
+- **Arguments**: none
+
+### `list_check_groups`
+
+Returns the live troubleshooting groups currently exposed in the UI, including group-level availability and the current state of `Run All Catalog Checks` and `Run Full Baseline`.
+
+- **Source**: `backend_session_state`
+- **Status**: Live when the operator has enabled agent access for the current session.
+- **Arguments**: none
+
+### Bounded Run Tools
+
+The MCP server now exposes bounded execution tools that enqueue an action in the backend relay, wait for the operator page to claim it, and return the completion result:
+
+- `list_agent_reads`
+- `run_check`
+- `run_check_group`
+- `run_all_catalog_checks`
+- `run_recommended_checks`
+- `run_full_baseline`
+- `list_recovery_actions`
+- `run_dhcp_refresh`
+- `run_restart_mist_agent`
+- `run_config_sync_preview`
+- `get_effective_config`
+- `list_log_files`
+- `search_log_file`
+
+These do **not** execute serial commands directly from the MCP server. Instead, they instruct the already-open operator page to run the corresponding in-app workflow.
+
+- **Source**: operator page via backend action relay
+- **Status**: Live when the operator has enabled agent access for the current session.
+- **Arguments**:
+  - `run_check`: `checkId`
+  - `run_check_group`: `groupId`
+  - others: none
 
 ### `get_device_config` ★ FULLY WIRED
 
@@ -89,10 +176,16 @@ Fetches the Mist-intended configuration for a specific switch as a list of Junos
 
 | Tool | Data source | Live now? |
 |------|------------|-----------|
-| `get_session_summary` | Backend session state | No — stub until Phase 2 frontend wiring |
-| `get_device_identity` | Backend session state | No — stub until Phase 2 frontend wiring |
-| `get_jma_connectivity_state` | Backend session state | No — stub until Phase 2 frontend wiring |
-| `get_check_results` | Backend session state | No — stub until Phase 2 frontend wiring |
+| `get_session_summary` | Backend session state | Yes — when operator enables agent access |
+| `get_device_identity` | Backend session state | Yes — when operator enables agent access |
+| `get_jma_connectivity_state` | Backend session state | Yes — when operator enables agent access |
+| `get_check_results` | Backend session state | Yes — when operator enables agent access |
+| `get_console_context` | Backend session state | Yes — when operator enables agent access |
+| `get_mist_context` | Backend session state | Yes — when operator enables agent access |
+| `get_recovery_guidance` | Backend session state | Yes — when operator enables agent access |
+| `list_checks` | Backend session state | Yes — when operator enables agent access |
+| `list_check_groups` | Backend session state | Yes — when operator enables agent access |
+| `run_check*` / `run_*` | Operator page via action relay | Yes — when operator enables agent access |
 | `get_device_config` | Mist API via proxy | **Yes** — fully wired |
 
 When stub data is returned, the tool response includes a `source: "backend_stub"` field and a `_note` explaining why the data is absent and what is needed to wire it up. The agent can use this signal to communicate the missing context rather than silently working from null values.
@@ -172,13 +265,16 @@ Or with `tsx` for development:
 
 ## Trust Boundary
 
-The Phase 1 trust model is explicit in the code and enforced in structure:
+The trust model is explicit in the code and enforced in structure:
 
 **Operator owns the session.**
 The agent gets a read-only window into state the operator has chosen to expose. The backend session state is only populated when the frontend POSTs to `/mcp/agent-context` — a step that requires explicit operator action (Phase 2 wiring).
 
-**This phase is read-only.**
-All five tools are read-only. There is no tool for command execution, config commit, rollback, or any state-changing action. These are intentionally deferred.
+**The MCP server still has no direct serial control.**
+Even the new run tools do not inject commands straight into the console. They enqueue a bounded action, and the already-open operator page decides how to execute that workflow.
+
+**High-risk config mutation remains deferred.**
+The action relay currently targets bounded troubleshooting workflows only. Direct config commit / rollback / adoption mutation through MCP remains intentionally deferred.
 
 **Agent access requires explicit enablement.**
 The `/mcp/session-state` endpoint returns a `_stub: true` response until a session state has been pushed by the frontend. An agent receiving stub responses knows the operator has not enabled agent access for this session.
@@ -188,17 +284,19 @@ Every tool response includes a `source` field: `backend_session_state`, `switch_
 
 ---
 
-## Phase 2 Wiring
+## Current Agent-Context Wiring
 
-The session-state tools return stubs because the frontend has not yet been wired to push state to the backend. Phase 2 would add:
+The frontend now pushes live agent context to the backend when agent access is enabled. The pushed state includes:
 
-1. A `pushAgentContext(state)` call in `src/main.ts` (or a controller) that fires when:
-   - the operator enables agent access in the UI
-   - the device identity is established
-   - a troubleshoot workflow completes
-   - the JMA state updates
+- session and serial state
+- switch identity and Mist match
+- current JMA state
+- current Mist selection context
+- bounded check results from the latest run
+- prompt mode and recent console tail
+- current guided recovery recommendation and action availability
 
-2. The payload shape expected by `POST /mcp/agent-context`:
+The payload shape accepted by `POST /mcp/agent-context` is:
 
 ```json
 {
@@ -247,7 +345,7 @@ The session-state tools return stubs because the frontend has not yet been wired
 }
 ```
 
-3. Session-state cleanup when the operator disconnects or disables agent access (call `DELETE /mcp/agent-context/:sessionId` or re-POST with `agentAccessEnabled: false`).
+Session-state is also cleared when the operator WebSocket session ends, so stale MCP summaries do not survive reloads or disconnects.
 
 ---
 

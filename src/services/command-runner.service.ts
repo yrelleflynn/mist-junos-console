@@ -36,6 +36,21 @@ export const MORE_PATTERN = /---\(more\s*\d*%?\)---/i;
 export const MORE_PATTERN_ALT = /--\(more\)--/i;
 
 /**
+ * Normalise raw serial capture before prompt/echo stripping:
+ * - remove carriage returns
+ * - collapse backspace-overstrike sequences produced by shell echo wrapping
+ */
+export function normalizeSerialCapture(raw: string): string {
+  let output = raw.replace(/\r/g, '');
+  let previous = '';
+  while (output !== previous) {
+    previous = output;
+    output = output.replace(/[^\n]\x08/g, '');
+  }
+  return output.replace(/\x08/g, '');
+}
+
+/**
  * Strip the echoed command from the beginning of captured output,
  * remove surrounding blank lines, and drop the trailing prompt line.
  *
@@ -43,7 +58,7 @@ export const MORE_PATTERN_ALT = /--\(more\)--/i;
  * serial connection.
  */
 export function stripCommandEcho(raw: string, command: string): string {
-  let output = raw;
+  let output = normalizeSerialCapture(raw);
   const cmdIndex = output.indexOf(command);
   if (cmdIndex !== -1) {
     output = output.substring(cmdIndex + command.length);

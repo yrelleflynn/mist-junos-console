@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Check Catalog Mockup</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-primary:    #0c0f14;
+    --bg-secondary:  #10141a;
+    --bg-card:       #141820;
+    --bg-elevated:   #1a1f28;
+    --border-color:  #252b36;
+    --text-primary:  #e8eaed;
+    --text-secondary:#c4c6cc;
+    --text-muted:    #8e9196;
+    --accent-blue:   #5dd8e2;
+    --accent-green:  #3fb950;
+    --accent-red:    #f97583;
+    --accent-yellow: #e3b341;
+    --font-mono:     'JetBrains Mono', monospace;
+    --font-sans:     'DM Sans', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  /* ---- Simulated results panel header ---- */
+  .panel-tabs {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 0 8px;
+    height: 34px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+    flex-shrink: 0;
+  }
+  .panel-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-right: 6px;
+  }
+  .tab {
+    padding: 4px 10px;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    cursor: pointer;
+    border-radius: 4px;
+  }
+  .tab.active {
+    color: var(--accent-blue);
+    background: rgba(93,216,226,0.10);
+    box-shadow: inset 0 -2px 0 var(--accent-blue);
+  }
+
+  /* ---- Catalog pane ---- */
+  .catalog-pane {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .catalog-pane::-webkit-scrollbar { width: 6px; }
+  .catalog-pane::-webkit-scrollbar-track { background: transparent; }
+  .catalog-pane::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
+
+  /* ---- Toolbar ---- */
+  .catalog-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .catalog-toolbar-title {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--text-muted);
+    flex: 1;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 11px;
+    border-radius: 5px;
+    border: 1px solid transparent;
+    font-family: var(--font-sans);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .btn-primary  { background: rgba(93,216,226,0.14); border-color: rgba(93,216,226,0.35); color: var(--accent-blue); }
+  .btn-primary:hover  { background: rgba(93,216,226,0.22); }
+  .btn-secondary { background: rgba(255,255,255,0.05); border-color: var(--border-color); color: var(--text-secondary); }
+  .btn-secondary:hover { background: rgba(255,255,255,0.09); }
+  .btn-sm { padding: 3px 8px; font-size: 11px; }
+
+  /* ---- Check group ---- */
+  .check-group { display: flex; flex-direction: column; gap: 1px; }
+  .check-group-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0 6px;
+    border-bottom: 1px solid var(--border-color);
+    margin-bottom: 3px;
+  }
+  .check-group-name {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+  }
+  .check-group-run-btn {
+    margin-left: auto;
+    padding: 2px 8px;
+    font-size: 10px;
+    border-radius: 3px;
+    border: 1px solid var(--border-color);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-family: var(--font-mono);
+    transition: color 0.12s, border-color 0.12s;
+  }
+  .check-group-run-btn:hover { color: var(--text-secondary); border-color: var(--text-muted); }
+
+  /* ---- Check item (wrapper for row + detail) ---- */
+  .check-item { display: flex; flex-direction: column; border-radius: 5px; }
+  .check-item.is-open { background: rgba(255,255,255,0.025); }
+
+  /* ---- Check row ---- */
+  .check-row {
+    display: grid;
+    grid-template-columns: 16px 16px 1fr auto auto;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background 0.1s;
+    user-select: none;
+  }
+  .check-item:not(.is-open) .check-row:hover { background: rgba(255,255,255,0.04); }
+
+  /* Chevron */
+  .check-chevron {
+    width: 12px;
+    height: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    opacity: 0.5;
+    transition: transform 0.18s, opacity 0.18s;
+    flex-shrink: 0;
+  }
+  .check-chevron svg { display: block; }
+  .check-item.is-open .check-chevron { transform: rotate(90deg); opacity: 0.8; }
+  .check-item.no-detail .check-chevron { visibility: hidden; }
+
+  /* Status dot */
+  .check-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    justify-self: center;
+    flex-shrink: 0;
+    transition: box-shadow 0.2s;
+  }
+  .check-status-dot.idle    { background: var(--border-color); }
+  .check-status-dot.pass    { background: var(--accent-green); box-shadow: 0 0 5px rgba(63,185,80,0.5); }
+  .check-status-dot.fail    { background: var(--accent-red);   box-shadow: 0 0 5px rgba(249,117,131,0.5); }
+  .check-status-dot.warn    { background: var(--accent-yellow);box-shadow: 0 0 5px rgba(227,179,65,0.5); }
+  .check-status-dot.running { background: var(--accent-blue);  animation: pulse 1s ease-in-out infinite; }
+
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.25} }
+
+  .check-info { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+  .check-name {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .check-desc {
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Result badge */
+  .check-result-badge {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    white-space: nowrap;
+    color: var(--text-muted);
+    text-align: right;
+    min-width: 70px;
+  }
+  .check-result-badge.pass    { color: var(--accent-green); }
+  .check-result-badge.fail    { color: var(--accent-red); }
+  .check-result-badge.warn    { color: var(--accent-yellow); }
+  .check-result-badge.running { color: var(--accent-blue); }
+
+  /* Run button */
+  .check-run-btn {
+    padding: 2px 8px;
+    font-size: 10px;
+    font-family: var(--font-mono);
+    border-radius: 3px;
+    border: 1px solid var(--border-color);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: color 0.12s, border-color 0.12s, background 0.12s;
+    white-space: nowrap;
+  }
+  .check-run-btn:hover { color: var(--accent-blue); border-color: rgba(93,216,226,0.4); background: rgba(93,216,226,0.06); }
+  .check-run-btn.running { color: var(--accent-blue); border-color: rgba(93,216,226,0.4); }
+
+  /* Mist-required badge */
+  .mist-badge {
+    font-size: 9px;
+    font-family: var(--font-mono);
+    padding: 1px 4px;
+    border-radius: 3px;
+    background: rgba(93,216,226,0.08);
+    border: 1px solid rgba(93,216,226,0.2);
+    color: var(--accent-blue);
+    white-space: nowrap;
+    opacity: 0.7;
+  }
+
+  /* ---- Expandable detail panel ---- */
+  .check-detail {
+    display: none;
+    flex-direction: column;
+    gap: 8px;
+    padding: 0 10px 10px 42px; /* indent to align under check name */
+  }
+  .check-item.is-open .check-detail { display: flex; }
+
+  /* Command line */
+  .detail-cmd {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+  }
+  .detail-cmd-prompt {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--accent-blue);
+    flex-shrink: 0;
+  }
+  .detail-cmd-text {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+
+  /* Raw output block */
+  .detail-output {
+    background: rgba(0,0,0,0.35);
+    border-radius: 4px;
+    border-left: 3px solid var(--border-color);
+    padding: 7px 10px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    white-space: pre;
+    overflow-x: auto;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+  .detail-output.pass { border-left-color: var(--accent-green); }
+  .detail-output.warn { border-left-color: var(--accent-yellow); }
+  .detail-output.fail { border-left-color: var(--accent-red); }
+  .detail-output::-webkit-scrollbar { width: 4px; height: 4px; }
+  .detail-output::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+  /* Remediation hint (only shown on warn/fail) */
+  .detail-remediation {
+    display: flex;
+    gap: 7px;
+    padding: 6px 9px;
+    background: rgba(227,179,65,0.06);
+    border: 1px solid rgba(227,179,65,0.18);
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+  .detail-remediation.fail {
+    background: rgba(249,117,131,0.06);
+    border-color: rgba(249,117,131,0.18);
+  }
+  .detail-remediation-icon { font-size: 13px; flex-shrink: 0; margin-top: 1px; }
+</style>
+</head>
+<body>
+
+<div class="panel-tabs">
+  <span class="panel-label">Results</span>
+  <button class="tab active">Checks</button>
+  <button class="tab">Config Sync</button>
+  <button class="tab">Timeline</button>
+</div>
+
+<div class="catalog-pane">
+
+  <div class="catalog-toolbar">
+    <span class="catalog-toolbar-title">Click a check to expand · Run individually or by group</span>
+    <button class="btn btn-primary btn-sm">▶ Run All</button>
+    <button class="btn btn-secondary btn-sm">✕ Clear</button>
+  </div>
+
+  <!-- ══ Layer 2 ══ -->
+  <div class="check-group">
+    <div class="check-group-header">
+      <span class="check-group-name">Layer 2</span>
+      <button class="check-group-run-btn">Run group</button>
+    </div>
+
+    <!-- LLDP — pass, expanded -->
+    <div class="check-item is-open">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot pass"></div>
+        <div class="check-info">
+          <span class="check-name">LLDP Neighbors</span>
+          <span class="check-desc">Upstream neighbors via LLDP</span>
+        </div>
+        <span class="check-result-badge pass">1 neighbor</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+      <div class="check-detail">
+        <div class="detail-cmd">
+          <span class="detail-cmd-prompt">&gt;</span>
+          <span class="detail-cmd-text">show lldp neighbors</span>
+        </div>
+        <div class="detail-output pass">Local Interface    Parent Interface    Chassis Id          Port info          System Name
+ge-0/0/0           -                   2c:6b:f5:aa:11:00   ge-0/1/3           core-sw-01.lab</div>
+      </div>
+    </div>
+
+    <!-- Uplink Port Status — pass, collapsed -->
+    <div class="check-item">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot pass"></div>
+        <div class="check-info">
+          <span class="check-name">Uplink Port Status</span>
+          <span class="check-desc">Physical state and speed of the uplink interface</span>
+        </div>
+        <span class="check-result-badge pass">ge-0/0/0 up</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+      <div class="check-detail">
+        <div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">show interfaces ge-0/0/0 terse</span></div>
+        <div class="detail-output pass">Interface  Admin  Link  Proto  Local
+ge-0/0/0   up     up
+ge-0/0/0.0 up     up    inet   10.99.0.108/24</div>
+      </div>
+    </div>
+
+    <!-- Interface Errors — warn, collapsed -->
+    <div class="check-item">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot warn"></div>
+        <div class="check-info">
+          <span class="check-name">Interface Errors</span>
+          <span class="check-desc">Error, CRC and drop counters on uplink interface</span>
+        </div>
+        <span class="check-result-badge warn">14 input errors</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+      <div class="check-detail">
+        <div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">show interfaces ge-0/0/0 extensive | match error</span></div>
+        <div class="detail-output warn">  Input errors:
+    Errors: 14, Drops: 0, Framing errors: 14, Runts: 0, Giants: 0
+    Policed discards: 0, Resource errors: 0
+  Output errors:
+    Carrier transitions: 1, Errors: 0, Drops: 0</div>
+        <div class="detail-remediation">
+          <span class="detail-remediation-icon">⚠</span>
+          <span>14 framing errors detected — typically indicates a duplex mismatch or cable/SFP issue on ge-0/0/0. Check the far-end port speed/duplex settings and try reseating the cable.</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- VLAN Config — pass, collapsed -->
+    <div class="check-item">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot pass"></div>
+        <div class="check-info">
+          <span class="check-name">VLAN Config</span>
+          <span class="check-desc">Management VLAN membership on uplink interface</span>
+        </div>
+        <span class="check-result-badge pass">VLAN 100 present</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+      <div class="check-detail">
+        <div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">show vlans interface ge-0/0/0</span></div>
+        <div class="detail-output pass">Name       Tag  Interfaces
+mgmt-vlan  100  ge-0/0/0.0*</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ IP / Routing ══ -->
+  <div class="check-group">
+    <div class="check-group-header">
+      <span class="check-group-name">IP / Routing</span>
+      <button class="check-group-run-btn">Run group</button>
+    </div>
+
+    <div class="check-item">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot pass"></div>
+        <div class="check-info"><span class="check-name">Management IP</span><span class="check-desc">Routable address on irb / vme / me0</span></div>
+        <span class="check-result-badge pass">10.99.0.108/24</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+      <div class="check-detail">
+        <div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">show interfaces terse | match "inet "</span></div>
+        <div class="detail-output pass">irb.0   up  up  inet  10.99.0.108/24</div>
+      </div>
+    </div>
+
+    <div class="check-item">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot pass"></div>
+        <div class="check-info"><span class="check-name">DHCP Lease</span><span class="check-desc">Active DHCP binding — server, IP, expiry</span></div>
+        <span class="check-result-badge pass">BOUND · 23h left</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+      <div class="check-detail">
+        <div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">show dhcp client binding detail</span></div>
+        <div class="detail-output pass">Client Interface: irb.0
+  State:            BOUND
+  Client IP:        10.99.0.108
+  Server IP:        10.99.0.1
+  Lease Start:      2026-04-18 11:13:12 UTC
+  Lease Expires:    2026-04-19 11:13:12 UTC  (23h 04m remaining)</div>
+      </div>
+    </div>
+
+    <div class="check-item">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot pass"></div>
+        <div class="check-info"><span class="check-name">Default Route</span><span class="check-desc">Default gateway exists and next-hop is in ARP</span></div>
+        <span class="check-result-badge pass">via 10.99.0.1</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+      <div class="check-detail">
+        <div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">show route 0.0.0.0/0</span></div>
+        <div class="detail-output pass">inet.0: 8 destinations
+0.0.0.0/0          *[DHCP/1] 1d 00:00:04
+                    > to 10.99.0.1 via irb.0</div>
+      </div>
+    </div>
+
+    <!-- Route to Mist — idle (not yet run) -->
+    <div class="check-item no-detail">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot idle"></div>
+        <div class="check-info"><span class="check-name">Route to Mist</span><span class="check-desc">Routing table entry for Mist cloud endpoints</span></div>
+        <span class="check-result-badge">—</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ DNS ══ -->
+  <div class="check-group">
+    <div class="check-group-header">
+      <span class="check-group-name">DNS</span>
+      <button class="check-group-run-btn">Run group</button>
+    </div>
+
+    <div class="check-item">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot pass"></div>
+        <div class="check-info"><span class="check-name">DNS Config</span><span class="check-desc">Name servers configured via DHCP or static</span></div>
+        <span class="check-result-badge pass">2 servers found</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+      <div class="check-detail">
+        <div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">cat /etc/resolv.conf</span></div>
+        <div class="detail-output pass">nameserver 45.90.28.80
+nameserver 45.90.30.80</div>
+      </div>
+    </div>
+
+    <!-- DNS Reachability — FAIL, expanded -->
+    <div class="check-item is-open">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot fail"></div>
+        <div class="check-info">
+          <span class="check-name">DNS Reachability</span>
+          <span class="check-desc">ICMP ping to each configured name server</span>
+        </div>
+        <span class="check-result-badge fail">1 of 2 unreachable</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+      <div class="check-detail">
+        <div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">ping inet 45.90.28.80 count 3 rapid</span></div>
+        <div class="detail-output pass">PING 45.90.28.80: 56 data bytes
+!!!</div>
+        <div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">ping inet 45.90.30.80 count 3 rapid</span></div>
+        <div class="detail-output fail">PING 45.90.30.80: 56 data bytes
+Request timeout for icmp_seq 0
+Request timeout for icmp_seq 1
+Request timeout for icmp_seq 2
+3 packets transmitted, 0 packets received, 100% packet loss</div>
+        <div class="detail-remediation fail">
+          <span class="detail-remediation-icon">✕</span>
+          <span>Secondary DNS server 45.90.30.80 is unreachable. DNS resolution is degraded and may fail under load. Check firewall rules for outbound UDP/TCP port 53. The primary server (45.90.28.80) is responding normally.</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="check-item">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot warn"></div>
+        <div class="check-info"><span class="check-name">DNS Resolution</span><span class="check-desc">Resolves Mist endpoints and google.com</span></div>
+        <span class="check-result-badge warn">Mist resolved, slow</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+      <div class="check-detail">
+        <div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">show host ep-terminator.mistsys.net</span></div>
+        <div class="detail-output warn">Name:    ep-terminator.mistsys.net
+Address: 54.241.200.105  (3847ms)</div>
+        <div class="detail-remediation">
+          <span class="detail-remediation-icon">⚠</span>
+          <span>DNS resolution succeeded but took 3.8 s — likely a result of the unreachable secondary DNS server causing timeouts before falling back to the primary. Fix DNS reachability first.</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ Mist Agent ══ -->
+  <div class="check-group">
+    <div class="check-group-header">
+      <span class="check-group-name">Mist Agent</span>
+      <button class="check-group-run-btn">Run group</button>
+    </div>
+
+    <div class="check-item">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot pass"></div>
+        <div class="check-info"><span class="check-name">Agent Version</span><span class="check-desc">Installed Mist agent package and version</span></div>
+        <span class="check-result-badge pass">mist-2.6.1234</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+      <div class="check-detail">
+        <div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">show version | match mist</span></div>
+        <div class="detail-output pass">JUNOS Mist Agent [mist-2.6.1234]</div>
+      </div>
+    </div>
+
+    <div class="check-item">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot pass"></div>
+        <div class="check-info"><span class="check-name">Outbound SSH Config</span><span class="check-desc">Outbound-SSH client "mist" configured with secret and device-id</span></div>
+        <span class="check-result-badge pass">Configured</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+      <div class="check-detail">
+        <div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">show configuration system services outbound-ssh</span></div>
+        <div class="detail-output pass">client mist {
+    secret "...";
+    device-id 5c5b35a0-1234-5678-abcd-000000000000.ap0ea79f48b0000;
+    services netconf;
+    server 54.241.200.105 {
+        port 2200;
+    }
+}</div>
+      </div>
+    </div>
+
+    <!-- Active Cloud Connections — idle -->
+    <div class="check-item no-detail">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot idle"></div>
+        <div class="check-info"><span class="check-name">Active Cloud Connections</span><span class="check-desc">Established TCP sessions from mgmt IP to Mist endpoints</span></div>
+        <span class="check-result-badge">—</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ Cloud Reachability ══ -->
+  <div class="check-group">
+    <div class="check-group-header">
+      <span class="check-group-name">Cloud Reachability</span>
+      <button class="check-group-run-btn">Run group</button>
+    </div>
+
+    <div class="check-item no-detail">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot idle"></div>
+        <div class="check-info"><span class="check-name">Endpoint Reachability</span><span class="check-desc">DNS resolution + TCP port connectivity to Mist endpoints</span></div>
+        <span class="check-result-badge">—</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+    </div>
+
+    <div class="check-item no-detail">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot idle"></div>
+        <div class="check-info"><span class="check-name">Firewall / SSL Policy</span><span class="check-desc">TCP port reachability and SSL certificate inspection detection</span></div>
+        <span class="check-result-badge">—</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+    </div>
+
+    <div class="check-item no-detail">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot idle"></div>
+        <div class="check-info"><span class="check-name">Mist Cloud Status</span><span class="check-desc">Full Mist agent + outbound SSH + active connections summary</span></div>
+        <span class="check-result-badge">—</span>
+        <button class="check-run-btn">Run</button>
+      </div>
+    </div>
+
+    <div class="check-item no-detail">
+      <div class="check-row">
+        <span class="check-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <div class="check-status-dot idle"></div>
+        <div class="check-info"><span class="check-name">Offline Timeline</span><span class="check-desc">Correlate Mist events and switch logs around disconnect time</span></div>
+        <div class="mist-badge">Mist + site</div>
+        <button class="check-run-btn">Run</button>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /catalog-pane -->
+
+<script>
+  // Toggle expand/collapse on row click
+  document.querySelectorAll('.check-item:not(.no-detail) .check-row').forEach(row => {
+    row.addEventListener('click', e => {
+      // Don't toggle if the Run button was clicked
+      if (e.target.closest('.check-run-btn')) return;
+      row.closest('.check-item').classList.toggle('is-open');
+    });
+  });
+</script>
+</body>
+</html>
