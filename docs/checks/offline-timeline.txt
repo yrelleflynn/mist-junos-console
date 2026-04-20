@@ -1,0 +1,70 @@
+CHECK: Offline Timeline Analysis
+ID: mist-last-seen, mist-events, switch-uptime, mist-audit-logs,
+     switch-logs-messages, switch-logs-mist-agent  (multi-result)
+File: src/checks/offline-timeline.check.ts
+Function: runOfflineTimeline(ctx, siteId?, deviceId?)
+
+PURPOSE
+Correlates Mist API data (last_seen, device events, audit logs) with
+switch-side syslog output to reconstruct a timeline of when and why the
+switch went offline. This is the primary diagnostic for switches that
+are currently offline or have been intermittently disconnecting.
+
+The analysis automatically aligns switch log timestamps (which are in
+the switch's local timezone) to UTC using the timezone information
+parsed from 'show system uptime'. See src/utils/junos-log-time.ts.
+
+RESULTS PRODUCED (one or more per run)
+
+  mist-last-seen
+    Status: pass (connected) or warn (offline).
+    Reports the last_seen timestamp from the Mist API device stats.
+
+  mist-events
+    Status: info.
+    Lists the most recent 5 Mist device events (connect/disconnect,
+    config push, firmware upgrade, etc.).
+
+  switch-uptime
+    Status: info.
+    Reports boot time, last config commit time, and committing user.
+
+  mist-audit-logs
+    Status: pass (no changes) or warn (changes found near disconnect).
+    Searches Mist org audit logs within ±30 min of the disconnect time
+    for configuration changes that may have caused the outage.
+
+  switch-logs-messages
+    Status: info or warn.
+    Shows ~50 lines of system messages log (show log messages) around
+    the disconnect time. Lines matching problem keywords are highlighted
+    with category tags: [Outbound SSH], [Mist Agent], [Link State], etc.
+
+  switch-logs-mist-agent
+    Status: info or warn.
+    Shows ~50 lines of the Mist agent log (jmd.log or mist.log for
+    legacy pyagent stacks) around the disconnect time.
+
+COMMANDS
+  show system uptime
+  show log jmd.log | last 200     (or mist.log for legacy pyagent)
+  show log messages | last 200
+  show version | match mist       (to choose jmd.log vs mist.log)
+  Mist API: GET /api/v1/sites/<id>/devices/<id>/stats
+  Mist API: GET /api/v1/sites/<id>/devices/events
+  Mist API: GET /api/v1/orgs/<id>/logs
+
+TIMEZONE ALIGNMENT
+  Junos syslog timestamps have no year and use the switch's local
+  timezone (e.g. "Jan 15 14:32:01"). The junos-log-time utility
+  parses 'show system uptime' output to extract the current time and
+  timezone offset, then converts log timestamps to UTC milliseconds
+  for comparison with Mist API event times.
+
+  If the timezone offset cannot be determined, UTC+0 is assumed and
+  a note is added to the detail.
+
+REQUIRES
+  - Mist API configured (mistApi.isConfigured) for Mist-side results.
+  - siteId and deviceId for device-specific events/stats.
+  - Serial connection for switch log commands.

@@ -1,0 +1,32 @@
+CHECK: Port Status
+ID: port-status
+File: src/checks/port-status.check.ts
+
+PURPOSE
+Verifies that the uplink port is physically up and operationally active.
+Checks both link state and duplex/speed negotiation.
+
+COMMANDS
+  show interfaces <uplinkPort>
+
+PASS
+  The uplink interface shows "Physical link is Up" and the logical unit
+  reports "Flags: Up". Speed and duplex are reported in the detail.
+
+WARN
+  Interface is up but running at a degraded speed (e.g. 10 Mbps instead
+  of 1 Gbps) or half-duplex — possible cable or negotiation issue.
+
+FAIL
+  The interface shows "Physical link is Down" or is administratively
+  disabled ("Admin State: Disabled").
+
+SKIP
+  uplinkPort is not set in context.
+
+REMEDIATION
+  - Check physical cable on both ends.
+  - Run: show interfaces <uplinkPort> extensive — look for input errors,
+    CRC errors, or carrier transitions.
+  - Run: show interfaces <uplinkPort> detail — check negotiation.
+  - If admin disabled: set interfaces <uplinkPort> enable

@@ -1,0 +1,37 @@
+CHECK: Active Cloud Connections
+ID: cloud-connections
+File: src/checks/active-connections.check.ts
+
+PURPOSE
+Inspects the active TCP connection table and identifies whether the
+switch has ESTABLISHED outbound connections to known Mist cloud
+endpoint IPs. This is the most direct confirmation that the switch is
+actively connected to Mist.
+
+Resolves each Mist endpoint FQDN to its current IP using 'show host'
+and cross-references against the established connection list.
+
+COMMANDS
+  show system connections | grep <mgmtIp>
+  show host <endpoint-host>  (per endpoint in cloud config)
+
+PASS
+  At least one ESTABLISHED connection matches a resolved Mist endpoint IP.
+
+WARN (two cases)
+  1. Connections exist but none are ESTABLISHED (SYN_SENT, CLOSE_WAIT,
+     etc.) — the switch is trying to connect but the session is not up.
+  2. ESTABLISHED connections exist but none match a known Mist endpoint
+     IP — the switch is connected somewhere, but not to Mist.
+
+FAIL
+  No outbound connections found from the management IP at all.
+
+SKIP
+  No management IP in context (interfaceIpCheck must run first).
+
+REMEDIATION
+  - If SYN_SENT: firewall is likely blocking the outbound TCP.
+  - If no connections: check outbound-ssh config (outbound-ssh check).
+  - Restart Mist agent: restart mist-agent
+  - Check jmd.log for connection errors: show log jmd.log | last 100

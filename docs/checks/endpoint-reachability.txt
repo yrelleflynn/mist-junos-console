@@ -1,0 +1,37 @@
+CHECK: Endpoint Reachability (TCP)
+ID: reach-<hostname>  (one per endpoint)
+File: src/checks/endpoint-reachability.check.ts
+Pattern: Factory function — endpointReachabilityCheck(endpoint)
+
+PURPOSE
+Tests that a specific Mist cloud endpoint is reachable over TCP on the
+expected port (typically 443 or 2200). Uses a two-step approach:
+  1. Ping (ICMP) — verifies DNS resolution and basic IP reachability.
+  2. Telnet to port — verifies TCP connectivity through any firewall.
+
+Instantiated once per endpoint in TroubleshootService.checkFirewallPolicy().
+
+COMMANDS
+  ping inet <host> count 1 rapid
+  telnet inet <host> port <port>
+
+PASS
+  TCP connection established ("Connected to" or "Escape character is"
+  in telnet output). Telnet session is cleanly terminated.
+
+WARN
+  TCP connection refused — the host is reachable (ARP/routing work) but
+  the port is closed or filtered at the host level.
+
+FAIL
+  - DNS resolution failed (unknown host).
+  - No route to host (ICMP or TCP level).
+  - TCP timed out with ping working — firewall is blocking the port.
+  - TCP timed out and ping also failed — general routing issue.
+
+REMEDIATION
+  - If firewall blocked: whitelist Mist IP ranges and ports in the
+    perimeter firewall. Mist requires TCP 443 and TCP 2200 outbound.
+  - If DNS fails: see dns-config and dns-resolution checks.
+  - If no route: see default-route check.
+  - Reference: https://www.juniper.net/documentation/us/en/software/mist/

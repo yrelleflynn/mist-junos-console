@@ -1,0 +1,39 @@
+CHECK: Outbound SSH Configuration
+ID: outbound-ssh-config
+File: src/checks/outbound-ssh.check.ts
+
+PURPOSE
+Inspects the outbound-ssh configuration block that Mist uses for its
+persistent connection. The Mist agent establishes an outbound SSH tunnel
+to the oc-term endpoint using the device-id and secret defined here.
+
+A misconfigured, missing, or deactivated outbound-ssh block will prevent
+the switch from connecting to Mist even if all network checks pass.
+
+COMMANDS
+  show configuration system services outbound-ssh
+
+PASS
+  client "mist" block exists, device-id is set, and secret is present.
+  Host and port are reported.
+
+WARN
+  client "mist" block exists but device-id is missing, secret is absent,
+  or the netconf service is not listed.
+
+FAIL
+  - client "mist" block is absent — Mist has not pushed config, or
+    the config was deleted.
+  - client "mist" block exists but is marked inactive.
+
+EXTRA DATA RETURNED
+  port — the configured outbound-ssh port (typically 443 or 2200),
+         forwarded to the endpoint-reachability checks.
+
+REMEDIATION
+  - If missing: re-adopt the switch in the Mist dashboard. The agent
+    will push the outbound-ssh block on next contact.
+  - If inactive: set system services outbound-ssh client mist active
+  - If device-id missing: check Mist dashboard for the switch's device ID
+    and set it manually: set system services outbound-ssh client mist device-id <id>
+  - Confirm secret matches Mist's expected secret via support if needed.

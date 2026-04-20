@@ -1,0 +1,32 @@
+CHECK: Interface IP Address
+ID: interface-ip
+File: src/checks/interface-ip.check.ts
+Critical: YES — failure skips remaining checks
+
+PURPOSE
+Determines the management IP address assigned to the switch. Without a
+management IP the switch cannot reach the Mist cloud or DNS servers.
+The resolved IP is stored in CheckContext.mgmtIp for use by all
+downstream checks (ARP, route, connections, etc.).
+
+COMMANDS
+  show interfaces terse
+  show interfaces irb terse (if no IP found on physical interfaces)
+
+PASS
+  A non-loopback, non-link-local IP address is found on at least one
+  interface (typically irb.<mgmt-vlan> or me0). The IP is stored in ctx.
+
+FAIL
+  No routable IP address found on any interface. DHCP may have failed,
+  or the management VLAN/IRB interface is misconfigured.
+  All remaining checks are skipped.
+
+EXTRA DATA RETURNED
+  mgmtIp — the management IP string (passed to CheckContext.mgmtIp)
+
+REMEDIATION
+  - Run: show dhcp client binding — check if a lease is active.
+  - Run: show interfaces irb detail — check for IRB address.
+  - Confirm DHCP server is reachable on the management VLAN.
+  - If static: verify set interfaces irb.<vlan> unit 0 family inet address.

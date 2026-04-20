@@ -1,0 +1,38 @@
+CHECK: Mist Agent Processes
+ID: mist-processes
+File: src/checks/mist-agent-processes.check.ts
+
+PURPOSE
+Verifies that the Mist agent daemon processes are running:
+  - mcd — Mist Cloud Daemon (manages cloud connectivity)
+  - jmd — Junos Mist Daemon (JMA's primary process on newer platforms)
+
+A switch may have the Mist Agent installed but the processes could be
+crashed, not started, or killed by a resource constraint. This check
+confirms the daemons are active in the process table.
+
+The check drops into the Junos shell to run ps (the ps command is not
+available in CLI mode).
+
+COMMANDS (run in shell mode)
+  start shell
+  /bin/sh -c 'ps aux | grep -E "mcd|jmd" | grep -v grep'
+  exit / cli
+
+PASS
+  Both mcd and jmd appear in the process list.
+
+WARN
+  Only one of mcd or jmd is running. The missing daemon indicates a
+  partial agent failure.
+
+FAIL
+  Neither mcd nor jmd is found in the process table. The Mist agent is
+  not running — connectivity to the cloud will fail.
+
+REMEDIATION
+  - Restart the Mist agent: restart mist-agent
+  - Or from shell: /etc/rc.d/mist restart
+  - Check process logs: show log jmd.log | last 50
+  - If processes crash repeatedly: check disk space and memory.
+  - Run: show system storage / show system virtual-memory

@@ -1,0 +1,35 @@
+CHECK: DNS Resolution & Reachability
+ID: dns-resolution
+File: src/checks/dns-resolution.check.ts
+Critical: YES — failure skips remaining checks
+
+PURPOSE
+Tests that the switch can actually resolve a Mist cloud hostname via DNS
+and reach it with ICMP. Uses the oc-term endpoint (or the first switch
+endpoint) from the cloud config as the test target. This confirms both
+DNS server reachability and correct name resolution.
+
+COMMANDS
+  ping inet <oc-term-host> count 3 rapid
+
+PASS
+  Ping succeeds (at least one reply received). The resolved IP is
+  reported.
+
+WARN
+  Hostname resolves to an IP (seen in ping output) but 0 packets
+  received — ICMP may be blocked by a firewall. DNS is working but
+  ICMP reachability is uncertain. Endpoint TCP checks still run.
+
+FAIL
+  DNS resolution fails ("unknown host", "not known"). All downstream
+  endpoint checks are skipped. Check DNS config and server reachability.
+
+SKIP
+  No cloud config provided — no test host to resolve.
+
+REMEDIATION
+  - Confirm DNS server IPs are correct (see dns-config check).
+  - Run: show host <hostname> — test DNS resolution directly.
+  - Test DNS manually: ping inet <your-dns-server>
+  - If ICMP blocked but DNS works, proceed to endpoint-reachability checks.

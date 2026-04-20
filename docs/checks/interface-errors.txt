@@ -1,0 +1,32 @@
+CHECK: Interface Errors
+ID: interface-errors
+File: src/checks/interface-errors.check.ts
+
+PURPOSE
+Inspects the uplink port for high error counters that indicate a degraded
+physical link. Looks for input errors, CRC errors, framing errors, and
+carrier transitions.
+
+COMMANDS
+  show interfaces <uplinkPort> extensive
+
+PASS
+  Error counters are zero or below significance threshold. Link is clean.
+
+WARN
+  Non-zero input errors, CRC errors, or framing errors detected. Link is
+  functional but the physical layer may be degraded — could cause packet
+  loss or intermittent disconnects.
+
+FAIL
+  Error counters are high (above threshold) or carrier transitions are
+  excessive, indicating a flapping or faulty link.
+
+SKIP
+  uplinkPort is not set.
+
+REMEDIATION
+  - Replace or reseat the uplink cable.
+  - Test with a known-good SFP module if applicable.
+  - Run: show interfaces <uplinkPort> extensive — note the error delta.
+  - Check for duplex mismatch with upstream switch.

@@ -195,6 +195,19 @@ export class MistApiService {
   }
 
   /**
+   * Find a device in the Mist inventory by its Mist device ID.
+   * Used as a fallback status check when the stats endpoint is unavailable.
+   */
+  async findDeviceById(deviceId: string): Promise<MistInventoryDevice | null> {
+    try {
+      const inventory = await this.getInventory();
+      return inventory.find((d) => d.id === deviceId) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Fetch the Mist device configuration (intended config).
    */
   async getDeviceConfig(siteId: string, deviceId: string): Promise<MistDeviceConfig> {

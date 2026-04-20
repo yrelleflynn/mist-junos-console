@@ -1,0 +1,51 @@
+CHECK: SSL Certificate Inspection
+ID: cert-<hostname>  (one per endpoint)
+File: src/checks/ssl-certificate.check.ts
+Pattern: Factory function — sslCertificateCheck(endpoint)
+
+PURPOSE
+Connects to a Mist cloud endpoint over HTTPS and inspects the TLS
+certificate presented. Detects SSL inspection (MITM) by checking the
+certificate issuer against known Mist/Juniper/CDN certificate authorities.
+
+SSL inspection is a common cause of Mist connectivity failures: the
+switch sends its outbound-ssh connection to what it believes is the Mist
+cloud, but a corporate firewall decrypts and re-encrypts the traffic with
+its own certificate. The Mist agent rejects the foreign certificate.
+
+The check drops into the Junos shell to run curl (not available from
+CLI mode), then returns to CLI mode.
+
+COMMANDS (run in shell mode)
+  start shell
+  /bin/sh -c 'curl -4 -vk --connect-timeout 30 https://<host>/ -o /dev/null 2>/tmp/certcheck.txt'
+  cat /tmp/certcheck.txt
+  rm -f /tmp/certcheck.txt
+  exit / cli
+
+PASS
+  Certificate issuer matches an expected CA:
+    - Juniper Networks (redirect.juniper.net)
+    - Mist Systems (jma-terminator, ztp endpoints)
+    - DigiCert (cdn.juniper.net)
+    - Amazon / Starfield (AWS-hosted endpoints)
+    - Google Trust Services / GTS (GCP-hosted clouds)
+
+FAIL
+  Certificate issuer does NOT match any expected CA. This strongly
+  indicates SSL inspection is active. Detail message reads:
+  "POSSIBLE SSL INSPECTION — Certificate issued by <issuer>."
+
+WARN
+  curl is not available on the switch, TLS handshake timed out after
+  connecting, or cert output could not be parsed.
+
+SKIP
+  Connection refused on port 443, or connect timeout (host unreachable).
+
+REMEDIATION
+  - Identify the firewall performing SSL inspection.
+  - Add Mist cloud IP ranges / FQDNs to the SSL inspection bypass list.
+  - Mist cloud FQDNs: *.mistsys.net, *.mist.com, redirect.juniper.net
+  - After bypass is configured, re-run this check to confirm the
+    certificate issuer reverts to an expected CA.

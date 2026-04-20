@@ -13,6 +13,9 @@ const PORT = Number(process.env.JUNOS_CONSOLE_SERVER_PORT || 3333);
 /** @type {Map<string, { members: { ws: import('ws').WebSocket, role: 'operator' | 'support' }[] }>} */
 const sessions = new Map();
 
+/** Session IDs explicitly authorized by the local operator for remote MCP access. */
+const authorizedSessions = new Set();
+
 function mistProxyHandler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -104,6 +107,76 @@ const server = http.createServer((req, res) => {
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(found ?? { sessionId: null, mistCredentials: null }));
+    return;
+  }
+
+  // Local-only: authorize or deauthorize a session for remote MCP access.
+  if (req.url === '/api/authorize-session') {
+    const remoteAddr = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+    if (remoteAddr !== '127.0.0.1' && remoteAddr !== '::1') {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Forbidden: only accessible from localhost' }));
+      return;
+    }
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+      });
+      res.end();
+      return;
+    }
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Method not allowed' }));
+      return;
+    }
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      try {
+        const { sessionId, enabled } = JSON.parse(body);
+        if (!sessionId || typeof sessionId !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'sessionId required' }));
+          return;
+        }
+        if (!sessions.has(sessionId)) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Unknown session' }));
+          return;
+        }
+        if (enabled) {
+          authorizedSessions.add(sessionId);
+          console.log('[hub] remote MCP access enabled for session', sessionId);
+        } else {
+          authorizedSessions.delete(sessionId);
+          console.log('[hub] remote MCP access disabled for session', sessionId);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, sessionId, enabled: !!enabled }));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+    });
+    return;
+  }
+
+  // MCP list_sessions tool calls this to enumerate active console sessions.
+  if (req.method === 'GET' && req.url === '/sessions') {
+    const result = [];
+    for (const [id, sess] of sessions) {
+      const operatorConnected = sess.members.some(
+        (m) => m.role === 'operator' && m.ws.readyState === 1,
+      );
+      const supportCount = sess.members.filter(
+        (m) => m.role === 'support' && m.ws.readyState === 1,
+      ).length;
+      result.push({ session_id: id, operator_connected: operatorConnected, support_count: supportCount, remote_access_enabled: authorizedSessions.has(id) });
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
     return;
   }
 
@@ -274,6 +347,7 @@ wss.on('connection', (ws) => {
           m.ws.send(JSON.stringify({ type: 'session-ended', reason: 'operator-disconnected' }));
         }
       }
+      authorizedSessions.delete(sessionId);
       sessions.delete(sessionId);
       console.log('[ws] session closed (operator left)', sessionId);
     } else if (sess.members.length === 0) {

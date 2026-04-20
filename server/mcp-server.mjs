@@ -2,28 +2,29 @@
  * mcp-server.mjs — MCP server for Junos console + Mist API
  *
  * Stdio mode (default — for Claude Desktop on the same machine):
- *   MIST_API_HOST=api.mist.com MIST_API_TOKEN=xxx MIST_ORG_ID=xxx \
- *   node server/mcp-server.mjs <session-id>
+ *   node server/mcp-server.mjs
  *
  * HTTP mode (for Claude Desktop on a different machine on the LAN):
- *   MIST_API_HOST=api.mist.com MIST_API_TOKEN=xxx MIST_ORG_ID=xxx \
- *   MCP_TRANSPORT=http MCP_PORT=3334 \
- *   node server/mcp-server.mjs <session-id>
+ *   node server/mcp-server.mjs --http
  *
  *   Then in Claude Desktop on the remote machine:
  *   { "mcpServers": { "junos-console": { "url": "http://10.100.100.x:3334/mcp" } } }
+ *
+ * Session access:
+ *   All tools require a session_id obtained out-of-band from the local operator.
+ *   The operator must also tick "Allow remote access" in the UI before any tool call
+ *   will succeed. list_sessions validates and returns info for the given session_id.
  *
  * Environment variables:
  *   MCP_TRANSPORT    "stdio" (default) or "http"
  *   MCP_PORT         HTTP listen port (default 3334)
  *   MCP_HOST         HTTP bind address (default 0.0.0.0)
  *   MCP_ALLOW_CIDR   Comma-separated allowed subnets (default 10.100.100.0/24,192.168.1.0/24); localhost always allowed
- *   HUB_URL          Hub HTTP base URL for session discovery (default http://127.0.0.1:3333)
+ *   HUB_URL          Hub base URL (default http://127.0.0.1:3333)
  *   WS_URL           WebSocket hub URL (default ws://127.0.0.1:3333/ws)
- *   MCP_SESSION_ID   Session ID override (auto-discovered from hub if not set)
- *   MIST_API_HOST    e.g. api.mist.com (auto-discovered from session if not set)
- *   MIST_API_TOKEN   Mist API token   (auto-discovered from session if not set)
- *   MIST_ORG_ID      Mist org ID      (auto-discovered from session if not set)
+ *   MIST_API_HOST    e.g. api.mist.com (fallback for Mist tools when not supplied per-call)
+ *   MIST_API_TOKEN   Mist API token   (fallback for Mist tools when not supplied per-call)
+ *   MIST_ORG_ID      Mist org ID      (fallback for Mist tools when not supplied per-call)
  */
 
 import http from 'node:http';
@@ -46,10 +47,6 @@ const MCP_HOST = process.env.MCP_HOST || '0.0.0.0';
 const MCP_ALLOW_CIDRS = (process.env.MCP_ALLOW_CIDR || '10.100.100.0/24,192.168.1.0/24')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
-// Session ID: skip '--http' if it appears as first positional arg.
-// May be empty — auto-discovered from the hub on first console tool call.
-const _args = process.argv.slice(2).filter((a) => a !== '--http');
-let SESSION_ID = _args[0] || process.env.MCP_SESSION_ID || '';
 const HUB_URL = process.env.HUB_URL || 'http://127.0.0.1:3333';
 const WS_URL = process.env.WS_URL || 'ws://127.0.0.1:3333/ws';
 
@@ -166,31 +163,29 @@ function checkCommandSafety(command) {
 
 let ws = null;
 let wsReady = false;
-let wsError = null;
 let wsConnecting = false; // guard against concurrent connect attempts
+/** The session ID we are currently joined to (null if not connected). */
+let currentSessionId = null;
 
 /** @type {{ resolve: Function, collector: string[], timer: ReturnType<typeof setTimeout> } | null} */
 let pendingCommand = null;
 
-function connectWs() {
+/**
+ * Connect the WebSocket to the hub and join the given session as support.
+ * @param {string} sessionId
+ */
+function connectWs(sessionId) {
   return new Promise((resolve, reject) => {
-    if (!SESSION_ID) {
-      wsError = 'No session ID provided. Pass session ID as first argument.';
-      reject(new Error(wsError));
-      return;
-    }
-
     const socket = new WebSocket(WS_URL);
     ws = socket;
 
     const timeout = setTimeout(() => {
       socket.terminate();
-      wsError = 'WebSocket connection timed out.';
-      reject(new Error(wsError));
+      reject(new Error('WebSocket connection timed out.'));
     }, 8000);
 
     socket.on('open', () => {
-      socket.send(JSON.stringify({ type: 'join', role: 'support', sessionId: SESSION_ID }));
+      socket.send(JSON.stringify({ type: 'join', role: 'support', sessionId }));
     });
 
     socket.on('message', (raw) => {
@@ -200,6 +195,7 @@ function connectWs() {
       if (msg.type === 'joined') {
         clearTimeout(timeout);
         wsReady = true;
+        currentSessionId = sessionId;
         // Accept Mist credentials from session if not already set via env vars
         if (msg.mistCredentials && typeof msg.mistCredentials === 'object') {
           const c = msg.mistCredentials;
@@ -208,23 +204,24 @@ function connectWs() {
           if (!MIST_ORG_ID && c.orgId) { MIST_ORG_ID = c.orgId; }
           console.error('[mcp] Received Mist credentials from session (env vars take precedence).');
         }
-        console.error(`[mcp] Joined session ${SESSION_ID} as support`);
+        console.error(`[mcp] Joined session ${sessionId} as support`);
         resolve();
         return;
       }
 
       if (msg.type === 'error') {
         clearTimeout(timeout);
-        wsError = msg.message || 'WebSocket error';
-        if (!wsReady) { reject(new Error(wsError)); return; }
-        console.error('[mcp] ws error:', wsError);
+        const errMsg = msg.message || 'WebSocket error';
+        if (!wsReady) { reject(new Error(errMsg)); return; }
+        console.error('[mcp] ws error:', errMsg);
         return;
       }
 
       if (msg.type === 'session-ended') {
         wsReady = false;
-        wsError = `Session ended: ${msg.reason || 'unknown'}`;
-        console.error('[mcp]', wsError);
+        currentSessionId = null;
+        const reason = `Session ended: ${msg.reason || 'unknown'}`;
+        console.error('[mcp]', reason);
         if (pendingCommand) {
           const { resolve: res, collector, timer } = pendingCommand;
           clearTimeout(timer);
@@ -254,7 +251,7 @@ function connectWs() {
 
     socket.on('close', () => {
       wsReady = false;
-      wsError = 'WebSocket disconnected.';
+      currentSessionId = null;
       if (pendingCommand) {
         const { resolve: res, collector, timer } = pendingCommand;
         clearTimeout(timer);
@@ -264,82 +261,42 @@ function connectWs() {
     });
 
     socket.on('error', (err) => {
-      wsError = err.message;
       if (!wsReady) { clearTimeout(timeout); reject(err); }
     });
   });
 }
 
 /**
- * Call the hub's /api/session endpoint to get the current active operator
- * session ID and Mist credentials. Populates SESSION_ID and credential vars
- * if they are not already set.
+ * Ensure the WebSocket is connected and joined to the given session.
+ * - Already connected to that session → reuse.
+ * - Connected to a different session → disconnect, clear buffer, reconnect.
+ * - Not connected → connect fresh.
  *
- * @returns {Promise<string|null>} null on success, error message on failure.
- */
-async function discoverSession() {
-  return new Promise((resolve) => {
-    const req = http.get(`${HUB_URL}/api/session`, (res) => {
-      let data = '';
-      res.on('data', (c) => { data += c; });
-      res.on('end', () => {
-        try {
-          const body = JSON.parse(data);
-          if (!body.sessionId) {
-            resolve('No active operator session found on hub. Enable the remote session in the browser first.');
-            return;
-          }
-          // Populate session ID if not already set
-          if (!SESSION_ID) SESSION_ID = body.sessionId;
-          // Populate Mist credentials from session if env vars are absent
-          if (body.mistCredentials) {
-            const c = body.mistCredentials;
-            if (!MIST_API_HOST && c.apiHost) MIST_API_HOST = c.apiHost;
-            if (!MIST_API_TOKEN && c.apiToken) MIST_API_TOKEN = c.apiToken;
-            if (!MIST_ORG_ID && c.orgId) MIST_ORG_ID = c.orgId;
-            console.error('[mcp] Discovered Mist credentials from hub session.');
-          }
-          console.error(`[mcp] Discovered session: ${SESSION_ID}`);
-          resolve(null);
-        } catch (err) {
-          resolve(`Failed to parse hub /api/session response: ${err.message}`);
-        }
-      });
-    });
-    req.on('error', (err) => {
-      resolve(`Hub unreachable at ${HUB_URL} — is the server running? (${err.message})`);
-    });
-    req.end();
-  });
-}
-
-/**
- * Ensure the WebSocket is connected and joined to the session.
- * Called lazily before each console tool invocation. Auto-discovers the
- * session from the hub if SESSION_ID is not set, so no session ID needs
- * to be passed on the command line.
- *
+ * @param {string} sessionId
  * @returns {Promise<string|null>} null on success, error message string on failure.
  */
-async function ensureWsConnected() {
-  if (wsReady) return null;
+async function ensureConnectedTo(sessionId) {
+  if (!sessionId) return 'session_id is required.';
+
+  // Already on the right session
+  if (wsReady && currentSessionId === sessionId) return null;
+
   if (wsConnecting) return 'Connection attempt already in progress — try again shortly.';
 
-  // Auto-discover session ID (and credentials) from hub if not configured
-  if (!SESSION_ID) {
-    const discoverErr = await discoverSession();
-    if (discoverErr) return discoverErr;
-  }
-
-  // Clean up any stale socket before retrying
+  // Disconnect from old session (different session or stale socket)
   if (ws) {
     try { ws.terminate(); } catch { /* ignore */ }
     ws = null;
+    wsReady = false;
+    currentSessionId = null;
+    // Clear buffered output — it belongs to the old session
+    outputBuffer.length = 0;
+    rawTail = '';
   }
 
   wsConnecting = true;
   try {
-    await connectWs();
+    await connectWs(sessionId);
     return null;
   } catch (err) {
     return err.message;
@@ -416,7 +373,10 @@ function mistRequest(method, path, body, apiHost, apiToken) {
 
 // ── Tool implementations ───────────────────────────────────────────────────
 
-async function toolSendCommand({ command, timeout_ms = 15000, force = false }) {
+async function toolSendCommand({ command, session_id, timeout_ms = 15000, force = false }) {
+  const authErr = await checkAuthorization(session_id);
+  if (authErr) return { isError: true, content: [{ type: 'text', text: authErr }] };
+
   // Safety checks run before attempting connection (no need to be online to block a command)
   const isForceReboot = /^\s*request\s+system\s+reboot\b/i.test(command) && force;
   let warnMsg = null;
@@ -429,8 +389,7 @@ async function toolSendCommand({ command, timeout_ms = 15000, force = false }) {
     if (safety.warned) warnMsg = safety.warning;
   }
 
-  // Lazily connect if not already joined (handles session created after server start)
-  const connErr = await ensureWsConnected();
+  const connErr = await ensureConnectedTo(session_id);
   if (connErr) {
     return { isError: true, content: [{ type: 'text', text: connErr }] };
   }
@@ -464,7 +423,10 @@ function runCommand(command, timeout_ms) {
   });
 }
 
-async function toolReadOutput({ lines = 50 }) {
+async function toolReadOutput({ session_id, lines = 50 }) {
+  const authErr = await checkAuthorization(session_id);
+  if (authErr) return { isError: true, content: [{ type: 'text', text: authErr }] };
+
   const snapshot = rawTail ? [...outputBuffer, rawTail] : [...outputBuffer];
   const slice = snapshot.slice(-lines);
   return {
@@ -475,17 +437,58 @@ async function toolReadOutput({ lines = 50 }) {
   };
 }
 
-async function toolGetSessionState() {
-  const connErr = await ensureWsConnected();
+async function toolGetSessionState({ session_id }) {
+  const authErr = await checkAuthorization(session_id);
+  if (authErr) return { isError: true, content: [{ type: 'text', text: authErr }] };
+
+  const connErr = await ensureConnectedTo(session_id);
   if (connErr) {
     return { isError: true, content: [{ type: 'text', text: connErr }] };
   }
   const result = await runCommand('', 5000);
   const mode = detectMode(result.output);
-  return { content: [{ type: 'text', text: JSON.stringify({ mode }) }] };
+  return { content: [{ type: 'text', text: JSON.stringify({ mode, session_id }) }] };
+}
+
+async function toolListSessions({ session_id } = {}) {
+  const authErr = await checkAuthorization(session_id);
+  if (authErr) return { isError: true, content: [{ type: 'text', text: authErr }] };
+
+  return new Promise((resolve) => {
+    const req = http.get(`${HUB_URL}/sessions`, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try {
+          const sessions = JSON.parse(data);
+          if (session_id) {
+            // HTTP mode: return only the caller's own session (prevents enumeration).
+            const session = sessions.find((s) => s.session_id === session_id);
+            if (!session) {
+              resolve({ isError: true, content: [{ type: 'text', text: 'Error: Invalid or unauthorized session_id' }] });
+            } else {
+              resolve({ content: [{ type: 'text', text: JSON.stringify([session]) }] });
+            }
+          } else {
+            // stdio mode (no session_id): local operator can see all sessions.
+            resolve({ content: [{ type: 'text', text: JSON.stringify(sessions) }] });
+          }
+        } catch (err) {
+          resolve({ isError: true, content: [{ type: 'text', text: `Failed to parse sessions response: ${err.message}` }] });
+        }
+      });
+    });
+    req.on('error', (err) => {
+      resolve({ isError: true, content: [{ type: 'text', text: `Hub unreachable at ${HUB_URL} — is the server running? (${err.message})` }] });
+    });
+    req.end();
+  });
 }
 
 async function toolMistApiGet(input) {
+  const authErr = await checkAuthorization(input.session_id);
+  if (authErr) return { isError: true, content: [{ type: 'text', text: authErr }] };
+
   const creds = resolveMistCreds(input);
   if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
   try {
@@ -497,6 +500,9 @@ async function toolMistApiGet(input) {
 }
 
 async function toolMistApiPut(input) {
+  const authErr = await checkAuthorization(input.session_id);
+  if (authErr) return { isError: true, content: [{ type: 'text', text: authErr }] };
+
   const creds = resolveMistCreds(input);
   if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
   try {
@@ -508,6 +514,9 @@ async function toolMistApiPut(input) {
 }
 
 async function toolListSites(input = {}) {
+  const authErr = await checkAuthorization(input.session_id);
+  if (authErr) return { isError: true, content: [{ type: 'text', text: authErr }] };
+
   const creds = resolveMistCreds(input);
   if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
   if (!creds.orgId) {
@@ -525,6 +534,9 @@ async function toolListSites(input = {}) {
 }
 
 async function toolGetDeviceConfig(input) {
+  const authErr = await checkAuthorization(input.session_id);
+  if (authErr) return { isError: true, content: [{ type: 'text', text: authErr }] };
+
   const creds = resolveMistCreds(input);
   if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
   try {
@@ -536,6 +548,9 @@ async function toolGetDeviceConfig(input) {
 }
 
 async function toolGetDeviceStats(input) {
+  const authErr = await checkAuthorization(input.session_id);
+  if (authErr) return { isError: true, content: [{ type: 'text', text: authErr }] };
+
   const creds = resolveMistCreds(input);
   if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
   try {
@@ -547,6 +562,9 @@ async function toolGetDeviceStats(input) {
 }
 
 async function toolGetInventory(input = {}) {
+  const authErr = await checkAuthorization(input.session_id);
+  if (authErr) return { isError: true, content: [{ type: 'text', text: authErr }] };
+
   const creds = resolveMistCreds(input);
   if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
   if (!creds.orgId) {
@@ -571,6 +589,9 @@ async function toolGetInventory(input = {}) {
 }
 
 async function toolGetSiteSetting(input) {
+  const authErr = await checkAuthorization(input.session_id);
+  if (authErr) return { isError: true, content: [{ type: 'text', text: authErr }] };
+
   const creds = resolveMistCreds(input);
   if (creds.error) return { isError: true, content: [{ type: 'text', text: creds.error }] };
   try {
@@ -582,6 +603,41 @@ async function toolGetSiteSetting(input) {
 }
 
 // ── Tool definitions ───────────────────────────────────────────────────────
+
+/**
+ * Verify that session_id has been authorized for remote access by the local operator.
+ * Returns null if authorized, or an error message string if not.
+ * @param {string | undefined} session_id
+ * @returns {Promise<string | null>}
+ */
+function checkAuthorization(session_id) {
+  // stdio mode = local operator = always trusted; auth only applies to remote HTTP clients.
+  if (!USE_HTTP) return Promise.resolve(null);
+  if (!session_id) return Promise.resolve('session_id is required.');
+  return new Promise((resolve) => {
+    const req = http.get(`${HUB_URL}/sessions`, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try {
+          const list = JSON.parse(data);
+          const session = list.find((s) => s.session_id === session_id);
+          if (!session || !session.remote_access_enabled) {
+            resolve('Error: Invalid or unauthorized session_id');
+          } else {
+            resolve(null);
+          }
+        } catch (err) {
+          resolve(`Failed to verify authorization: ${err.message}`);
+        }
+      });
+    });
+    req.on('error', (err) => {
+      resolve(`Hub unreachable — cannot verify authorization: ${err.message}`);
+    });
+    req.end();
+  });
+}
 
 /** Optional per-call Mist credential properties, shared across all Mist API tool schemas. */
 const MIST_CRED_PROPS = {
@@ -599,7 +655,26 @@ const MIST_CRED_PROPS = {
   },
 };
 
+/** session_id property used as an auth token on all tools. */
+const SESSION_AUTH_PROP = {
+  session_id: {
+    type: 'string',
+    description: 'Authorized session ID — provided by the local operator and required for authentication.',
+  },
+};
+
 const TOOLS = [
+  {
+    name: 'list_sessions',
+    description:
+      'List active console sessions. In HTTP mode (remote access), session_id is required and ' +
+      'only that specific session is returned — prevents enumeration. In stdio mode (local), ' +
+      'session_id is optional and all sessions are returned when omitted.',
+    inputSchema: {
+      type: 'object',
+      properties: { ...SESSION_AUTH_PROP },
+    },
+  },
   {
     name: 'send_command',
     description:
@@ -609,6 +684,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        session_id: { type: 'string', description: 'Console session ID (from list_sessions).' },
         command: { type: 'string', description: 'The Junos CLI command to send.' },
         timeout_ms: {
           type: 'number',
@@ -621,21 +697,23 @@ const TOOLS = [
           default: false,
         },
       },
-      required: ['command'],
+      required: ['session_id', 'command'],
     },
   },
   {
     name: 'read_output',
-    description: 'Read the last N lines from the console output buffer (ANSI-stripped).',
+    description: 'Read the last N lines from the console output buffer (ANSI-stripped) for the currently connected session.',
     inputSchema: {
       type: 'object',
       properties: {
+        ...SESSION_AUTH_PROP,
         lines: {
           type: 'number',
           description: 'Number of lines to return (default 50).',
           default: 50,
         },
       },
+      required: ['session_id'],
     },
   },
   {
@@ -643,7 +721,13 @@ const TOOLS = [
     description:
       'Send a newline to the switch and detect the current CLI mode: ' +
       'operational (>), config (#), shell (%), login, or unknown.',
-    inputSchema: { type: 'object', properties: {} },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'Console session ID (from list_sessions).' },
+      },
+      required: ['session_id'],
+    },
   },
   {
     name: 'mist_api_get',
@@ -651,10 +735,11 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...SESSION_AUTH_PROP,
         path: { type: 'string', description: 'API path, e.g. /api/v1/orgs/{org_id}/sites' },
         ...MIST_CRED_PROPS,
       },
-      required: ['path'],
+      required: ['session_id', 'path'],
     },
   },
   {
@@ -663,11 +748,12 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...SESSION_AUTH_PROP,
         path: { type: 'string', description: 'API path.' },
         body: { type: 'object', description: 'JSON body to send.' },
         ...MIST_CRED_PROPS,
       },
-      required: ['path', 'body'],
+      required: ['session_id', 'path', 'body'],
     },
   },
   {
@@ -675,7 +761,8 @@ const TOOLS = [
     description: 'List all sites in the Mist org. Returns id and name for each site. Credentials fall back to server env vars if not supplied.',
     inputSchema: {
       type: 'object',
-      properties: { ...MIST_CRED_PROPS },
+      properties: { ...SESSION_AUTH_PROP, ...MIST_CRED_PROPS },
+      required: ['session_id'],
     },
   },
   {
@@ -684,11 +771,12 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...SESSION_AUTH_PROP,
         site_id: { type: 'string', description: 'Mist site ID.' },
         device_id: { type: 'string', description: 'Mist device ID.' },
         ...MIST_CRED_PROPS,
       },
-      required: ['site_id', 'device_id'],
+      required: ['session_id', 'site_id', 'device_id'],
     },
   },
   {
@@ -697,11 +785,12 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...SESSION_AUTH_PROP,
         site_id: { type: 'string', description: 'Mist site ID.' },
         device_id: { type: 'string', description: 'Mist device ID.' },
         ...MIST_CRED_PROPS,
       },
-      required: ['site_id', 'device_id'],
+      required: ['session_id', 'site_id', 'device_id'],
     },
   },
   {
@@ -710,9 +799,11 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...SESSION_AUTH_PROP,
         site_id: { type: 'string', description: 'If provided, only return devices assigned to this site.' },
         ...MIST_CRED_PROPS,
       },
+      required: ['session_id'],
     },
   },
   {
@@ -721,10 +812,11 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...SESSION_AUTH_PROP,
         site_id: { type: 'string', description: 'Mist site ID.' },
         ...MIST_CRED_PROPS,
       },
-      required: ['site_id'],
+      required: ['session_id', 'site_id'],
     },
   },
 ];
@@ -744,9 +836,10 @@ function createMcpServer() {
     const input = args ?? {};
 
     switch (name) {
+      case 'list_sessions':     return toolListSessions(input);
       case 'send_command':      return toolSendCommand(input);
       case 'read_output':       return toolReadOutput(input);
-      case 'get_session_state': return toolGetSessionState();
+      case 'get_session_state': return toolGetSessionState(input);
       case 'mist_api_get':      return toolMistApiGet(input);
       case 'mist_api_put':      return toolMistApiPut(input);
       case 'list_sites':        return toolListSites(input);
@@ -817,7 +910,7 @@ async function startHttp() {
         status: 'ok',
         transport: 'http',
         wsReady,
-        sessionId: SESSION_ID || null,
+        currentSessionId: currentSessionId || null,
         activeMcpSessions: httpSessions.size,
       }));
       return;
@@ -900,21 +993,7 @@ async function startHttp() {
 // ── Startup ────────────────────────────────────────────────────────────────
 
 async function main() {
-  // Attempt an eager connection if a session ID was explicitly provided.
-  // Otherwise, session discovery happens lazily on first console tool call —
-  // this avoids startup failures when the operator hasn't yet enabled the session.
-  if (SESSION_ID) {
-    try {
-      await connectWs();
-    } catch (err) {
-      console.error('[mcp] Console session unavailable at startup:', err.message);
-      console.error('[mcp] Will retry on first tool call.');
-      wsError = err.message;
-    }
-  } else {
-    console.error(`[mcp] No session ID set — will auto-discover from ${HUB_URL}/api/session on first console tool call.`);
-  }
-
+  // All tool calls require a session_id provided out-of-band by the local operator.
   if (USE_HTTP) {
     await startHttp();
   } else {

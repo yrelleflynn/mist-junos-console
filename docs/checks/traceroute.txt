@@ -1,0 +1,34 @@
+CHECK: Traceroute
+ID: trace-<hostname>  (one per endpoint)
+File: src/checks/traceroute.check.ts
+Pattern: Factory function — tracerouteCheck(endpoint)
+
+PURPOSE
+Runs a traceroute to a Mist cloud endpoint to show the network path.
+Results are informational — they do not cause a pass/fail but help
+identify where the path is being blocked or how many hops exist.
+
+Commonly used alongside endpoint-reachability: if TCP is blocked,
+the traceroute shows at which hop the traffic stops, pointing to the
+firewall device.
+
+COMMANDS
+  traceroute inet <host> wait 2 as-number-lookup no-resolve
+
+STATUS
+  Always returns 'info' (never pass/fail/warn) — this is a diagnostic
+  tool, not a connectivity gate.
+
+DETAIL
+  Reports:
+    - Number of responding hops
+    - IP of the last responding hop
+    - Count of non-responding hops (marked * * * in output)
+  If no hops respond, traffic may be blocked at the first hop (i.e.,
+  the default gateway is not forwarding).
+
+NOTES
+  - Uses inet (IPv4) to avoid IPv6 surprises.
+  - wait 2 reduces default 5-second per-hop timeout.
+  - as-number-lookup adds AS number annotations for ISP identification.
+  - no-resolve skips reverse DNS to speed up output.

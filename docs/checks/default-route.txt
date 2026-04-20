@@ -1,0 +1,26 @@
+CHECK: Default Gateway (Default Route)
+ID: default-route
+File: src/checks/default-route.check.ts
+Critical: YES — failure skips remaining checks
+
+PURPOSE
+Verifies a default route (0.0.0.0/0) exists in the routing table.
+Without a default route, the switch cannot send traffic to any address
+outside its directly connected subnets — including Mist cloud endpoints.
+
+COMMANDS
+  show route 0.0.0.0/0
+
+PASS
+  A default route is present. The next-hop IP is reported in the detail.
+
+FAIL
+  No default route found in the routing table. All cloud-reachability
+  checks are skipped because they will fail for the same reason.
+
+REMEDIATION
+  - Run: show route — inspect the full routing table.
+  - If DHCP: check the DHCP server is sending option 3 (router).
+  - If static: run: set routing-options static route 0.0.0.0/0 next-hop <gw>
+  - Check if the management IRB/interface is up: show interfaces terse.
+  - Confirm VLAN/gateway config on the upstream switch.

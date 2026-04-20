@@ -1,0 +1,33 @@
+CHECK: VLAN Configuration
+ID: vlan-config
+File: src/checks/vlan-config.check.ts
+
+PURPOSE
+Checks that the management VLAN is present and that the uplink port
+carries it (either as a tagged trunk or an access VLAN). A misconfigured
+VLAN is a common cause of management IP loss after a config push.
+
+COMMANDS
+  show vlans
+  show interfaces <uplinkPort> detail
+
+PASS
+  The expected management VLAN is listed in the VLAN table and the uplink
+  port is a member.
+
+WARN
+  VLAN table is populated but the management VLAN cannot be confirmed on
+  the uplink port, or there is ambiguity in the config.
+
+FAIL
+  Management VLAN is absent from the VLAN table, or the uplink port is
+  not a member.
+
+SKIP
+  uplinkPort is not set.
+
+REMEDIATION
+  - Run: show vlans <vlan-name> to inspect VLAN membership.
+  - Confirm the upstream switch is tagging the management VLAN on the
+    port connected to this switch.
+  - Correct VLAN config via Mist port profile or direct CLI commit.

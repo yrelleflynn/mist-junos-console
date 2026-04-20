@@ -1,0 +1,38 @@
+CHECK: DNS Configuration
+ID: dns-config
+File: src/checks/dns-config.check.ts
+
+PURPOSE
+Confirms that DNS server addresses are configured on the switch. Without
+DNS, the switch cannot resolve Mist cloud hostnames and all endpoint
+reachability checks will fail.
+
+The check searches five locations in order, stopping when servers are
+found:
+  1. show configuration system name-server
+  2. show configuration groups | display set | match name-server
+  3. show configuration system name-server | display inheritance
+  4. show system name-server (operational)
+  5. file show /etc/resolv.conf (shell fallback)
+
+COMMANDS
+  show configuration system name-server
+  show configuration groups | display set | match name-server
+  show configuration system name-server | display inheritance
+  show system name-server
+  file show /etc/resolv.conf
+
+PASS
+  At least one DNS server IP found via any of the above methods.
+  All found server IPs are reported.
+
+FAIL
+  No DNS server IPs found in any location. The switch has no name
+  resolution configured.
+
+REMEDIATION
+  - If Mist-managed: check the site network settings in the Mist
+    dashboard for DNS server configuration.
+  - If static: run: set system name-server <dns-ip>
+  - Check if a DNS server is configured in a Junos group:
+    show groups | display inheritance

@@ -5,7 +5,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "concurrently -k -n server,client -c blue,green \"npm run dev:server\" \"wait-on tcp:127.0.0.1:3333 && npm run dev:client\"",
+    "dev": "concurrently -k -n server,mcp,client -c blue,magenta,green \"npm run dev:server\" \"wait-on tcp:127.0.0.1:3333 && npm run mcp:http\" \"wait-on tcp:127.0.0.1:3333 && npm run dev:client\"",
     "dev:client": "vite",
     "dev:server": "node server/index.mjs",
     "build": "tsc --noEmit && vite build",

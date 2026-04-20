@@ -1,0 +1,33 @@
+CHECK: DHCP Lease
+ID: dhcp-lease
+File: src/checks/dhcp-lease.check.ts
+
+PURPOSE
+Checks whether the switch has an active DHCP lease on its management
+interface. Confirms the lease is bound (not expired or in a pending
+state) and reports the server IP, lease time, and interface.
+
+COMMANDS
+  show dhcp client binding
+
+PASS
+  At least one DHCP binding is shown in BOUND state. Server IP and
+  remaining lease time are reported.
+
+WARN
+  A binding exists but is in REQUESTING, RENEWING, or REBINDING state.
+  The switch has a lease but may lose it soon.
+
+FAIL
+  No bindings found, or all bindings are in INIT or EXPIRED state.
+
+SKIP
+  The management interface is statically addressed (no DHCP client
+  configured), or DHCP client process is not running.
+
+REMEDIATION
+  - Run: restart dhcp-local-server — restart the DHCP client.
+  - Confirm the management VLAN reaches a DHCP server.
+  - Run: show log dhclient — inspect DHCP client log for errors.
+  - If DHCP server is Mist-controlled, check site DHCP settings in the
+    Mist dashboard.

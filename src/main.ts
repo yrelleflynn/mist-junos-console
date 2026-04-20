@@ -213,8 +213,30 @@ function init(): void {
   let consoleSession: ConsoleSessionService | null = null;
   let currentMistCreds: { apiHost: string; apiToken: string; orgId: string } | undefined;
 
+  function hubApiBase(): string {
+    if (import.meta.env.DEV) {
+      const port = import.meta.env.VITE_CONSOLE_SERVER_PORT || '3333';
+      return `http://127.0.0.1:${port}`;
+    }
+    return window.location.origin;
+  }
+
+  async function setRemoteAccess(sessionId: string, enabled: boolean): Promise<void> {
+    try {
+      await fetch(`${hubApiBase()}/api/authorize-session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, enabled }),
+      });
+    } catch (err) {
+      term.writeError(`Remote access authorization failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   function tearDownRemoteSession(): void {
     if (consoleSession) {
+      const sid = consoleSession.id;
+      if (sid) void setRemoteAccess(sid, false);
       consoleSession.close();
       consoleSession = null;
     }
@@ -229,6 +251,7 @@ function init(): void {
     cs.onJoined = (sessionId) => {
       ui.remoteSessionId.value = sessionId;
       ui.remoteSessionPanel.classList.remove('is-hidden');
+      void setRemoteAccess(sessionId, true);
       term.writeSystem('— Remote session active —');
     };
     cs.onRemoteSerialTx = (data: Uint8Array) => {

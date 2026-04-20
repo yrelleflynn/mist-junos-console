@@ -1,0 +1,34 @@
+CHECK: Route to Mist Endpoints
+ID: route-to-mist
+File: src/checks/route-to-mist.check.ts
+
+PURPOSE
+Resolves the oc-term (or first switch endpoint) hostname to an IP and
+verifies a route exists to that IP in the routing table. Confirms the
+Mist cloud IP range is reachable from a routing perspective, independent
+of firewall policy.
+
+COMMANDS
+  show host <oc-term-host>
+  show route <resolved-ip>
+
+PASS
+  A route to the resolved Mist endpoint IP is found. The next-hop is
+  reported.
+
+WARN
+  The hostname could not be resolved to an IP (DNS may be working but
+  slow or the host returned no A record). Route check is skipped.
+
+FAIL
+  No route to the resolved IP. The Mist cloud IP range is not reachable
+  from the switch's routing table.
+
+SKIP
+  No cloud config provided, or no endpoint host available.
+
+REMEDIATION
+  - Run: show route <mist-ip> — inspect routing table.
+  - If no route: check default route (default-route check).
+  - If ISP-level routing issue: traceroute to the endpoint.
+  - Confirm upstream switch/router is not blocking Mist IP ranges.

@@ -30,6 +30,10 @@ export default defineConfig({
         target: SERVER_ORIGIN,
         changeOrigin: true,
       },
+      '/api': {
+        target: SERVER_ORIGIN,
+        changeOrigin: true,
+      },
       '/ws': {
         target: SERVER_ORIGIN,
         ws: true,
@@ -40,6 +44,10 @@ export default defineConfig({
     port: 3000,
     proxy: {
       '/mist-proxy': {
+        target: SERVER_ORIGIN,
+        changeOrigin: true,
+      },
+      '/api': {
         target: SERVER_ORIGIN,
         changeOrigin: true,
       },

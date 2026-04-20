@@ -1,0 +1,40 @@
+CHECK: LLDP Neighbor Detection
+ID: lldp
+File: src/checks/lldp.check.ts
+
+PURPOSE
+Discovers the uplink port by inspecting LLDP neighbor advertisements.
+Identifies which local interface connects to the upstream switch and
+extracts the upstream device hostname, chassis MAC, and port info.
+
+COMMANDS
+  show lldp neighbors
+  show lldp neighbors detail
+
+PASS
+  An LLDP neighbor is found on the configured uplinkPort (or the first
+  port with a neighbor if uplinkPort is not set). The detected port,
+  upstream device hostname, and chassis MAC are stored in the result and
+  forwarded to the CheckContext for use by downstream checks.
+
+WARN
+  LLDP neighbors are present but none match the configured uplinkPort.
+  Check is reported as pass but the detected port is substituted.
+
+FAIL
+  No LLDP neighbors found on any interface. The uplink cable may be
+  unplugged, the upstream switch may not have LLDP enabled, or the
+  interface may be down.
+
+SKIP
+  (Not applicable for this check.)
+
+EXTRA DATA RETURNED
+  detectedPort  — local interface where the upstream neighbor was seen
+  uplinkNeighbor — { localInterface, parentInterface, chassisId, portInfo, systemName }
+
+REMEDIATION
+  - Verify uplink cable is seated in both switches.
+  - Confirm LLDP is enabled on the upstream switch port.
+  - Run: show interfaces ge-0/0/0 (replace with uplink port).
+  - Run: show lldp statistics to see if LLDP PDUs are being received.

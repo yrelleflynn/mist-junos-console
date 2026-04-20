@@ -1,0 +1,33 @@
+CHECK: ARP (Gateway Reachability)
+ID: arp
+File: src/checks/arp.check.ts
+
+PURPOSE
+Checks that the default gateway is reachable at Layer 2 by verifying an
+ARP entry exists for it. A missing ARP entry means the switch cannot
+send IP packets off its local subnet even if it has a default route.
+
+COMMANDS
+  show arp
+
+PASS
+  An ARP entry is found for the default gateway IP, indicating Layer 2
+  adjacency is working.
+
+WARN
+  ARP table is present but the default gateway entry is incomplete or
+  stale (no MAC resolved).
+
+FAIL
+  No ARP entry for the default gateway. The gateway is Layer 2
+  unreachable — check VLAN membership and upstream switch config.
+
+SKIP
+  No management IP in context (interfaceIpCheck must run first), or
+  no default route found.
+
+REMEDIATION
+  - Run: ping <gateway-ip> — verify basic reachability.
+  - Run: show arp no-resolve — dump the full ARP table.
+  - Confirm the gateway is on the same VLAN as the management IP.
+  - Confirm the uplink is carrying the correct management VLAN tag.

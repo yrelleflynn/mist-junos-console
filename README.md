@@ -160,11 +160,18 @@ These apply equally to **Mist Support** and **future AI** features:
 
 - **Web Serial API** — Direct serial communication (Chrome/Edge)
 - **TypeScript + Vite** — SPA + **`support.html`** (remote viewer); dev server on port **3000**
-- **Node backend** — `server/index.mjs` on **3333** (override with `JUNOS_CONSOLE_SERVER_PORT`): **`POST /mist-proxy`** (same contract as before), **`GET /health`**, **WebSocket `/ws`** (console session hub)
-- **Dev routing** — Vite **proxies** `/mist-proxy` to the backend. **Console WebSockets** use **`ws://127.0.0.1:<port>/ws` directly** in dev (Vite’s `/ws` proxy is flaky with the Node `ws` server). Port defaults to **3333**; set **`VITE_CONSOLE_SERVER_PORT`** in `.env.development` if it must match **`JUNOS_CONSOLE_SERVER_PORT`**
-- **Remote support (initial)** — Operator enables **“Enable remote session”** after serial connect; **`support.html`** joins by session ID (mirrored RX/TX). *No Mist SSO yet—treat session IDs as secrets.*
-- **xterm.js** — Terminal UI
-- **Legacy** — `proxy/proxy.js` (port 4000) still forwards Mist only; prefer the unified server for WebSocket + proxy together.
+- **Node backend** (`server/index.mjs`) — Port **3333** (override with `JUNOS_CONSOLE_SERVER_PORT`):
+  - `POST /mist-proxy` — server-side Mist API proxy (no browser CORS)
+  - `GET /health` — liveness check
+  - `GET /api/session` — returns the first active operator session + Mist credentials (used by MCP server)
+  - `POST /api/authorize-session` — localhost-only; enables/disables remote MCP access for a session
+  - `GET /sessions` — lists all active sessions with operator/support counts and remote-access flags
+  - `WebSocket /ws` — console session hub (multiplex RX/TX between operator and support/agent)
+- **MCP server** (`server/mcp-server.mjs`) — Port **3334** (HTTP) or stdio; exposes 11 tools to AI agents for console interaction and Mist API access. Connects to the hub as a `support` client. Enforces IP allowlist and operator authorization in HTTP mode.
+- **Dev routing** — Vite proxies `/mist-proxy`, `/api`, and `/ws` to the backend. Console WebSockets connect directly to `ws://127.0.0.1:3333/ws` in dev (Vite’s WS proxy is unreliable with the Node `ws` library). Set `VITE_CONSOLE_SERVER_PORT` in `.env.development` if the port differs from 3333.
+- **Remote support** — Operator enables **”Enable remote session”** after serial connect; **`support.html`** joins by session ID (mirrored RX/TX). *No Mist SSO yet — treat session IDs as secrets.*
+- **xterm.js** — Terminal UI with ANSI support, scrollback, clickable URLs, auto-resize
+- **Legacy** — `proxy/proxy.js` (port 4000) still forwards Mist only; prefer the unified server.
 
 ---
 
@@ -175,39 +182,51 @@ npm install
 npm run dev
 ```
 
-This runs **both** the backend (`node server/index.mjs`, default **http://127.0.0.1:3333**) and **Vite** (http://localhost:3000) via `concurrently`. Open Chrome to **http://localhost:3000**.
+This runs **three processes** via `concurrently`:
 
-**Web Serial:** Use a normal **Chrome or Edge window** (not only Cursor’s / VS Code’s embedded Simple Browser). `'serial' in navigator` may still be `true` there, but the **port picker** is often missing or non-functional inside the IDE preview.
+| Process | Script | Default URL |
+|---------|--------|-------------|
+| Backend (HTTP + WebSocket hub) | `node server/index.mjs` | http://127.0.0.1:3333 |
+| MCP server (HTTP mode, for AI agents) | `node server/mcp-server.mjs --http` | http://0.0.0.0:3334/mcp |
+| Vite (frontend dev server) | `vite` | http://localhost:3000 |
+
+The MCP server and Vite each wait for TCP port 3333 to be open before starting.
+
+**Web Serial:** Use a normal **Chrome or Edge window** (not Cursor’s / VS Code’s embedded Simple Browser). `’serial’ in navigator` may still be `true` in the IDE preview, but the **port picker** is often missing or non-functional there.
 
 - **Main app:** `/` or `/index.html`
 - **Support console:** `/support.html` (optional query `?session=<uuid>`)
-- **Frontend only (no Mist / no remote sessions):** `npm run dev:client` — proxied calls fail unless the backend is running separately (`npm run dev:server`)
+- **Frontend only (no Mist / no remote sessions):** `npm run dev:client` — proxied calls fail unless the backend is running separately
 - **Backend only:** `npm run start:server` or `npm run dev:server`
+- **MCP server (stdio, for Claude Desktop on same machine):** `npm run mcp`
+- **MCP server (HTTP, for Claude Desktop on another LAN machine):** `npm run mcp:http`
 
-`npm run dev` waits until **TCP port 3333** is open, then starts Vite. You should see both **`[server]`** and **`[client]`** lines in the terminal; if the backend exits (e.g. **port 3333 already in use**), `concurrently -k` stops Vite too and **http://localhost:3000** will not load — fix the server error or stop the stale process: `lsof -i :3333` / `lsof -i :3000`. If **port 3000 is busy**, Vite fails fast (`strictPort: true`) — free the port or change `vite.config.ts`.
+`npm run dev` waits until **TCP port 3333** is open, then starts Vite and the MCP server. You should see **`[server]`**, **`[mcp]`**, and **`[client]`** lines in the terminal. If the backend exits (e.g. **port 3333 already in use**), `concurrently -k` stops all processes — fix the server error or kill the stale process: `lsof -i :3333` / `lsof -i :3000`. If **port 3000 is busy**, Vite fails fast (`strictPort: true`).
 
-Production: serve `dist/` behind HTTPS, run the **same** Node server (or equivalent) so `/mist-proxy` and `/ws` are available on **the same host** the browser uses (or configure explicit API/WS origins in the client when you add env-based URLs).
+Production: serve `dist/` behind HTTPS, run the **same** Node server so `/mist-proxy` and `/ws` are available on **the same host** the browser uses.
 
 ## Module Map
 
 ```
 src/
-├── main.ts                             # App controller
-├── support-main.ts                    # Support viewer (support.html entry)
-├── config/mist-clouds.config.ts        # 12 Mist cloud regions + endpoints
+├── main.ts                             # App controller — wires all services and DOM controls
+├── support-main.ts                     # Support viewer (support.html entry)
+├── config/mist-clouds.config.ts        # 12 Mist cloud regions + per-region switch endpoints
 ├── services/
-│   ├── serial.service.ts               # Web Serial API (+ optional TX mirroring)
-│   ├── console-session.service.ts     # WebSocket client for shared sessions
-│   ├── command-runner.service.ts        # CLI command execution + login
-│   ├── mist-api.service.ts             # Mist REST API (sites, inventory, config, adoption)
-│   ├── switch-identity.service.ts      # Switch identification + Mist inventory matching
-│   ├── config-drift.service.ts         # Mist vs Junos config comparison
-│   └── troubleshoot.service.ts         # Cloud connectivity checks
-├── components/terminal.component.ts    # xterm.js wrapper
+│   ├── serial.service.ts               # Web Serial API (open/read/write, TX mirroring to WebSocket)
+│   ├── console-session.service.ts      # WebSocket client for shared sessions (operator & support roles)
+│   ├── command-runner.service.ts       # CLI command execution + Junos login state machine
+│   ├── mist-api.service.ts             # Mist REST API (sites, inventory, config, adoption, events, stats, audit logs)
+│   ├── switch-identity.service.ts      # Switch identification + Mist inventory matching + cloud status
+│   ├── config-drift.service.ts         # Mist intended config vs actual Junos running config comparison
+│   └── troubleshoot.service.ts         # Cloud connectivity checks + offline timeline
+├── components/terminal.component.ts    # xterm.js wrapper (ANSI, scrollback, clickable URLs, auto-resize)
+├── utils/junos-log-time.ts             # Junos syslog timestamp parser (timezone-aware UTC alignment)
 └── styles/main.css
 
 server/
-└── index.mjs                           # Mist proxy + WebSocket session hub
+├── index.mjs                           # Mist proxy (POST /mist-proxy) + WebSocket session hub (/ws)
+└── mcp-server.mjs                      # MCP server — exposes console + Mist API tools to AI agents
 ```
 
 ## Features (current)
@@ -218,6 +237,8 @@ server/
 ### Mist API Integration
 - 12 cloud regions, site list, root password retrieval, inventory search
 - Device config pull, adoption commands (`GET /api/v1/orgs/{org_id}/ocdevices/outbound_ssh_cmd`)
+- Device events (`sites/{id}/devices/events`) and stats (`sites/{id}/stats/devices/{id}`) including `last_seen`, `status`
+- Org audit logs (`orgs/{id}/logs`) for correlating config changes with disconnect events
 - Browser calls **`/mist-proxy`**; in dev the Vite dev server forwards to the Node backend (production: same host or your edge proxy)
 
 ### Remote support session
@@ -229,6 +250,22 @@ server/
 - **Get Root Password** — from Mist site settings, with login instructions
 - **Check Config Drift** — compares Mist intended config vs actual running config
 - **Adopt Switch** — fetches adoption commands from API, pre-checks root auth, applies via console
+
+### Offline Timeline
+
+Triggered by **"Offline Timeline"** after a switch is identified in Mist. Correlates cloud-side and switch-side data to explain *when* and *why* the switch went offline:
+
+| Step | Source | What it fetches |
+|------|--------|-----------------|
+| Mist Last Seen | `stats/devices` API | Last seen timestamp + current status (`connected` / `disconnected`) |
+| Recent Mist Events | `devices/events` API | Up to 20 device events; highlights DISCONNECTED events |
+| Switch Uptime | `show system uptime` | Boot time, last configured time, configuring user |
+| Mist Audit Logs | `orgs/{id}/logs` API | Config changes within ±30 min of the disconnect event |
+| Switch Logs | `show log jmd.log` (JMA) or `show log mist.log` (legacy pyagent) | Mist agent log lines around the disconnect window |
+
+Log file selection is automatic: `show version | match mist` output determines whether the switch runs JMA (`jmd.log`) or the legacy pyagent (`mist.log`). Log line timestamps are aligned to UTC using `show system uptime` "Current time" (timezone-aware, 30+ timezone abbreviations supported including GMT±N offsets).
+
+**Requires:** switch identified in Mist with a site assigned; Mist API configured.
 
 ### Cloud Connectivity Check (17 tests)
 
@@ -258,6 +295,80 @@ Tests run sequentially with critical gates:
 ### Standalone Mist Status
 - Runs tests 11-14 independently via button
 
+### MCP Server (AI agent integration)
+
+`server/mcp-server.mjs` exposes the console session and Mist API as [Model Context Protocol](https://modelcontextprotocol.io) tools so an AI agent (Claude Desktop, or any MCP-compatible client) can autonomously operate the Junos console.
+
+#### Transport modes
+
+| Mode | Command | When to use |
+|------|---------|-------------|
+| **stdio** | `npm run mcp` | Claude Desktop on the **same machine** — no network exposure |
+| **HTTP** | `npm run mcp:http` | Claude Desktop (or any client) on a **different machine on the LAN** |
+
+HTTP mode listens on port **3334** (env `MCP_PORT`), binds to `0.0.0.0` (env `MCP_HOST`), and enforces an **IP allowlist** (env `MCP_ALLOW_CIDR`, default `10.100.100.0/24,192.168.1.0/24`; localhost always allowed). Each connecting MCP client gets its own session negotiated via the `mcp-session-id` header.
+
+#### Authorization model
+
+All tools require a **session_id** that the local operator obtains from the UI after connecting to serial. The operator must also tick **"Allow remote access"** in the UI — this calls `POST /api/authorize-session` on the backend to register the session as authorized. Unrecognized or unauthorized session IDs are rejected with a 403-equivalent error. In stdio mode (local operator) authorization is bypassed.
+
+#### Available tools
+
+| Tool | Description |
+|------|-------------|
+| `list_sessions` | List active console sessions (HTTP mode: returns only the caller's own session to prevent enumeration) |
+| `send_command` | Send a Junos CLI command and wait for a prompt response. Dangerous commands (`zeroize`, `halt`, `power-off`, `reboot`) are blocked; destructive commands (`delete`, `commit`, `rollback`) emit a warning but proceed |
+| `read_output` | Read the last N lines from the in-memory console output buffer (ANSI-stripped, up to 1000 lines rolling) |
+| `get_session_state` | Detect current CLI mode: `operational` (`>`), `config` (`#`), `shell` (`%`), `login`, or `unknown` |
+| `mist_api_get` | Make a GET request to the Mist REST API |
+| `mist_api_put` | Make a PUT request to the Mist REST API |
+| `list_sites` | List all sites in a Mist org |
+| `get_device_config` | Get the full device configuration from Mist for a specific switch |
+| `get_device_stats` | Get live device stats (including `port_stat`) from Mist |
+| `get_inventory` | Get the switch inventory for a Mist org, optionally filtered by site |
+| `get_site_setting` | Get site settings from Mist, including `switch_mgmt.root_password` |
+
+Mist credentials for the API tools are resolved in this order: per-call parameters → Mist credentials forwarded by the operator's session → environment variables (`MIST_API_HOST`, `MIST_API_TOKEN`, `MIST_ORG_ID`).
+
+#### Environment variables (MCP server)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
+| `MCP_PORT` | `3334` | HTTP listen port |
+| `MCP_HOST` | `0.0.0.0` | HTTP bind address |
+| `MCP_ALLOW_CIDR` | `10.100.100.0/24,192.168.1.0/24` | Comma-separated allowed subnets (HTTP mode) |
+| `HUB_URL` | `http://127.0.0.1:3333` | Backend hub base URL |
+| `WS_URL` | `ws://127.0.0.1:3333/ws` | WebSocket hub URL |
+| `MIST_API_HOST` | _(empty)_ | Fallback Mist API host (e.g. `api.mist.com`) |
+| `MIST_API_TOKEN` | _(empty)_ | Fallback Mist API token |
+| `MIST_ORG_ID` | _(empty)_ | Fallback Mist org ID |
+
+#### Claude Desktop configuration (stdio, same machine)
+
+```json
+{
+  "mcpServers": {
+    "junos-console": {
+      "command": "node",
+      "args": ["C:/path/to/mist-junos-console/server/mcp-server.mjs"]
+    }
+  }
+}
+```
+
+#### Claude Desktop configuration (HTTP, remote machine)
+
+```json
+{
+  "mcpServers": {
+    "junos-console": {
+      "url": "http://10.100.100.x:3334/mcp"
+    }
+  }
+}
+```
+
 ## Backlog & future improvements
 
 Ideas and follow-ups (not committed work). Add or tick items as you go.
@@ -270,7 +381,7 @@ Ideas and follow-ups (not committed work). Add or tick items as you go.
 
 ### Logs & timeline
 
-- **Timezone alignment** — Offline timeline matches log line timestamps to disconnect time using switch-local TZ or full date parsing (today uses minutes-of-day vs UTC, which can drift).
+- **Timezone alignment** — UTC conversion is implemented via `junos-log-time.ts` using `show system uptime` "Current time" + TZ abbreviation. Known gap: ambiguous abbreviations (e.g. `CST` = US Central or China) default to US Central; use `GMT±N` on the switch for unambiguous alignment.
 - **Dual log fallback** — If `jmd.log` is empty and version heuristics are ambiguous, optionally tail `mist.log` as a second pass.
 - **Structured log excerpts** — Attach top N categorized lines to export or support bundle.
 
