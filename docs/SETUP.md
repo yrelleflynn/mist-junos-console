@@ -13,7 +13,8 @@ hackathon judges.
   - Chrome or Edge for Web Serial support
 - a Juniper EX switch connected by USB or serial console cable
 - optional:
-  - Mist API token
+  - browser extension loaded from `extension/` for Mist Launch Mode
+  - Mist API token for manual fallback mode
   - backend access for remote support and MCP testing
 
 ## Quick Start
@@ -42,12 +43,50 @@ This starts:
 ## First Run Workflow
 
 1. Open the operator UI in Chrome or Edge.
-2. Connect the serial cable to the switch.
-3. Use `Connect` and complete the browser serial picker if needed.
-4. Log in to the switch.
-5. Optionally configure Mist API details.
-6. Identify the switch.
-7. Run `Run Recommended Checks` or `Run Full Baseline`.
+2. If you want the preferred flow, open a Mist switch page and launch via the browser extension.
+3. Connect the serial cable to the switch.
+4. Use `Connect` and complete the browser serial picker if needed.
+5. Click `Login to Switch`.
+6. In Mist Launch Mode, let the app use the Mist-launched root password when available and verify the console-connected switch against the Mist-launched switch.
+7. After the Mist Launch card turns green, run `Run Recommended Checks` or `Run Full Baseline`.
+
+## Mist Launch Mode
+
+Preferred workflow:
+
+1. Start the frontend and backend locally.
+2. Load the unpacked extension from [extension/README.md](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03 Mist Docs/07 Projects/mist-junos-console/extension/README.md).
+3. Open a Mist switch page in the browser.
+4. Click `Open in Junos Console`.
+5. In the app:
+   - connect the serial session
+   - click `Login to Switch`
+   - wait for switch verification
+6. Only after verification succeeds should `Mist Status`, `Switch Cloud State`, checks, and actions be considered trusted.
+
+Expected behavior in Mist Launch Mode:
+
+- `Identify Switch` and `Get Root Password` controls are hidden
+- the Mist Launch card shows waiting, mismatch, or matched state
+- `Mist Status` and `Switch Cloud State` remain `Unknown` until verification succeeds
+- the manual Mist API modal remains available as fallback only
+
+## Manual Fallback Mode
+
+Use this when:
+
+- you did not launch from Mist
+- the extension is unavailable
+- launch hydration failed
+- you intentionally want to test the manual API workflow
+
+Workflow:
+
+1. Open `http://localhost:3000/` directly.
+2. Connect serial and log in.
+3. Configure Mist API details manually if needed.
+4. Identify the switch.
+5. Run checks or actions.
 
 ## Support Session Workflow
 

@@ -1,5 +1,37 @@
 # Mist Launch Mode
 
+## Current State
+
+Mist Launch Mode is now a real product mode, not just a design direction.
+
+Implemented behavior:
+
+- the browser extension launches `junos-console` from a Mist switch page
+- the extension resolves switch context from the authenticated Mist browser session
+- the launch payload is exchanged through a short-lived backend token rather than a raw query-string dump
+- the frontend persists the launch overlay in session storage and reapplies it after URL cleanup
+- the UI shows a dedicated Mist Launch verification card
+- checks, actions, config sync, adoption, and trusted cloud state stay locked until the console-connected switch matches the Mist-launched switch
+- `Identify Switch` and `Get Root Password` controls are hidden in Mist Launch Mode because the launch flow already provides the expected switch and the preferred login path
+
+Current extension-backed launch context can include:
+
+- device name
+- serial
+- MAC
+- site and org identifiers
+- Mist cloud / API host
+- `switch_mgmt.root_password`
+- `config_cmd`
+- monitor / status data used by the app after verification
+
+Manual Mist API setup still exists, but it is now the fallback path for:
+
+- sessions not launched from Mist
+- development / test workflows
+- extension-unavailable scenarios
+- recovery if extension-backed data is unavailable
+
 ## Purpose
 
 Define the target user experience when `junos-console` is launched directly
@@ -47,7 +79,9 @@ Operator flow:
 
 1. open a Mist switch page
 2. click `Open in Junos Console`
-3. local `junos-console` opens with Mist launch context
+3. the extension posts the launch payload to the local backend
+4. local `junos-console` opens with a short-lived `mistLaunchToken`
+5. the app imports the launch context, cleans the URL, and keeps the launch overlay in session storage for the rest of the browser session
 
 The UI should show a compact launch indicator such as:
 
@@ -68,8 +102,13 @@ Those may still be available internally, but they are not the primary value.
 
 ## 2. Verify The Console Device
 
-After `Identify Switch`, the app should compare the locally identified switch
-with the Mist launch context.
+After login and identity discovery, the app compares the console-connected
+switch with the Mist launch context.
+
+The product rule is now:
+
+- first priority is verifying that the operator is on the correct switch
+- only after verification succeeds should Mist status, switch cloud state, and mutating workflows be trusted
 
 Suggested comparison inputs:
 
@@ -96,9 +135,17 @@ Example wording:
 
 #### Neutral: Not yet verified
 
-Before identify runs:
+Before verification succeeds:
 
 - `Waiting to verify console device against Mist launch context`
+
+Current gating behavior while waiting:
+
+- `Mist Status` remains `Unknown`
+- `Switch Cloud State` remains `Unknown`
+- checks and actions stay disabled
+- config sync and adoption stay disabled
+- the UI explains that this is intentional until the console session is verified
 
 This becomes the central job of switch identification in Mist-launched mode.
 
@@ -113,6 +160,13 @@ something like:
 If the extension is present but not yet able to provide richer data:
 
 - `Mist launch context imported; richer Mist data still requires extension-backed fetches`
+
+Today the extension-backed path already provides more than simple context
+bridging. It can supply:
+
+- site-backed root password for login
+- device config intent (`config_cmd`)
+- Mist monitor data used after verification
 
 ## What To Do With Org And Site
 
@@ -150,6 +204,8 @@ Preferred mode:
 - no required API token paste
 - no mandatory org/site selection
 - extension-backed context and data
+- login should prefer the Mist-launched root password when available
+- manual identify/root-password controls should stay out of the way
 
 ### Manual Mode
 
@@ -246,14 +302,13 @@ Good model:
 
 ## Phase 1: Mist Launch Context
 
-Already in progress:
+Implemented:
 
 - cross-launch from Mist switch page
-- import cloud/org/site/device IDs
+- import cloud/org/site/device context
+- secure launch token exchange through the backend
 - show Mist-launched state
-
-Main UX improvement still needed:
-
+- persist launch context for the session after URL cleanup
 - make switch-match verification a first-class state
 
 ## Phase 2: Verification-First UX
@@ -271,11 +326,17 @@ Reduce emphasis on:
 
 ## Phase 3: Extension-Backed Mist Data
 
-Extension provides:
+Implemented now:
 
-- device stats
-- events
-- enough Mist context for status/history panels
+- root password lookup from Mist site settings
+- device config intent retrieval
+- monitor / status retrieval for trusted post-verification display
+
+Next extension data still worth adding:
+
+- richer event history
+- broader page support
+- more explicit debugging / operator diagnostics when launch hydration fails
 
 Goal:
 

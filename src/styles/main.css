@@ -3049,3 +3049,16 @@ body.support-page #support-app {
   white-space: nowrap;
   border: 0;
 }
+
+body.mist-launch-mode #btn-identify,
+body.mist-launch-mode #btn-root-password,
+body.mist-launch-mode #btn-session-identify,
+body.mist-launch-mode #btn-session-root,
+body.mist-launch-mode #btn-session-root-password {
+  display: none !important;
+}
+
+body.mist-launch-mode .sidebar-actions:has(#btn-identify),
+body.mist-launch-mode .sidebar-actions:has(#btn-root-password) {
+  display: none !important;
+}

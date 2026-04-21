@@ -11,7 +11,7 @@ When a Mist-managed switch goes offline, operators currently need to:
 5. Manually construct and paste remediation commands from the Mist UI
 6. Escalate by phone or screenshot because there is no shared view of the session
 
-This tool collapses that into a single browser tab. There is no software to install. The operator opens the app, connects the cable, and has structured diagnostics, Mist context, and guided remediation in one place.
+This tool collapses that into a single browser tab. There is no software to install for the operator path itself. The operator launches from Mist or opens the app directly, connects the cable, and has structured diagnostics, Mist context, and guided remediation in one place.
 
 ---
 
@@ -104,7 +104,7 @@ This tool is not a generic Junos console. Every meaningful feature is built arou
 - Config sync applies the Mist-intended config diff — not a manually crafted patch
 - Adoption command retrieval fetches the Mist device-specific adoption commands
 
-The product is designed to eventually be launched from Mist directly, with org and site context inherited from the Mist session, eliminating the current manual token and org configuration step.
+The product now supports extension-backed launch from Mist directly. In that mode, the app inherits the Mist switch context, verifies the console-connected switch against the Mist-launched switch before trusting cloud state, and treats manual Mist API setup as fallback rather than the primary operator path.
 
 ---
 
@@ -133,7 +133,7 @@ Retail is an especially strong fit because:
 
 ## Production vs Hackathon Scope
 
-The tool is deployed today as an internal-facing application and can be used immediately by teams that are comfortable operating it with Chrome, a USB serial cable, and a Mist API token.
+The tool is deployed today as an internal-facing application and can be used immediately by teams that are comfortable operating it with Chrome, a USB serial cable, and either Mist Launch Mode or the manual Mist API fallback path.
 
 ### Already production-usable
 
@@ -147,7 +147,7 @@ The tool is deployed today as an internal-facing application and can be used imm
 
 ### Production-leaning, needs hardening
 
-- Mist API token input: currently a manual entry step; should be replaced by a trusted Mist-native auth handoff
+- Mist API token input: no longer the preferred launched workflow, but still present as a manual fallback and should continue moving toward a trusted Mist-native auth handoff
 - Remote session: functional but needs authentication, expiry, and access controls for production exposure
 - Config sync: the staged candidate model is safe, but the complete operator UX for complex multi-VLAN diffs could be improved
 

@@ -1,18 +1,26 @@
 # Junos Console Browser Extension
 
-This is an early Chrome / Edge extension scaffold for launching local
-`junos-console` from a Mist switch page with pre-scoped Mist context.
+This Chrome / Edge extension launches local `junos-console` from a Mist switch
+page with extension-backed Mist Launch context.
 
-Current V1 scope:
+Current scope:
 
 - detect a Mist switch page from the active tab URL
-- extract:
+- resolve switch identity from the authenticated Mist browser session
+- retrieve:
   - cloud / API host
   - org ID
   - site ID
   - switch ID
+  - switch name
+  - serial
+  - MAC
+  - `switch_mgmt.root_password`
+  - `config_cmd`
+  - monitor / status data
 - show a floating `Open in Junos Console` action directly on supported Mist switch pages
-- open `http://localhost:3000/index.html` with a `mistContext` launch payload
+- post the launch payload to the local backend
+- open `http://localhost:3000/index.html` with a short-lived `mistLaunchToken`
 
 ## Load Unpacked
 
@@ -24,21 +32,38 @@ Current V1 scope:
 ## Current Assumptions
 
 - `junos-console` is running locally on `http://localhost:3000`
+- the local backend is running on `http://127.0.0.1:3333`
 - the active browser tab is a Mist switch page
-- the local app still uses its normal Mist API setup flow as fallback
+- the local app can still fall back to manual Mist API setup if launch hydration fails
 
 ## Notes
 
-This scaffold intentionally keeps the first version small:
+The extension-backed launch path is intended to be the preferred operator flow:
 
-- popup plus a lightweight page launcher
-- no cookie/session handling yet
-- no direct Mist API calls from the extension yet
-- no special icons or store packaging yet
+1. open a Mist switch page
+2. click `Open in Junos Console`
+3. connect the console cable
+4. click `Login to Switch`
+5. let the app verify the console-connected switch against the Mist-launched switch
+6. only after match should Mist Status, Switch Cloud State, checks, and actions unlock
+
+Important UX rules in Mist Launch Mode:
+
+- `Identify Switch` and `Get Root Password` controls are hidden
+- the app should use the Mist-launched root password directly when available
+- `Mist Status` and `Switch Cloud State` remain `Unknown` until verification succeeds
+- manual Mist API token setup is fallback only, not the primary launched workflow
+
+This extension is still local-development oriented:
+
+- unpacked install only
+- localhost launch target
+- no browser-store packaging yet
+- no production auth / distribution story yet
 
 The next logical steps are:
 
 1. broaden page parsing beyond switch detail pages
-2. add extension-side Mist session awareness
-3. pass richer context such as site and device display names
-4. eventually replace most manual Mist setup in the local app
+2. harden launch diagnostics and error handling
+3. extend support for richer event/history fetches
+4. continue shrinking the remaining manual Mist setup fallback path

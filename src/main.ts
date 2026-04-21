@@ -228,6 +228,11 @@ function init(): void {
   }
 
   // ---- Populate Mist cloud dropdown ----
+  const mistCloudPlaceholder = document.createElement('option');
+  mistCloudPlaceholder.value = '';
+  mistCloudPlaceholder.textContent = '— Select a Mist cloud region —';
+  ui.mistCloud.appendChild(mistCloudPlaceholder);
+
   MIST_CLOUDS.forEach((cloud) => {
     const opt = document.createElement('option');
     opt.value = cloud.id;
@@ -278,7 +283,9 @@ function init(): void {
   function saveSelectedMistCloud(): void {
     if (ui.mistCloud.value) {
       window.localStorage.setItem(MIST_CLOUD_STORAGE_KEY, ui.mistCloud.value);
+      return;
     }
+    window.localStorage.removeItem(MIST_CLOUD_STORAGE_KEY);
   }
 
   type EffectiveCloudResolution = {
@@ -303,8 +310,7 @@ function init(): void {
       ui.mistCloud.value = savedCloudId;
       return;
     }
-    const preferredDefault = MIST_CLOUDS.find((c) => c.apiHost === 'api.mist.com') ?? MIST_CLOUDS[0];
-    if (preferredDefault) ui.mistCloud.value = preferredDefault.id;
+    ui.mistCloud.value = '';
   }
 
   async function resolveEffectiveMistCloud(): Promise<EffectiveCloudResolution> {
@@ -760,7 +766,9 @@ function init(): void {
     const selectedSiteName = getSelectedSiteName();
     const effectiveTarget = getEffectiveMistTarget();
     const promptMode = getRecentPromptMode();
-    const recentTail = recentConsoleTail.trim();
+    // Strip ANSI escape sequences for plain-text MCP consumption
+    const recentTail = recentConsoleTail.trim()
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').replace(/\x1b./g, '');
     const blockingConsoleTask = getBlockingConsoleTask();
     const catalogGroups: AgentCatalogGroupState[] = CATALOG_GROUPS.map((group) => {
       const checks = group.checks.map((check) => {
@@ -1694,6 +1702,30 @@ function init(): void {
     return `This session was launched from Mist on ${cloudName}. Manual API token setup is optional fallback only.`;
   }
 
+  function setElementVisibility(element: HTMLElement | null, visible: boolean): void {
+    if (!element) return;
+    element.hidden = !visible;
+    element.style.display = visible ? '' : 'none';
+    element.setAttribute('aria-hidden', visible ? 'false' : 'true');
+  }
+
+  function setMistLaunchButtonVisibility(forceMode?: boolean): void {
+    const inMistLaunchMode = forceMode ?? !!extensionLaunchContext;
+    document.body.classList.toggle('mist-launch-mode', inMistLaunchMode);
+
+    setElementVisibility(ui.btnIdentify, !inMistLaunchMode);
+    setElementVisibility(ui.btnRootPassword, !inMistLaunchMode);
+    setElementVisibility(ui.btnIdentify.closest('.sidebar-actions') as HTMLElement | null, !inMistLaunchMode);
+    setElementVisibility(ui.btnRootPassword.closest('.sidebar-actions') as HTMLElement | null, !inMistLaunchMode);
+
+    if (ui.btnSessionIdentify) {
+      setElementVisibility(ui.btnSessionIdentify, !inMistLaunchMode);
+    }
+    if (ui.btnSessionRootPassword) {
+      setElementVisibility(ui.btnSessionRootPassword, !inMistLaunchMode);
+    }
+  }
+
   function getMistLaunchVerification(): {
     active: boolean;
     state: MistLaunchVerificationState;
@@ -1720,7 +1752,7 @@ function init(): void {
       return {
         active: true,
         state: 'waiting',
-        detail: `Launched from Mist for ${expectedLabel}. Connect the serial session, log in, and identify the switch.`,
+        detail: `Launched from Mist for ${expectedLabel}. Connect the serial session and log in to begin verification.`,
         why: 'Checks, actions, config sync, and adoption stay locked until the console-connected switch is verified.',
         unlocksWorkflow: false,
       };
@@ -1730,7 +1762,7 @@ function init(): void {
       return {
         active: true,
         state: 'waiting',
-        detail: `Launched from Mist for ${expectedLabel}. Identify the console-connected switch to verify the session.`,
+        detail: `Launched from Mist for ${expectedLabel}. Waiting to observe the console-connected switch identity.`,
         why: 'Checks, actions, config sync, and adoption stay locked until the console-connected switch is verified.',
         unlocksWorkflow: false,
       };
@@ -1804,7 +1836,7 @@ function init(): void {
     return {
       active: true,
       state: 'waiting',
-      detail: `Launched from Mist for ${expectedLabel}. Identify the console-connected switch to complete verification.`,
+      detail: `Launched from Mist for ${expectedLabel}. Waiting to complete automatic verification against the Mist launch context.`,
       why: 'This workflow remains locked until the app can compare the console identity to the Mist launch context.',
       unlocksWorkflow: false,
     };
@@ -1926,6 +1958,7 @@ function init(): void {
   function applyExtensionLaunchContext(context: ExtensionLaunchContext | null): void {
     extensionLaunchContext = context;
     mistApi.setLaunchOverlay(context);
+    setMistLaunchButtonVisibility();
 
     if (context) {
       sessionStorage.setItem(EXTENSION_LAUNCH_CONTEXT_STORAGE_KEY, JSON.stringify(context));
@@ -1955,17 +1988,36 @@ function init(): void {
 
     renderMistLaunchVerification();
     renderJmaRecommendation(latestJmaCode);
-    refreshCatalogRunButtons(false);
     updateConfigSyncUIState();
+    applyMistLaunchWorkflowGates();
     scheduleAgentContextPush();
   }
 
   async function consumeLaunchContextFromUrl(): Promise<void> {
     const url = new URL(window.location.href);
     let payload: ExtensionLaunchContext | null = null;
+    let storedPayload: ExtensionLaunchContext | null = null;
 
     const launchToken = url.searchParams.get('mistLaunchToken');
     const rawContext = url.searchParams.get('mistContext');
+
+    const storedContext = sessionStorage.getItem(EXTENSION_LAUNCH_CONTEXT_STORAGE_KEY);
+    if (storedContext) {
+      try {
+        storedPayload = JSON.parse(storedContext) as ExtensionLaunchContext;
+      } catch {
+        sessionStorage.removeItem(EXTENSION_LAUNCH_CONTEXT_STORAGE_KEY);
+      }
+    }
+
+    if (storedPayload) {
+      applyExtensionLaunchContext(storedPayload);
+    } else if (launchToken || rawContext) {
+      // Secure launch tokens are resolved asynchronously. Hide the manual
+      // identify/root-password controls immediately so Mist-launch sessions do
+      // not briefly expose fallback actions during startup.
+      setMistLaunchButtonVisibility(true);
+    }
 
     if (launchToken) {
       try {
@@ -1989,19 +2041,14 @@ function init(): void {
     }
 
     if (!payload) {
-      const storedContext = sessionStorage.getItem(EXTENSION_LAUNCH_CONTEXT_STORAGE_KEY);
-      if (storedContext) {
-        try {
-          payload = JSON.parse(storedContext) as ExtensionLaunchContext;
-        } catch {
-          sessionStorage.removeItem(EXTENSION_LAUNCH_CONTEXT_STORAGE_KEY);
-        }
-      }
+      payload = storedPayload;
     }
 
     if (payload) {
       applyExtensionLaunchContext(payload);
     }
+
+    setMistLaunchButtonVisibility();
 
     const cleanedUrl = `${url.pathname}${url.search}${url.hash}`;
     window.history.replaceState({}, document.title, cleanedUrl);
@@ -2203,8 +2250,8 @@ function init(): void {
     return msSinceLastUserConsoleInput() >= minIdleMs;
   }
 
-  function getRecentPromptMode(): 'operational' | 'config' | 'shell' | 'login' | 'password' | 'unknown' {
-    const trimmed = recentConsoleTail.trimEnd();
+  function classifyPromptMode(output: string): 'operational' | 'config' | 'shell' | 'login' | 'password' | 'unknown' {
+    const trimmed = output.trimEnd();
     if (!trimmed) return 'unknown';
     if (/[Pp]assword:\s*$/.test(trimmed)) return 'password';
     if (/login:\s*$/i.test(trimmed)) return 'login';
@@ -2212,6 +2259,10 @@ function init(): void {
     if (/(?:\{[^}\n]+\}\s*\n)?[\w\-@.:]+#\s*$/.test(trimmed)) return 'config';
     if (/(?:\{[^}\n]+\}\s*\n)?[\w\-@.:]+>\s*$/.test(trimmed)) return 'operational';
     return 'unknown';
+  }
+
+  function getRecentPromptMode(): 'operational' | 'config' | 'shell' | 'login' | 'password' | 'unknown' {
+    return classifyPromptMode(recentConsoleTail);
   }
 
   function isOperationalPromptVisible(): boolean {
@@ -2971,47 +3022,114 @@ function init(): void {
     setLatestAgentGuidedAnalysis(card);
   }
 
-  function buildGuidedAnalysisForJma(code: number | null, results: CheckResult[]): GuidedAnalysisCard | null {
-    if (!code || results.length === 0) return null;
+  function buildDnsGuidedAnalysis(results: CheckResult[]): GuidedAnalysisCard | null {
+    const dnsConfig = results.find((result) => result.id === 'dns-config');
+    const dnsReachability = results.find((result) => result.id === 'dns-server-reachability');
+    const dnsResolution = results.find((result) => result.id === 'dns-resolution');
+    const dnsResults = [dnsConfig, dnsReachability, dnsResolution].filter(Boolean) as CheckResult[];
+    if (dnsResults.length === 0) return null;
 
-    if (code === 106) {
-      const dnsConfig = results.find((result) => result.id === 'dns-config');
-      const dnsReachability = results.find((result) => result.id === 'dns-server-reachability');
-      const dnsResolution = results.find((result) => result.id === 'dns-resolution');
-      if (!dnsResolution) return null;
+    const relevantDnsIssues = dnsResults.filter((result) => result.status === 'fail' || result.status === 'warn' || result.status === 'skip');
+    if (relevantDnsIssues.length === 0) return null;
 
-      const raw = `${dnsResolution.raw || ''}`.toLowerCase();
-      const findings: string[] = [];
-      if (dnsConfig?.detail) findings.push(dnsConfig.detail);
-      if (dnsReachability?.detail) findings.push(dnsReachability.detail);
-      findings.push(dnsResolution.detail);
+    const findings = dnsResults
+      .filter((result) => result.detail)
+      .map((result) => `${result.name}: ${result.detail}`);
 
-      let conclusion = 'DNS resolution failed, so the switch still cannot resolve the hostnames it needs for cloud connectivity.';
-      if ((dnsConfig?.detail || '').toLowerCase().includes('no dns servers found')) {
-        conclusion = 'No DNS resolvers are currently available to the switch. There are no usable entries in the runtime resolver configuration, so DNS cannot work until resolvers are supplied via static configuration or DHCP.';
-      } else if ((dnsReachability?.detail || '').toLowerCase().includes('no dns servers were available to test')) {
-        conclusion = 'No DNS resolvers are currently available to the switch, so hostname resolution could not even be attempted. Restore resolver entries first, then retry the lookup.';
-      } else if ((dnsReachability?.detail || '').toLowerCase().includes('reachable dns servers')
-        && (raw.includes('no servers could be reached') || raw.includes('connection timed out'))) {
-        conclusion = 'Configured DNS servers respond to ping, but Junos cannot reach them for actual DNS queries. This strongly suggests upstream DNS transport is being blocked, most likely firewall policy on UDP/TCP 53 between the switch and its resolvers.';
-      } else if (dnsResolution.detail === 'Mist hostnames are unknown to the resolver') {
-        conclusion = 'Public DNS still works, but the resolver reported the Mist hostname as unknown. This suggests split-DNS, selective filtering, or an internal DNS server that does not know or forward Juniper Mist domains.';
-      } else if (dnsResolution.detail === 'Resolver returned unknown host responses') {
-        conclusion = 'The resolver answered the queries, but returned unknown-host responses for both public and Mist names. That points to a resolver content, recursion, or DNS policy problem rather than pure transport blocking.';
-      } else if (dnsResolution.detail === 'Mist hostname was unknown to the resolver') {
-        conclusion = 'The resolver answered the lookup, but it does not know the Mist hostname being queried. This points to a resolver content or forwarding problem rather than a raw connectivity issue.';
-      } else if (raw.includes('unknown host') || raw.includes('host name lookup failure')) {
-        conclusion = 'The resolver answered the lookup, but reported the hostname as unknown. That points to a DNS content or hostname problem rather than pure transport blocking.';
-      }
-
+    if (!dnsResolution) {
+      const title = dnsConfig?.status === 'fail'
+        ? 'DNS is not configured'
+        : 'DNS path needs attention';
+      const summary = dnsConfig?.status === 'fail'
+        ? 'The switch does not currently have usable DNS resolvers configured, so cloud hostname resolution cannot succeed yet.'
+        : 'DNS-related checks found a problem before hostname resolution completed. Review the findings below to restore resolver configuration or DNS-path reachability.';
+      const conclusion = dnsConfig?.status === 'fail'
+        ? 'Restore DNS servers first, either through DHCP Option 6 or static name-server configuration, then rerun the DNS checks.'
+        : 'Fix the earliest failing DNS prerequisite first, then rerun the DNS group to confirm hostname resolution is working again.';
       return {
         eyebrow: 'Guided Analysis',
-        title: 'DNS lookup is failing',
-        summary: 'The switch can see configured DNS servers, but name resolution is still failing. Use the findings below to decide whether the issue is transport, resolver content, or stale DHCP-supplied DNS settings.',
+        title,
+        summary,
         findings,
         conclusion,
       };
     }
+
+    const raw = `${dnsResolution.raw || ''}`.toLowerCase();
+    let conclusion = 'DNS resolution failed, so the switch still cannot resolve the hostnames it needs for cloud connectivity.';
+    if ((dnsConfig?.detail || '').toLowerCase().includes('no dns servers found')) {
+      conclusion = 'No DNS resolvers are currently available to the switch. There are no usable entries in the runtime resolver configuration, so DNS cannot work until resolvers are supplied via static configuration or DHCP.';
+    } else if ((dnsReachability?.detail || '').toLowerCase().includes('no dns servers were available to test')) {
+      conclusion = 'No DNS resolvers are currently available to the switch, so hostname resolution could not even be attempted. Restore resolver entries first, then retry the lookup.';
+    } else if ((dnsReachability?.detail || '').toLowerCase().includes('reachable dns servers')
+      && (raw.includes('no servers could be reached') || raw.includes('connection timed out'))) {
+      conclusion = 'Configured DNS servers respond to ping, but Junos cannot reach them for actual DNS queries. This strongly suggests upstream DNS transport is being blocked, most likely firewall policy on UDP/TCP 53 between the switch and its resolvers.';
+    } else if (dnsResolution.detail === 'Mist hostnames are unknown to the resolver') {
+      conclusion = 'Public DNS still works, but the resolver reported the Mist hostname as unknown. This suggests split-DNS, selective filtering, or an internal DNS server that does not know or forward Juniper Mist domains.';
+    } else if (dnsResolution.detail === 'Resolver returned unknown host responses') {
+      conclusion = 'The resolver answered the queries, but returned unknown-host responses for both public and Mist names. That points to a resolver content, recursion, or DNS policy problem rather than pure transport blocking.';
+    } else if (dnsResolution.detail === 'Mist hostname was unknown to the resolver') {
+      conclusion = 'The resolver answered the lookup, but it does not know the Mist hostname being queried. This points to a resolver content or forwarding problem rather than a raw connectivity issue.';
+    } else if (raw.includes('unknown host') || raw.includes('host name lookup failure')) {
+      conclusion = 'The resolver answered the lookup, but reported the hostname as unknown. That points to a DNS content or hostname problem rather than pure transport blocking.';
+    }
+
+    return {
+      eyebrow: 'Guided Analysis',
+      title: 'DNS lookup is failing',
+      summary: 'The switch can see configured DNS servers, but name resolution is still failing. Use the findings below to decide whether the issue is transport, resolver content, or stale DHCP-supplied DNS settings.',
+      findings,
+      conclusion,
+    };
+  }
+
+  function buildGenericCheckSummary(
+    results: CheckResult[],
+    options: { title?: string | null } = {},
+  ): GuidedAnalysisCard | null {
+    if (results.length === 0) return null;
+
+    const counts = { pass: 0, fail: 0, warn: 0, skip: 0, info: 0 };
+    results.forEach((result) => {
+      if (result.status in counts) counts[result.status as keyof typeof counts] += 1;
+    });
+
+    const title = options.title ?? 'Check Summary';
+    const findings = results
+      .filter((result) => result.status === 'fail' || result.status === 'warn' || result.status === 'skip')
+      .slice(0, 4)
+      .map((result) => `${result.name}: ${result.detail}`);
+
+    const summary = `${results.length} checks completed: ${counts.pass} pass, ${counts.fail} fail, ${counts.warn} warn, ${counts.skip} skip.`;
+    let conclusion: string | undefined;
+    if (counts.fail > 0) {
+      conclusion = 'Address the failing checks first, then rerun the group to confirm the path is healthy end to end.';
+    } else if (counts.warn > 0) {
+      conclusion = 'The group completed without hard failures, but there are still warnings worth resolving before treating the path as healthy.';
+    } else if (counts.skip > 0) {
+      conclusion = 'Some checks were skipped because an earlier prerequisite was missing. Fix the prerequisite and rerun the group if you need full coverage.';
+    } else if (results.length > 1) {
+      conclusion = 'The group completed cleanly with no failing checks.';
+    } else {
+      return null;
+    }
+
+    return {
+      eyebrow: 'Guided Analysis',
+      title,
+      summary,
+      findings,
+      conclusion,
+    };
+  }
+
+  function buildGuidedAnalysisForJma(code: number | null, results: CheckResult[]): GuidedAnalysisCard | null {
+    if (results.length === 0) return null;
+
+    const dnsAnalysis = buildDnsGuidedAnalysis(results);
+    if (dnsAnalysis) return dnsAnalysis;
+
+    if (!code) return null;
 
     const recommendation = getJmaRecommendation(code);
     if (!recommendation) return null;
@@ -3023,6 +3141,14 @@ function init(): void {
       summary: recommendation.summary,
       findings,
     };
+  }
+
+  function buildGuidedAnalysisForRun(
+    results: CheckResult[],
+    options: { jmaCode?: number | null; title?: string | null } = {},
+  ): GuidedAnalysisCard | null {
+    return buildGuidedAnalysisForJma(options.jmaCode ?? null, results)
+      ?? buildGenericCheckSummary(results, { title: options.title ?? null });
   }
 
   function buildCatalogDetailHtml(results: CheckResult[]): string {
@@ -3365,6 +3491,9 @@ function init(): void {
         try {
           const results = await troubleshooter.runRecommendedChecks(resolved.options);
           setLatestAgentCheckResults(results);
+          renderGuidedCheckAnalysis(buildGuidedAnalysisForRun(results, {
+            title: `${getCatalogCheck(catalogId)?.name ?? 'Check'} summary`,
+          }));
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           term.writeError(`Check failed: ${msg}`);
@@ -3416,6 +3545,9 @@ function init(): void {
         try {
           const results = await troubleshooter.runRecommendedChecks(resolved.options);
           setLatestAgentCheckResults(results);
+          renderGuidedCheckAnalysis(buildGuidedAnalysisForRun(results, {
+            title: `${groupName} summary`,
+          }));
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           term.writeError(`Group checks failed: ${msg}`);
@@ -3464,6 +3596,9 @@ function init(): void {
         try {
           const results = await troubleshooter.runRecommendedChecks(resolved.options);
           setLatestAgentCheckResults(results);
+          renderGuidedCheckAnalysis(buildGuidedAnalysisForRun(results, {
+            title: 'Catalog checks summary',
+          }));
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           term.writeError(`Check suite failed: ${msg}`);
@@ -3511,6 +3646,10 @@ function init(): void {
             onProgress: handleProgressResult,
           });
           setLatestAgentCheckResults(results);
+          renderGuidedCheckAnalysis(buildGuidedAnalysisForRun(results, {
+            jmaCode: latestJmaCode,
+            title: 'Full baseline summary',
+          }));
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           term.writeError(`Full baseline failed: ${msg}`);
@@ -4376,7 +4515,10 @@ function init(): void {
             onProgress: handleProgressResult,
           });
           setLatestAgentCheckResults(results);
-          renderGuidedCheckAnalysis(buildGuidedAnalysisForJma(recommendation.code, results));
+          renderGuidedCheckAnalysis(buildGuidedAnalysisForRun(results, {
+            jmaCode: recommendation.code,
+            title: 'Recommended checks summary',
+          }));
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           term.writeError(`Recommended checks failed: ${msg}`);
@@ -4704,6 +4846,27 @@ function init(): void {
     return cmdRunner.sendAndWaitFor(`${value}\r`, pattern, timeoutMs);
   }
 
+  async function observeCurrentPrompt(preferVisiblePrompt = false): Promise<{
+    mode: 'operational' | 'config' | 'shell' | 'login' | 'password' | 'unknown';
+    output: string;
+    matched: boolean;
+  }> {
+    const visibleOutput = recentConsoleTail.trimEnd();
+    const visibleMode = classifyPromptMode(visibleOutput);
+    if (preferVisiblePrompt && (visibleMode === 'operational' || visibleMode === 'config' || visibleMode === 'shell')) {
+      return { mode: visibleMode, output: visibleOutput, matched: true };
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const observed = await cmdRunner.sendAndWaitFor('\r', /login:\s*$|[Pp]assword:\s*$|[>#%]\s*$/im, 3000);
+    const output = observed.output.trimEnd() || visibleOutput;
+    return {
+      mode: classifyPromptMode(output),
+      output,
+      matched: observed.matched,
+    };
+  }
+
   async function passwordLoginWasRejected(passResultOutput: string): Promise<boolean> {
     const mode = await cmdRunner.detectMode();
     if (mode === 'shell' || mode === 'operational' || mode === 'config') {
@@ -4723,79 +4886,109 @@ function init(): void {
       term.writeSystem('— Attempting to log in to switch —');
 
       try {
-      // Prefer the current visible prompt when it is already unambiguous.
-      // Sending an extra newline while a login/password prompt is active can
-      // cause the username/password exchange to drift onto the wrong prompt.
-      const visibleMode = getRecentPromptMode();
-      let output = '';
-      if (visibleMode === 'login' || visibleMode === 'password' || visibleMode === 'shell' || visibleMode === 'config' || visibleMode === 'operational') {
-        output = recentConsoleTail.trimEnd();
-      } else {
-        const initial = await cmdRunner.sendAndWaitFor('\n', /login:|>|#|%/, 5000);
-        output = initial.output;
-      }
+        const prompt = await observeCurrentPrompt(true);
+        const output = prompt.output;
+        let promptMode = prompt.mode;
 
-      // Case 1: Already at a CLI prompt (already logged in)
-      if (/>\s*$|#\s*$/.test(output)) {
-        ui.loginResult.innerHTML = '<div class="device-mist-match found">Already logged in to Junos CLI.</div>';
-        term.writeSystem('  Already logged in.');
-        await ensureLoggedInBootstrap();
-        ui.btnIdentify.disabled = false;
-        ui.btnLogin.disabled = false;
-        return;
-      }
+        // Case 1: Already at a CLI prompt (already logged in)
+        if (promptMode === 'operational' || promptMode === 'config') {
+          ui.loginResult.innerHTML = '<div class="device-mist-match found">Already logged in to Junos CLI.</div>';
+          term.writeSystem('  Already logged in.');
+          await ensureLoggedInBootstrap();
+          ui.btnIdentify.disabled = false;
+          ui.btnLogin.disabled = false;
+          return;
+        }
 
-      // Case 2: Shell prompt (root@switch%)
-      if (/%\s*$/.test(output)) {
-        term.writeSystem('  At shell prompt — entering Junos CLI…');
-        await cmdRunner.send('cli\n');
-        await new Promise((r) => setTimeout(r, 1500));
-        ui.loginResult.innerHTML = '<div class="device-mist-match found">Logged in (was at shell prompt, entered CLI).</div>';
-        term.writeSystem('  Entered Junos CLI.');
-        await ensureLoggedInBootstrap();
-        ui.btnIdentify.disabled = false;
-        ui.btnLogin.disabled = false;
-        return;
-      }
+        // Case 2: Shell prompt (root@switch%)
+        if (promptMode === 'shell') {
+          term.writeSystem('  At shell prompt — entering Junos CLI…');
+          await cmdRunner.send('cli\n');
+          await new Promise((r) => setTimeout(r, 1500));
+          ui.loginResult.innerHTML = '<div class="device-mist-match found">Logged in (was at shell prompt, entered CLI).</div>';
+          term.writeSystem('  Entered Junos CLI.');
+          await ensureLoggedInBootstrap();
+          ui.btnIdentify.disabled = false;
+          ui.btnLogin.disabled = false;
+          return;
+        }
 
-      // Case 3: Login prompt
-      if (/login:/i.test(output) || /[Pp]assword:\s*$/i.test(output)) {
+        // Case 3: Login or password prompt
+        if (promptMode === 'login' || promptMode === 'password') {
+        const inMistLaunchMode = !!extensionLaunchContext;
         const siteId = getEffectiveMistTarget().siteId ?? ui.mistSite.value;
         const mistRootPassword = extensionLaunchContext?.deviceRootPassword
           ?? (siteId ? await mistApi.getRootPassword(siteId) : null);
 
-        if (mistRootPassword) {
-          let passResult;
+        if (inMistLaunchMode) {
+          if (!mistRootPassword) {
+            ui.loginResult.innerHTML = '<div class="device-mist-match not-found">' +
+              '<strong>Login unavailable</strong> — this Mist launch did not include a usable root password.<br><br>' +
+              'Relaunch from the Mist extension after the backend is running so the secure launch token can include the site root password.' +
+              '</div>';
+            term.writeError('  Mist Launch login unavailable — no root password was present in the launch context.');
+            ui.btnLogin.disabled = false;
+            return;
+          }
 
-          if (/[Pp]assword:\s*$/i.test(output)) {
+          const freshPrompt = await observeCurrentPrompt(true);
+          promptMode = freshPrompt.mode;
+          let loginResultOutput = freshPrompt.output;
+
+          if (promptMode === 'password') {
             term.writeSystem('  Password prompt detected. Using root password from Mist launch context…');
-            passResult = await sendLoginFieldAndWaitFor(
+            const passResult = await sendLoginFieldAndWaitFor(
               mistRootPassword,
-              /(?:login:\s*$|[>#%]\s*$)/im,
+              /login:\s*$|[>#%]\s*$/i,
               10000,
             );
-          } else {
+            loginResultOutput = passResult.output;
+          } else if (promptMode === 'login') {
             term.writeSystem('  Login prompt detected. Using Mist Launch root password…');
 
-            const userResult = await sendLoginFieldAndWaitFor('root', /[Pp]assword:\s*$/im, 5000);
+            const userResult = await sendLoginFieldAndWaitFor(
+              'root',
+              /login:\s*$|[Pp]assword:\s*$|[>#%]\s*$/im,
+              5000,
+            );
             if (!userResult.matched) {
               ui.loginResult.innerHTML = '<div class="device-mist-match not-found">' +
-                '<strong>Login failed</strong> — did not receive a password prompt after sending the root username.' +
+                '<strong>Login failed</strong> — did not receive a usable prompt after sending the root username.' +
                 '</div>';
-              term.writeError('  Login failed — password prompt not reached.');
+              term.writeError('  Login failed — expected the login exchange to continue, but no prompt arrived.');
               ui.btnLogin.disabled = false;
               return;
             }
 
-            term.writeSystem('  Password required. Using root password from Mist launch context…');
-            passResult = await sendLoginFieldAndWaitFor(
-              mistRootPassword,
-              /(?:login:\s*$|[>#%]\s*$)/im,
-              10000,
-            );
+            const nextPromptMode = classifyPromptMode(userResult.output);
+            if (nextPromptMode === 'password') {
+              term.writeSystem('  Password required. Using root password from Mist launch context…');
+              const passResult = await sendLoginFieldAndWaitFor(
+                mistRootPassword,
+                /login:\s*$|[>#%]\s*$/i,
+                10000,
+              );
+              loginResultOutput = passResult.output;
+            } else if (nextPromptMode === 'operational' || nextPromptMode === 'config' || nextPromptMode === 'shell') {
+              loginResultOutput = userResult.output;
+            } else {
+              ui.loginResult.innerHTML = '<div class="device-mist-match not-found">' +
+                '<strong>Login failed</strong> — the switch did not advance to a password prompt or CLI prompt after sending the root username.' +
+                '</div>';
+              term.writeError('  Login failed — login exchange did not advance after sending the root username.');
+              ui.btnLogin.disabled = false;
+              return;
+            }
+          } else {
+            ui.loginResult.innerHTML = '<div class="device-mist-match not-found">' +
+              '<strong>Login failed</strong> — no login or password prompt was visible when the Mist launch login began.' +
+              '</div>';
+            term.writeError('  Login failed — no active login exchange prompt was visible.');
+            ui.btnLogin.disabled = false;
+            return;
           }
 
-          if (await passwordLoginWasRejected(passResult.output)) {
+          if (await passwordLoginWasRejected(loginResultOutput)) {
             ui.loginResult.innerHTML = '<div class="device-mist-match not-found">' +
               '<strong>Login failed</strong> — Mist site root password was rejected.<br><br>' +
               'The switch may have a different password than what is configured in the Mist site settings.' +
@@ -4826,10 +5019,20 @@ function init(): void {
 
         term.writeSystem('  Login prompt detected. Trying root with no password (factory default)…');
 
-        const userResult = await cmdRunner.sendAndWaitFor('root\n', /[Pp]assword:|>|#|%/, 5000);
+        let userResult: { output: string; matched: boolean };
+        if (promptMode === 'password') {
+          userResult = { output, matched: true };
+        } else {
+          userResult = await sendLoginFieldAndWaitFor(
+            'root',
+            /login:\s*$|[Pp]assword:\s*$|[>#%]\s*$/im,
+            5000,
+          );
+        }
+        const nextPromptMode = classifyPromptMode(userResult.output);
 
         // Factory default: root with no password goes straight to shell/CLI
-        if (/>\s*$|#\s*$/.test(userResult.output)) {
+        if (nextPromptMode === 'operational' || nextPromptMode === 'config') {
           // Went straight to Junos CLI — factory default, no password
           ui.loginResult.innerHTML = '<div class="device-mist-match found">' +
             '<strong>Factory default switch — logged in as root (no password).</strong><br><br>' +
@@ -4842,7 +5045,7 @@ function init(): void {
           return;
         }
 
-        if (/%\s*$/.test(userResult.output)) {
+        if (nextPromptMode === 'shell') {
           // Went to shell — factory default, enter CLI
           term.writeSystem('  Factory default — at shell prompt, entering CLI…');
           await cmdRunner.send('cli\n');
@@ -4858,14 +5061,57 @@ function init(): void {
           return;
         }
 
-        // Got a password prompt — switch has a password set
-        if (/[Pp]assword:/i.test(userResult.output)) {
+        // Got a password prompt — switch has a password set.
+        // The initial mistRootPassword lookup returned null, but try once more now
+        // that we know we actually need it (the lookup may have raced with the
+        // extension context loading, or the siteId became available only after
+        // the switch identified itself).
+        if (nextPromptMode === 'password') {
           term.writeSystem('  Password required. Attempting to retrieve from Mist…');
 
-          // No Mist password available — tell the user
-          // Send Ctrl+C to cancel the password prompt
+          const retryPassword = extensionLaunchContext?.deviceRootPassword
+            ?? (siteId ? await mistApi.getRootPassword(siteId) : null);
+
+          if (retryPassword) {
+            term.writeSystem('  Retrieved root password. Attempting login…');
+            const passResult = await sendLoginFieldAndWaitFor(
+              retryPassword,
+              /(?:login:\s*$|[>#%]\s*$)/im,
+              10000,
+            );
+
+            if (await passwordLoginWasRejected(passResult.output)) {
+              ui.loginResult.innerHTML = '<div class="device-mist-match not-found">' +
+                '<strong>Login failed</strong> — Mist site root password was rejected.<br><br>' +
+                'The switch may have a different password than what is configured in the Mist site settings.' +
+                '</div>';
+              term.writeError('  Login failed — Mist password rejected.');
+              ui.btnLogin.disabled = false;
+              return;
+            }
+
+            const reachedCli = await ensureJunosCliAfterLogin((message) => term.writeSystem(message));
+            if (!reachedCli) {
+              ui.loginResult.innerHTML = '<div class="device-mist-match not-found">' +
+                '<strong>Login state unclear</strong> — the switch did not return to a usable Junos CLI prompt.<br><br>' +
+                'Check the console session manually and try again.' +
+                '</div>';
+              term.writeError('  Login did not reach a usable Junos CLI prompt.');
+              ui.btnLogin.disabled = false;
+              return;
+            }
+
+            ui.loginResult.innerHTML = '<div class="device-mist-match found">Logged in as root using Mist site password.</div>';
+            term.writeSystem('  Login successful.');
+            await ensureLoggedInBootstrap();
+            ui.btnIdentify.disabled = false;
+            ui.btnLogin.disabled = false;
+            return;
+          }
+
+          // No password available — abort the hanging password prompt cleanly.
           await cmdRunner.send('\x03\n');
-          await new Promise((r) => setTimeout(r, 1000));
+          await new Promise((r) => setTimeout(r, 1500));
 
           let html = '<div class="device-mist-match not-found">';
           html += '<strong>Password required but not available.</strong><br><br>';
@@ -4913,6 +5159,10 @@ function init(): void {
         ui.deviceIdentity.innerHTML = '';
         term.writeSystem('— Identifying connected switch —');
         await deviceContext.runIdentify({ silent: false });
+        // Apply verification gating immediately once we have a fresh identity/match result,
+        // even if the subsequent Mist/JMA refresh takes a moment or fails.
+        renderMistLaunchVerification();
+        applyMistLaunchWorkflowGates();
         await cloudStatus.refresh(deviceContext.matchResult, serial.isConnected);
         ui.btnIdentify.disabled = false;
         term.writeSystem('— Identification complete —');

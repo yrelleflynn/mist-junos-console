@@ -25,7 +25,7 @@ This section aligns the README with **hackathon judging** (customer impact, self
 
 ### Problem statement
 
-Mist-managed **EX** switches that are **offline or never adopted** still show up as operational pain: someone must **physically console in**, **guess** at WAN/DNS/firewall issues, **correlate** with what Mist *intended* for config, and often **loop support**. This tool **shortens that path**: one browser session, **Mist API context** (org/site/inventory/config/adoption), **automated CLI checks** with **critical gates**, optional **remote assist**, and **guided adoption**—so “disconnected switch” is **detected, diagnosed, and moved toward remediation** faster.
+Mist-managed **EX** switches that are **offline or never adopted** still show up as operational pain: someone must **physically console in**, **guess** at WAN/DNS/firewall issues, **correlate** with what Mist *intended* for config, and often **loop support**. This tool **shortens that path**: one browser session, **Mist launch context** from the Mist UI or **manual Mist API fallback**, **automated CLI checks** with **critical gates**, optional **remote assist**, and **guided adoption**—so “disconnected switch” is **detected, diagnosed, and moved toward remediation** faster.
 
 ### Self-driving capability (Levels 1–3)
 
@@ -54,7 +54,7 @@ Mist-managed **EX** switches that are **offline or never adopted** still show up
 - **Errors:** Mist API errors surfaced in UI; serial/WebSocket failures messaged in-terminal.
 - **Documentation:** Architecture (current + proposed), module map, feature list, design decisions.
 - **Example outputs:** Run **Cloud connectivity check** and **Mist status** with a live or lab switch; capture screenshots for the deck (terminal + sidebar results). Optional: support console mirror screenshot.
-- **Security:** API token in browser today (mitigated by **server-side proxy** toward Mist); **remote session IDs are secrets**—document need for **SSO/auth** before production scale; see [Security and consent](#security-and-consent-cross-cutting).
+- **Security:** Mist Launch Mode now prefers an **extension-backed launch token** and browser-session-derived context; the manual API token path still exists as fallback. **Remote session IDs are secrets**—document need for **SSO/auth** before production scale; see [Security and consent](#security-and-consent-cross-cutting).
 
 Dedicated reviewer-facing docs:
 
@@ -240,13 +240,20 @@ server/
 - Device config pull, adoption commands (`GET /api/v1/orgs/{org_id}/ocdevices/outbound_ssh_cmd`)
 - Browser calls **`/mist-proxy`**; in dev the Vite dev server forwards to the Node backend (production: same host or your edge proxy)
 
+### Mist Launch Mode
+- Browser extension launches the app from a Mist switch page using a short-lived **`mistLaunchToken`**
+- Extension-backed launch context can include device identity, site/org IDs, root password, config intent, and monitor/status data
+- The app shows a dedicated **Mist Launch verification** card and keeps `Mist Status` / `Switch Cloud State` at `Unknown` until the console-connected switch is verified
+- In Mist Launch Mode, **`Identify Switch`** and **`Get Root Password`** controls are intentionally hidden because the workflow should log in and verify against the Mist-launched switch first
+- Manual Mist API configuration remains supported as a fallback for non-launched or extension-unavailable sessions
+
 ### Remote support session
 - After serial connect, enable **remote session** in the Connection panel; share the **session ID** with support (or open `support.html?session=…`)
 - Support joins from **`/support.html`**; device output and operator typing are mirrored; support keystrokes are sent to the operator browser and written to the serial port (with loop prevention for TX mirroring)
 
 ### Device & Config
-- **Identify Switch** — serial/MAC from console, matches to Mist inventory
-- **Get Root Password** — from Mist site settings, with login instructions
+- **Identify Switch** — serial/MAC from console, matches to Mist inventory in manual mode and verifies the console-connected switch against the Mist-launched switch in Mist Launch Mode
+- **Get Root Password** — from Mist site settings in manual mode; Mist Launch Mode prefers the extension-backed root password path and hides the manual button
 - **Check Config Drift** — compares Mist intended config vs actual running config
 - **Adopt Switch** — fetches adoption commands from API, pre-checks root auth, applies via console
 

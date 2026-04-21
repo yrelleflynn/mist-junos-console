@@ -1,5 +1,36 @@
 # Mist UI Session And Extension Integration
 
+## Implemented Now
+
+The integration is no longer purely conceptual.
+
+Current implemented flow:
+
+1. operator opens a Mist switch page
+2. browser extension resolves switch context from the authenticated Mist browser session
+3. extension posts the launch payload to the local backend
+4. backend stores it behind a short-lived `/extension-launch/<token>` entry
+5. local app opens with `mistLaunchToken`
+6. frontend imports the launch context, cleans the URL, persists the launch overlay in session storage, and enters Mist Launch Mode
+
+Current launch-backed data can include:
+
+- cloud / API host
+- org, site, and device identifiers
+- device name
+- serial
+- MAC
+- `switch_mgmt.root_password`
+- `config_cmd`
+- monitor / status data
+
+Current app behavior after launch:
+
+- verification of the console-connected switch becomes the first priority
+- `Mist Status` and `Switch Cloud State` remain `Unknown` until verification succeeds
+- checks, actions, config sync, and adoption stay gated until the console-connected switch matches the Mist-launched switch
+- manual Mist API setup remains fallback only
+
 ## Purpose
 
 Describe how `junos-console` could integrate with the authenticated Mist browser

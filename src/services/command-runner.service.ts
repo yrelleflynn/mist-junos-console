@@ -37,11 +37,14 @@ export const MORE_PATTERN_ALT = /--\(more\)--/i;
 
 /**
  * Normalise raw serial capture before prompt/echo stripping:
+ * - strip ANSI/VT100 escape sequences (CSI sequences and other 2-char escapes)
  * - remove carriage returns
  * - collapse backspace-overstrike sequences produced by shell echo wrapping
  */
 export function normalizeSerialCapture(raw: string): string {
-  let output = raw.replace(/\r/g, '');
+  // Strip CSI sequences (e.g. \x1b[32m, \x1b[?2004h) and other 2-char escapes
+  let output = raw.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').replace(/\x1b./g, '');
+  output = output.replace(/\r/g, '');
   let previous = '';
   while (output !== previous) {
     previous = output;

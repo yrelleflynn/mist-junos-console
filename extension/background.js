@@ -196,7 +196,37 @@ async function fetchMistSiteDevices(context) {
     const deviceMac = pickDeviceField(matchedDevice, ['mac', 'mac_address']);
     const siteName = pickDeviceField(matchedDevice, ['site_name']);
     const orgName = pickDeviceField(matchedDevice, ['org_name']);
-    const deviceRootPassword = pickSwitchRootPassword(matchedDevice);
+
+    let deviceRootPassword = pickSwitchRootPassword(matchedDevice);
+
+    // If no device-specific password, fall back to the site-level switch_mgmt password
+    if (!deviceRootPassword && context.siteId) {
+      const siteSetting = await fetchObject(
+        `/api/v1/sites/${encodeURIComponent(context.siteId)}/setting`,
+        'site-setting',
+      );
+      if (siteSetting) {
+        deviceRootPassword = normalizeText(siteSetting?.switch_mgmt?.root_password) || null;
+      }
+    }
+
+    // If still no password, fall back to the site's assigned network template
+    if (!deviceRootPassword && context.siteId && context.orgId) {
+      const siteDetail = await fetchObject(
+        `/api/v1/sites/${encodeURIComponent(context.siteId)}`,
+        'site-detail',
+      );
+      const templateId = siteDetail?.network_template_id;
+      if (templateId) {
+        const networkTemplate = await fetchObject(
+          `/api/v1/orgs/${encodeURIComponent(context.orgId)}/networktemplates/${encodeURIComponent(templateId)}`,
+          'network-template',
+        );
+        if (networkTemplate) {
+          deviceRootPassword = normalizeText(networkTemplate?.switch_mgmt?.root_password) || null;
+        }
+      }
+    }
 
     if (!deviceName && !deviceSerial && !deviceMac) {
       return { ok: false, message: 'Matched Mist device returned no usable name/serial/mac fields.', payload: matchedDevice };
