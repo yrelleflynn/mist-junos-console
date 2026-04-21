@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Junos Console</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <header class="popup-header">
+        <div class="eyebrow">JUNOS CONSOLE</div>
+        <h1>Launch From Mist</h1>
+        <p class="subtitle">Open the local Junos Console app with Mist switch context from the current tab.</p>
+      </header>
+
+      <section class="card">
+        <div class="status-row">
+          <span id="page-status-pill" class="pill neutral">Checking page…</span>
+        </div>
+        <dl class="context-grid">
+          <div>
+            <dt>Cloud</dt>
+            <dd id="cloud-value">—</dd>
+          </div>
+          <div>
+            <dt>Org ID</dt>
+            <dd id="org-value">—</dd>
+          </div>
+          <div>
+            <dt>Site ID</dt>
+            <dd id="site-value">—</dd>
+          </div>
+          <div>
+            <dt>Switch ID</dt>
+            <dd id="device-value">—</dd>
+          </div>
+        </dl>
+        <p id="status-message" class="status-message">Looking for a supported Mist switch page.</p>
+        <p id="debug-url" class="debug-url is-hidden"></p>
+      </section>
+
+      <section class="actions">
+        <button id="open-console" class="btn btn-primary" disabled>Open in Junos Console</button>
+      </section>
+    </main>
+
+    <script src="mist-context.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

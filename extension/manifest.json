@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Junos Console",
+  "short_name": "Junos Console",
+  "version": "0.1.0",
+  "description": "Launch Junos Console from Mist switch pages with scoped org/site/device context.",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Junos Console"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.mist.com/*",
+        "https://*.mistsys.com/*",
+        "https://*.mist-federal.com/*"
+      ],
+      "js": [
+        "mist-context.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": [
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://*.mist.com/*",
+    "https://*.mistsys.com/*",
+    "https://*.mist-federal.com/*",
+    "http://127.0.0.1:3333/*",
+    "http://localhost:3333/*"
+  ]
+}

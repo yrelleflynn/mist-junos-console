@@ -73,6 +73,36 @@ html, body {
   flex-shrink: 0;
 }
 
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.header-chip-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.header-chip-btn:hover {
+  background: rgba(93, 216, 226, 0.08);
+  border-color: rgba(93, 216, 226, 0.22);
+  color: var(--accent-blue);
+}
+
 .header-left {
   display: flex;
   align-items: baseline;
@@ -139,14 +169,19 @@ html, body {
    a dedicated right column with room to be readable. */
 #main {
   display: grid;
-  grid-template-columns: var(--sidebar-width) minmax(0, 1fr) var(--guidance-panel-width);
+  grid-template-columns: var(--guidance-panel-width) minmax(0, 1fr);
   flex: 1;
   overflow: hidden;
   min-height: 0;
+  position: relative;
 }
 
 /* ---- Sidebar ---- */
 #sidebar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
   width: var(--sidebar-width);
   min-width: var(--sidebar-min-width);
   max-width: var(--sidebar-max-width);
@@ -155,11 +190,28 @@ html, body {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  resize: horizontal;
-  overflow-x: auto;
+  resize: none;
+  overflow-x: hidden;
+  box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.02);
+  z-index: 30;
+  transform: translateX(calc(-100% - 18px));
+  opacity: 0;
+  pointer-events: none;
+  transition: transform 0.2s ease, opacity 0.2s ease;
+  box-shadow:
+    0 18px 44px rgba(0, 0, 0, 0.45),
+    inset -1px 0 0 rgba(255, 255, 255, 0.02);
+}
+
+#sidebar.is-open {
+  transform: translateX(0);
+  opacity: 1;
+  pointer-events: auto;
 }
 
 #workspace {
+  grid-column: 2;
+  grid-row: 1;
   flex: 1;
   min-width: 0;
   min-height: 0;
@@ -176,10 +228,13 @@ html, body {
    Width is controlled via --guidance-panel-width on #main's grid and can
    be dragged using the left-edge resize handle. */
 #guidance-panel {
+  grid-column: 1;
+  grid-row: 1;
   display: flex;
   flex-direction: column;
   background: var(--bg-sidebar);
-  border-left: 1px solid var(--border-color);
+  border-right: 1px solid var(--border-color);
+  border-left: none;
   overflow-y: auto;
   overflow-x: hidden;
   min-width: 0;
@@ -189,7 +244,7 @@ html, body {
 .guidance-resize-handle {
   position: absolute;
   top: 0;
-  left: 0;
+  right: 0;
   width: 8px;
   height: 100%;
   cursor: ew-resize;
@@ -200,11 +255,11 @@ html, body {
 
 .guidance-resize-handle:hover,
 .guidance-resize-handle.is-dragging {
-  background: linear-gradient(90deg, rgba(93, 216, 226, 0.18) 0%, transparent 100%);
+  background: linear-gradient(270deg, rgba(93, 216, 226, 0.18) 0%, transparent 100%);
 }
 
 .guidance-cloud-status {
-  padding: 10px 12px 10px 16px; /* 16px left to clear the resize handle hit area */
+  padding: 10px 16px 10px 12px; /* 16px right to clear the resize handle hit area */
   border-bottom: 1px solid var(--border-color);
   flex-shrink: 0;
 }
@@ -238,11 +293,23 @@ html, body {
   overflow: hidden;
 }
 
+.session-bar-action-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  margin-right: 12px;
+}
+
+.session-bar-action-group-secondary {
+  margin-right: 0;
+}
+
 .session-bar-label {
   font-family: var(--font-mono);
   font-size: 10px;
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--text-muted);
   flex-shrink: 0;
@@ -439,6 +506,33 @@ html, body {
   font-style: italic;
 }
 
+.guidance-actions-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 14px 18px 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.guidance-actions-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.guidance-actions-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.guidance-actions-grid .btn {
+  width: 100%;
+}
+
 .action-result-card {
   display: flex;
   flex-direction: column;
@@ -590,8 +684,8 @@ html, body {
   min-width: 0;
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 4px;
+  flex-wrap: nowrap;
+  gap: 0;
   overflow: hidden;
 }
 
@@ -627,6 +721,8 @@ html, body {
   color: var(--text-muted);
   font-style: italic;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .device-summary-grid {
@@ -657,21 +753,23 @@ html, body {
   word-break: break-word;
 }
 
-.device-summary-item {
+.device-summary-line {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-primary);
-  background: rgba(93, 216, 226, 0.08);
-  border: 1px solid rgba(93, 216, 226, 0.18);
-  border-radius: 4px;
-  padding: 1px 6px;
+  padding: 0;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .device-summary-sep {
   font-size: 11px;
   color: var(--text-muted);
   user-select: none;
+  margin: 0 6px;
+  flex-shrink: 0;
 }
 
 @keyframes device-summary-spin {
@@ -769,7 +867,7 @@ html, body {
   color: var(--text-primary);
   font-family: var(--font-mono);
   font-size: 13px;
-  padding: 6px 8px;
+  padding: 7px 9px;
   outline: none;
   transition: border-color 0.15s;
 }
@@ -794,6 +892,7 @@ html, body {
   margin-top: 8px;
   font-size: 11px;
   color: var(--text-secondary);
+  line-height: 1.5;
 }
 
 .connection-next-steps {
@@ -996,6 +1095,10 @@ html, body {
 
 /* ---- Buttons ---- */
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   font-family: var(--font-sans);
   font-size: 12px;
   font-weight: 600;
@@ -1044,13 +1147,23 @@ html, body {
   background: var(--accent-secondary-hover);
 }
 
+.btn-context-ready {
+  background: rgba(35, 134, 54, 0.14);
+  color: #7ee787;
+  border-color: rgba(35, 134, 54, 0.42);
+}
+
+.btn-context-ready:hover:not(:disabled) {
+  background: rgba(35, 134, 54, 0.22);
+}
+
 /* ---- Terminal container ---- */
 #terminal-container {
   flex: 1;
   min-height: 0;
   overflow: hidden;
   background: #010409;
-  padding: 8px;
+  padding: 10px 12px 8px;
 }
 
 /* xterm.js overrides to ensure it fills the container */
@@ -1077,36 +1190,49 @@ html, body {
 }
 
 /* ---- Responsive ---- */
-@media (max-width: 768px) {
+@media (max-width: 1100px) {
   #main {
-    flex-direction: column;
+    grid-template-columns: minmax(0, 1fr);
   }
+
+  #guidance-panel {
+    display: none;
+  }
+
+  #workspace {
+    grid-column: 1;
+  }
+
   #sidebar {
-    width: 100%;
+    width: min(92vw, 360px);
     min-width: unset;
     max-width: unset;
-    max-height: 220px;
-    border-right: none;
-    border-bottom: 1px solid var(--border-color);
-    flex-direction: row;
-    flex-wrap: wrap;
-    gap: 12px;
-    overflow-y: auto;
-    resize: none;
-  }
-  #workspace {
-    min-height: 0;
   }
 
   .results-resize-handle {
     display: none;
   }
-  .sidebar-section {
-    min-width: 200px;
-    flex: 1;
+
+  .session-bar {
+    height: auto;
+    min-height: 38px;
+    flex-wrap: wrap;
+    row-gap: 8px;
+    padding-top: 8px;
+    padding-bottom: 8px;
   }
-  .sidebar-info {
-    display: none;
+
+  .device-summary {
+    flex-basis: 100%;
+    order: 10;
+  }
+
+  .session-bar-clear-btn {
+    margin-left: auto;
+  }
+
+  .header-right {
+    gap: 6px;
   }
 }
 
@@ -1469,11 +1595,22 @@ html, body {
 .check-group-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 4px 0 6px;
+  gap: 7px;
+  padding: 5px 2px 7px;
   border-bottom: 1px solid var(--border-color);
   margin-bottom: 3px;
+  cursor: pointer;
+  user-select: none;
 }
+.check-group-header:hover .check-group-name { color: var(--text-secondary); }
+.check-group-chevron {
+  color: var(--text-muted);
+  opacity: 0.55;
+  flex-shrink: 0;
+  transition: transform 0.18s, opacity 0.18s;
+}
+.check-group.is-collapsed .check-group-chevron { transform: rotate(-90deg); opacity: 0.4; }
+.check-group.is-collapsed .check-item { display: none; }
 .check-group-name {
   font-family: var(--font-mono);
   font-size: 10px;
@@ -1481,20 +1618,40 @@ html, body {
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--text-muted);
+  transition: color 0.12s;
 }
+.check-group-badges {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 4px;
+}
+.check-group-badge {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 3px;
+  letter-spacing: 0.02em;
+}
+.check-group-badge.badge-pass { color: #3fb950; background: rgba(63,185,80,0.1); }
+.check-group-badge.badge-fail { color: var(--text-error); background: rgba(248,81,73,0.1); }
+.check-group-badge.badge-warn { color: #e3b341; background: rgba(227,179,65,0.1); }
+.check-group-badge.badge-skip { color: var(--text-muted); background: rgba(255,255,255,0.06); }
 .check-group-run-btn {
   margin-left: auto;
+  flex-shrink: 0;
   padding: 2px 8px;
   font-size: 10px;
   border-radius: 3px;
-  border: 1px solid var(--border-color);
-  background: transparent;
-  color: var(--text-muted);
+  border: 1px solid rgba(93, 216, 226, 0.35);
+  background: rgba(93, 216, 226, 0.08);
+  color: var(--accent-blue);
   cursor: pointer;
   font-family: var(--font-mono);
-  transition: color 0.12s, border-color 0.12s;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
 }
-.check-group-run-btn:hover { color: var(--text-secondary); border-color: var(--text-muted); }
+.check-group-run-btn:hover { background: rgba(93, 216, 226, 0.14); border-color: rgba(93, 216, 226, 0.5); }
 .check-group-run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .check-item {
   display: flex;
@@ -1588,17 +1745,17 @@ html, body {
   font-size: 10px;
   font-family: var(--font-mono);
   border-radius: 3px;
-  border: 1px solid var(--border-color);
-  background: transparent;
-  color: var(--text-muted);
+  border: 1px solid rgba(93, 216, 226, 0.35);
+  background: rgba(93, 216, 226, 0.08);
+  color: var(--accent-blue);
   cursor: pointer;
   transition: color 0.12s, border-color 0.12s, background 0.12s;
   white-space: nowrap;
+  justify-self: end;
 }
 .check-run-btn:hover {
-  color: var(--accent-blue);
-  border-color: rgba(93,216,226,0.4);
-  background: rgba(93,216,226,0.06);
+  background: rgba(93, 216, 226, 0.14);
+  border-color: rgba(93, 216, 226, 0.5);
 }
 .check-run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .check-detail {
@@ -2087,6 +2244,20 @@ html, body {
   border: 1px solid rgba(255, 255, 255, 0.05);
 }
 
+.mist-launch-card {
+  background:
+    linear-gradient(180deg, rgba(93, 216, 226, 0.05), rgba(93, 216, 226, 0.015)),
+    rgba(255, 255, 255, 0.03);
+  border-color: rgba(93, 216, 226, 0.14);
+}
+
+.cloud-status-card-why {
+  margin-top: 3px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
 .cloud-status-card-label {
   font-size: 11px;
   font-weight: 600;
@@ -2100,17 +2271,42 @@ html, body {
   color: var(--text-primary);
 }
 
+.mist-launch-compare-label {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
 .cloud-status-pill {
-  display: inline-block;
-  margin-top: 8px;
-  padding: 3px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 2px 7px;
   border-radius: 999px;
   border: 1px solid transparent;
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
+
+.cloud-status-pill-led {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: currentColor;
+  opacity: 0.75;
+}
+
+.state-connected .cloud-status-pill-led,
+.state-pass .cloud-status-pill-led { box-shadow: 0 0 4px rgba(63,185,80,0.6); }
+
+.state-disconnected .cloud-status-pill-led,
+.state-fail .cloud-status-pill-led { box-shadow: 0 0 4px rgba(248,81,73,0.6); }
+
+.state-degraded .cloud-status-pill-led,
+.state-warn .cloud-status-pill-led { box-shadow: 0 0 4px rgba(227,179,65,0.6); }
 
 .cloud-status-pill.state-connected,
 .cloud-status-pill.state-pass {
@@ -2287,7 +2483,14 @@ html, body {
 .jma-recommendation-actions {
   margin-top: 12px;
   display: flex;
-  gap: 8px;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.jma-recommendation-actions .btn {
+  width: 100%;
+  justify-content: space-between;
+  text-align: left;
 }
 
 /* jma-recommendation-sections is always single-column now (guidance panel).

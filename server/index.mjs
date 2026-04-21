@@ -49,6 +49,18 @@ const mcpActionQueues = new Map();
  */
 /** @type {Map<string, McpActionRecord>} */
 const mcpActions = new Map();
+/** @type {Map<string, { payload: Record<string, unknown>, createdAt: number }>} */
+const extensionLaunches = new Map();
+const EXTENSION_LAUNCH_TTL_MS = 15 * 60 * 1000;
+
+function pruneExtensionLaunches() {
+  const cutoff = Date.now() - EXTENSION_LAUNCH_TTL_MS;
+  for (const [token, entry] of extensionLaunches.entries()) {
+    if (entry.createdAt < cutoff) {
+      extensionLaunches.delete(token);
+    }
+  }
+}
 
 function latestMcpStubState() {
   return {
@@ -365,6 +377,74 @@ function mistProxyHandler(req, res) {
   });
 }
 
+function extensionLaunchHandler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Content-Type', 'application/json');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  pruneExtensionLaunches();
+
+  const reqUrl = new URL(req.url, 'http://127.0.0.1');
+
+  if (req.method === 'POST' && reqUrl.pathname === '/extension-launch') {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body);
+        if (!payload || typeof payload !== 'object') {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Invalid launch payload' }));
+          return;
+        }
+        const token = randomUUID();
+        extensionLaunches.set(token, {
+          payload,
+          createdAt: Date.now(),
+        });
+        res.writeHead(200);
+        res.end(JSON.stringify({
+          ok: true,
+          launchUrl: `http://localhost:3000/index.html?mistLaunchToken=${encodeURIComponent(token)}`,
+        }));
+      } catch {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && reqUrl.pathname.startsWith('/extension-launch/')) {
+    const token = decodeURIComponent(reqUrl.pathname.slice('/extension-launch/'.length));
+    if (!token) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Missing launch token' }));
+      return;
+    }
+    const entry = extensionLaunches.get(token);
+    if (!entry) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'Unknown or expired launch token' }));
+      return;
+    }
+    extensionLaunches.delete(token);
+    res.writeHead(200);
+    res.end(JSON.stringify(entry.payload));
+    return;
+  }
+
+  res.writeHead(404);
+  res.end(JSON.stringify({ error: 'Not found' }));
+}
+
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -373,6 +453,10 @@ const server = http.createServer((req, res) => {
   }
   if (req.url === '/mist-proxy' || req.url?.startsWith('/mist-proxy?')) {
     mistProxyHandler(req, res);
+    return;
+  }
+  if (req.url === '/extension-launch' || req.url?.startsWith('/extension-launch/')) {
+    extensionLaunchHandler(req, res);
     return;
   }
   if (req.url?.startsWith('/mcp/')) {

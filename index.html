@@ -17,6 +17,8 @@
         <span class="header-subtitle">Web Serial Terminal</span>
       </div>
       <div class="header-right">
+        <button id="btn-header-session" class="header-chip-btn" type="button">Session Tools</button>
+        <button id="btn-header-mist" class="header-chip-btn" type="button">Mist API</button>
         <span id="connection-badge" class="badge badge-disconnected">Disconnected</span>
       </div>
     </header>
@@ -24,7 +26,7 @@
     <!-- Main layout -->
     <div id="main">
 
-      <!-- Sidebar: Accordion navigation -->
+      <!-- Sidebar drawer: keeps the existing controls intact, but no longer dominates the main layout -->
       <aside id="sidebar">
 
         <!-- Connection section -->
@@ -190,8 +192,18 @@
       <section id="workspace">
         <div id="workspace-top-strip" class="workspace-strip workspace-strip-top">
           <div class="session-bar">
+            <div class="session-bar-action-group">
+              <button id="btn-session-connect" class="btn btn-primary btn-sm" type="button">Choose Serial Port</button>
+              <button id="btn-session-disconnect" class="btn btn-danger btn-sm" type="button" disabled>Disconnect</button>
+            </div>
             <span class="session-bar-label">Port</span>
             <span id="selected-port" class="session-bar-port-value">None selected</span>
+            <span class="session-bar-divider" aria-hidden="true"></span>
+            <div class="session-bar-action-group session-bar-action-group-secondary">
+              <button id="btn-session-login" class="btn btn-secondary btn-sm" type="button" disabled>Login</button>
+              <button id="btn-session-identify" class="btn btn-secondary btn-sm" type="button" disabled>Identify</button>
+              <button id="btn-session-root" class="btn btn-secondary btn-sm" type="button" disabled>Root PW</button>
+            </div>
             <span class="session-bar-divider" aria-hidden="true"></span>
             <div id="device-summary" class="device-summary device-summary-empty">
               <span class="device-summary-placeholder">Log in to identify the switch.</span>
@@ -275,17 +287,34 @@
           <div class="cloud-status-grid">
             <div class="cloud-status-card">
               <div class="cloud-status-card-label">Mist Status</div>
-              <span id="mist-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
+              <span id="mist-monitor-pill" class="cloud-status-pill state-unknown"><span class="cloud-status-pill-led"></span>Unknown</span>
               <div id="mist-monitor-detail" class="cloud-status-card-detail">Identify and match the switch in Mist to enable Mist status monitoring.</div>
+              <div id="mist-monitor-why" class="cloud-status-card-why">Mist evidence is not available yet.</div>
             </div>
             <div class="cloud-status-card">
               <div class="cloud-status-card-label">Switch Cloud State</div>
-              <span id="jma-monitor-pill" class="cloud-status-pill state-unknown">Unknown</span>
+              <span id="jma-monitor-pill" class="cloud-status-pill state-unknown"><span class="cloud-status-pill-led"></span>Unknown</span>
               <div id="jma-monitor-detail" class="cloud-status-card-detail">Log in to start the switch-reported cloud status monitor.</div>
+              <div id="jma-monitor-why" class="cloud-status-card-why">The switch has not reported a cloud state yet.</div>
             </div>
+          </div>
+          <div id="mist-launch-card" class="cloud-status-card mist-launch-card is-hidden">
+            <div class="cloud-status-card-label">Mist Launch Verification</div>
+            <span id="mist-launch-pill" class="cloud-status-pill state-unknown"><span class="cloud-status-pill-led"></span>Not active</span>
+            <div id="mist-launch-detail" class="cloud-status-card-detail">Open Junos Console from a Mist switch page to verify the console session against that launched switch.</div>
+            <div id="mist-launch-why" class="cloud-status-card-why">Mist launch verification is not active for this session.</div>
           </div>
         </div>
         <div id="jma-recommendation" class="jma-recommendation-card jma-recommendation-hidden" aria-live="polite"></div>
+        <div class="guidance-actions-panel">
+          <div class="guidance-actions-label">Quick Actions</div>
+          <div class="guidance-actions-grid">
+            <button id="btn-guidance-dhcp-refresh" class="btn btn-secondary btn-sm" type="button" disabled>DHCP Refresh</button>
+            <button id="btn-guidance-restart-mist-agent" class="btn btn-secondary btn-sm" type="button" disabled>Restart Agent</button>
+            <button id="btn-guidance-config-sync" class="btn btn-secondary btn-sm" type="button" disabled>Config Sync</button>
+            <button id="btn-guidance-adopt" class="btn btn-secondary btn-sm" type="button" disabled>Adopt Switch</button>
+          </div>
+        </div>
       </aside>
 
     </div>
@@ -296,7 +325,7 @@
           <h3 id="mist-modal-title">Mist API Integration Setup</h3>
           <button id="btn-close-mist-modal" class="mist-modal-close" type="button" aria-label="Close Mist setup">&times;</button>
         </div>
-        <p class="mist-modal-description">
+        <p id="mist-modal-description" class="mist-modal-description">
           Configure your Mist Cloud credentials to enable cloud-managed diagnostics and automated onboarding features.
         </p>
 

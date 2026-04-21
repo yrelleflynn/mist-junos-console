@@ -94,17 +94,42 @@ export interface MistDeviceConfig {
   [key: string]: any;
 }
 
+export interface MistLaunchOverlay {
+  siteId?: string | null;
+  deviceId?: string | null;
+  orgId?: string | null;
+  siteName?: string | null;
+  orgName?: string | null;
+  deviceName?: string | null;
+  deviceSerial?: string | null;
+  deviceMac?: string | null;
+  deviceRootPassword?: string | null;
+  deviceConfig?: MistDeviceConfig | null;
+  mistMonitor?: {
+    mistInventoryConnected?: boolean | null;
+    mistStatsStatus?: string | null;
+    mistRecentlySeen?: boolean | null;
+    mistCloudReachableHint?: boolean | null;
+    mistCloudStatusLine?: string | null;
+    mistLastSeenUtcIso?: string | null;
+    mistLastConfigUtcIso?: string | null;
+  } | null;
+  deviceEvents?: MistDeviceEvent[] | null;
+}
+
 export class MistApiService {
   private proxyBase: string;
   private apiToken: string;
   private apiHost: string;
   private orgId: string;
+  private launchOverlay: MistLaunchOverlay | null;
 
   constructor(proxyBase = '') {
     this.proxyBase = proxyBase;
     this.apiToken = '';
     this.apiHost = '';
     this.orgId = '';
+    this.launchOverlay = null;
   }
 
   configure(apiToken: string, apiHost: string, orgId: string): void {
@@ -115,6 +140,40 @@ export class MistApiService {
 
   get isConfigured(): boolean {
     return this.apiToken.length > 0 && this.apiHost.length > 0 && this.orgId.length > 0;
+  }
+
+  get hasLaunchOverlay(): boolean {
+    return !!this.launchOverlay;
+  }
+
+  setLaunchOverlay(overlay: MistLaunchOverlay | null): void {
+    this.launchOverlay = overlay;
+  }
+
+  private matchesLaunchSite(siteId: string): boolean {
+    return !!this.launchOverlay?.siteId && this.launchOverlay.siteId === siteId;
+  }
+
+  private matchesLaunchDevice(siteId: string, deviceId: string): boolean {
+    return this.matchesLaunchSite(siteId) && !!this.launchOverlay?.deviceId && this.launchOverlay.deviceId === deviceId;
+  }
+
+  private buildLaunchInventoryDevice(): MistInventoryDevice | null {
+    if (!this.launchOverlay?.deviceId || !this.launchOverlay.siteId) return null;
+    return {
+      id: this.launchOverlay.deviceId,
+      mac: this.launchOverlay.deviceMac ?? '',
+      serial: this.launchOverlay.deviceSerial ?? '',
+      model: '',
+      type: 'switch',
+      name: this.launchOverlay.deviceName ?? undefined,
+      site_id: this.launchOverlay.siteId,
+      connected: this.launchOverlay.mistMonitor?.mistInventoryConnected ?? undefined,
+    };
+  }
+
+  getLaunchInventoryDevice(): MistInventoryDevice | null {
+    return this.buildLaunchInventoryDevice();
   }
 
   /**
@@ -210,6 +269,9 @@ export class MistApiService {
   }
 
   async getSite(siteId: string): Promise<MistSite> {
+    if (this.matchesLaunchSite(siteId) && this.launchOverlay?.siteName) {
+      return { id: siteId, name: this.launchOverlay.siteName };
+    }
     const site = await this.get<MistSite>(`/api/v1/sites/${siteId}`);
     return { id: site.id, name: site.name };
   }
@@ -287,6 +349,13 @@ export class MistApiService {
    * Fetch site settings, including switch_mgmt.root_password.
    */
   async getSiteSettings(siteId: string): Promise<MistSiteSettings> {
+    if (this.matchesLaunchSite(siteId) && this.launchOverlay?.deviceRootPassword) {
+      return {
+        switch_mgmt: {
+          root_password: this.launchOverlay.deviceRootPassword,
+        },
+      };
+    }
     return this.get<MistSiteSettings>(`/api/v1/sites/${siteId}/setting`);
   }
 
@@ -294,6 +363,9 @@ export class MistApiService {
    * Convenience: get root password for a site's switches.
    */
   async getRootPassword(siteId: string): Promise<string | null> {
+    if (this.matchesLaunchSite(siteId) && this.launchOverlay?.deviceRootPassword) {
+      return this.launchOverlay.deviceRootPassword;
+    }
     try {
       const settings = await this.getSiteSettings(siteId);
       return settings.switch_mgmt?.root_password ?? null;
@@ -306,6 +378,8 @@ export class MistApiService {
    * Fetch org inventory (all devices).
    */
   async getInventory(): Promise<MistInventoryDevice[]> {
+    const launchDevice = this.buildLaunchInventoryDevice();
+    if (launchDevice) return [launchDevice];
     return this.get<MistInventoryDevice[]>(`/api/v1/orgs/${this.orgId}/inventory?type=switch`);
   }
 
@@ -314,6 +388,10 @@ export class MistApiService {
    * Uses the targeted serial-filter endpoint for efficiency on large orgs.
    */
   async findDeviceBySerial(serial: string): Promise<MistInventoryDevice | null> {
+    const launchDevice = this.buildLaunchInventoryDevice();
+    if (launchDevice?.serial?.toLowerCase() === serial.toLowerCase()) {
+      return launchDevice;
+    }
     try {
       const results = await this.get<MistInventoryDevice[]>(
         `/api/v1/orgs/${this.orgId}/inventory?serial=${encodeURIComponent(serial)}&type=switch`,
@@ -330,6 +408,10 @@ export class MistApiService {
    * Falls back to full inventory scan since the API does not support MAC-filter on this endpoint.
    */
   async findDeviceByMac(mac: string): Promise<MistInventoryDevice | null> {
+    const launchDevice = this.buildLaunchInventoryDevice();
+    if ((launchDevice?.mac ?? '').toLowerCase().replace(/[:-]/g, '') === mac.toLowerCase().replace(/[:-]/g, '')) {
+      return launchDevice;
+    }
     try {
       const normalized = mac.toLowerCase().replace(/[:-]/g, '');
       const inventory = await this.getInventory();
@@ -347,6 +429,10 @@ export class MistApiService {
    * Find a device in the Mist inventory by name (hostname).
    */
   async findDeviceByName(name: string): Promise<MistInventoryDevice | null> {
+    const launchDevice = this.buildLaunchInventoryDevice();
+    if (launchDevice?.name?.toLowerCase() === name.toLowerCase()) {
+      return launchDevice;
+    }
     try {
       const inventory = await this.getInventory();
       const match = inventory.find((d) =>
@@ -362,6 +448,9 @@ export class MistApiService {
    * Fetch the Mist device configuration (intended config).
    */
   async getDeviceConfig(siteId: string, deviceId: string): Promise<MistDeviceConfig> {
+    if (this.matchesLaunchDevice(siteId, deviceId) && this.launchOverlay?.deviceConfig) {
+      return this.launchOverlay.deviceConfig;
+    }
     return this.get<MistDeviceConfig>(`/api/v1/sites/${siteId}/devices/${deviceId}/config_cmd`);
   }
 
@@ -405,6 +494,9 @@ export class MistApiService {
    * Fetch device events (connect/disconnect, config changes, etc.)
    */
   async getDeviceEvents(siteId: string, deviceId: string, limit = 20): Promise<MistDeviceEvent[]> {
+    if (this.matchesLaunchDevice(siteId, deviceId) && this.launchOverlay?.deviceEvents) {
+      return this.launchOverlay.deviceEvents.slice(0, limit);
+    }
     try {
       const data = await this.get<{ results?: MistDeviceEvent[] } | MistDeviceEvent[]>(
         `/api/v1/sites/${siteId}/devices/events/search?device_id=${encodeURIComponent(deviceId)}&limit=${limit}`,
@@ -434,6 +526,24 @@ export class MistApiService {
    * Fetch device stats including last_seen timestamp.
    */
   async getDeviceStats(siteId: string, deviceId: string): Promise<MistDeviceStats | null> {
+    if (this.matchesLaunchDevice(siteId, deviceId) && this.launchOverlay?.mistMonitor) {
+      const monitor = this.launchOverlay.mistMonitor;
+      let lastSeen;
+      if (monitor.mistLastSeenUtcIso) {
+        const epoch = Math.floor(new Date(monitor.mistLastSeenUtcIso).getTime() / 1000);
+        lastSeen = Number.isFinite(epoch) ? epoch : undefined;
+      }
+      let lastConfig;
+      if (monitor.mistLastConfigUtcIso) {
+        const epoch = Math.floor(new Date(monitor.mistLastConfigUtcIso).getTime() / 1000);
+        lastConfig = Number.isFinite(epoch) ? epoch : undefined;
+      }
+      return {
+        last_seen: lastSeen,
+        last_config: lastConfig,
+        status: monitor.mistStatsStatus ?? undefined,
+      };
+    }
     try {
       return await this.get<MistDeviceStats>(`/api/v1/sites/${siteId}/stats/devices/${deviceId}`);
     } catch {

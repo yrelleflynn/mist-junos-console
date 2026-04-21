@@ -1,0 +1,156 @@
+:root {
+  color-scheme: dark;
+  --bg: #15181f;
+  --panel: #1d222c;
+  --panel-border: rgba(255, 255, 255, 0.08);
+  --text: #e8ecf4;
+  --text-muted: #9aa3b5;
+  --teal: #1fc8d9;
+  --teal-dark: #13899b;
+  --green: #3dc676;
+  --red: #ef6461;
+  --neutral: #586274;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 360px;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.popup {
+  padding: 16px;
+}
+
+.popup-header h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.eyebrow {
+  margin-bottom: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+}
+
+.subtitle {
+  margin: 6px 0 0;
+  color: var(--text-muted);
+}
+
+.card {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.status-row {
+  margin-bottom: 12px;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.pill.neutral {
+  background: rgba(88, 98, 116, 0.2);
+  color: #b9c0cc;
+  border: 1px solid rgba(88, 98, 116, 0.4);
+}
+
+.pill.good {
+  background: rgba(61, 198, 118, 0.12);
+  color: #9ef0bf;
+  border: 1px solid rgba(61, 198, 118, 0.35);
+}
+
+.pill.bad {
+  background: rgba(239, 100, 97, 0.12);
+  color: #ffb1af;
+  border: 1px solid rgba(239, 100, 97, 0.35);
+}
+
+.context-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  margin: 0;
+}
+
+.context-grid div {
+  min-width: 0;
+}
+
+.context-grid dt {
+  margin-bottom: 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.context-grid dd {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-message {
+  margin: 14px 0 0;
+  color: var(--text-muted);
+}
+
+.debug-url {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+  word-break: break-all;
+}
+
+.debug-url.is-hidden {
+  display: none;
+}
+
+.actions {
+  margin-top: 14px;
+}
+
+.btn {
+  width: 100%;
+  height: 40px;
+  border: 0;
+  border-radius: 10px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.btn:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.btn-primary {
+  background: linear-gradient(180deg, var(--teal), var(--teal-dark));
+  color: #071015;
+}

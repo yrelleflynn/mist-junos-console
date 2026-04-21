@@ -52,6 +52,10 @@ export class SwitchIdentityService {
     this.mistApi = mistApi;
   }
 
+  getLaunchMistDevice(): MistInventoryDevice | null {
+    return this.mistApi.getLaunchInventoryDevice();
+  }
+
   private parseChassisHardware(output: string): Pick<SwitchIdentity, 'serial' | 'model'> {
     const lines = output.split('\n');
 
@@ -320,7 +324,7 @@ export class SwitchIdentityService {
     let mistDevice: MistInventoryDevice | null = null;
     let matchedBy: 'serial' | 'mac' | 'name' | null = null;
 
-    if (!this.mistApi.isConfigured) {
+    if (!this.mistApi.isConfigured && !this.mistApi.hasLaunchOverlay) {
       return {
         identity,
         mistDevice: null,
@@ -464,7 +468,7 @@ export class SwitchIdentityService {
     | 'mistLastSeenUtcIso'
     | 'mistLastConfigUtcIso'
   >> {
-    if (!this.mistApi.isConfigured || !device.site_id) {
+    if ((!this.mistApi.isConfigured && !this.mistApi.hasLaunchOverlay) || !device.site_id) {
       return {
         mistInventoryConnected: typeof device.connected === 'boolean' ? device.connected : null,
         mistStatsStatus: null,

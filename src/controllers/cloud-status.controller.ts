@@ -117,14 +117,15 @@ export class CloudStatusController {
   }
 
   private async buildMistStatus(matchResult: MistMatchResult | null): Promise<MistMonitorStatus> {
-    if (!matchResult?.mistDevice) {
+    const targetDevice = matchResult?.mistDevice ?? this.switchIdentity.getLaunchMistDevice();
+    if (!targetDevice) {
       return {
         ...EMPTY_MIST_MONITOR_STATUS,
         detail: 'Identify and match the switch in Mist to enable Mist status monitoring.',
       };
     }
 
-    const refreshed = await this.switchIdentity.refreshMistCloudStatus(matchResult.mistDevice);
+    const refreshed = await this.switchIdentity.refreshMistCloudStatus(targetDevice);
     if (refreshed.mistCloudReachableHint === true) {
       return {
         pillState: 'connected',

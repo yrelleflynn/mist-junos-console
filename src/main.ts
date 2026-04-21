@@ -10,6 +10,7 @@ import { SerialService } from './services/serial.service';
 import { TerminalComponent } from './components/terminal.component';
 import { CommandRunnerService } from './services/command-runner.service';
 import { MistApiService } from './services/mist-api.service';
+import type { MistDeviceConfig, MistDeviceEvent, MistLaunchOverlay } from './services/mist-api.service';
 import { TroubleshootService, CheckResult, CheckStatus } from './services/troubleshoot.service';
 import { SwitchIdentityService } from './services/switch-identity.service';
 import { ConfigSyncService, isConfigSyncStagingWarning } from './services/config-sync.service';
@@ -41,6 +42,7 @@ const LAST_PORT_LABEL_STORAGE_KEY = 'junos-console.last-port-label';
 const MIST_CLOUD_STORAGE_KEY = 'junos-console.mist-cloud-id';
 const MIST_ORG_STORAGE_KEY = 'junos-console.mist-org-id';
 const REMOTE_SESSION_ENABLED_STORAGE_KEY = 'junos-console.remote-session-enabled';
+const EXTENSION_LAUNCH_CONTEXT_STORAGE_KEY = 'junos-console.extension-launch-context';
 const BACKGROUND_CONSOLE_IDLE_MS = 5000;
 
 type StoredSerialPrefs = {
@@ -50,6 +52,15 @@ type StoredSerialPrefs = {
   stopBits: string;
   flowControl: string;
 };
+
+type ExtensionLaunchContext = MistLaunchOverlay & {
+  source?: string | null;
+  cloudHost?: string | null;
+  apiHost?: string | null;
+  capturedAt?: string | null;
+};
+
+type MistLaunchVerificationState = 'inactive' | 'waiting' | 'matched' | 'mismatch';
 
 // ---- Check Web Serial support ----
 if (!SerialService.isSupported()) {
@@ -70,6 +81,7 @@ if (!SerialService.isSupported()) {
 function init(): void {
   // ---- DOM refs ----
   const ui = {
+    sidebar: document.getElementById('sidebar') as HTMLElement,
     workspace: document.getElementById('workspace') as HTMLElement,
     // Connection
     btnConnect: document.getElementById('btn-connect') as HTMLButtonElement,
@@ -78,6 +90,11 @@ function init(): void {
     btnClear: document.getElementById('btn-clear') as HTMLButtonElement,
     terminalContainer: document.getElementById('terminal-container') as HTMLElement,
     connectionBadge: document.getElementById('connection-badge') as HTMLElement,
+    btnSessionToolsOpen: (document.getElementById('btn-session-tools-open')
+      ?? document.getElementById('btn-header-session')) as HTMLButtonElement | null,
+    btnSessionToolsClose: document.getElementById('btn-session-tools-close') as HTMLButtonElement | null,
+    sessionToolsOverlay: document.getElementById('session-tools-overlay') as HTMLElement | null,
+    btnHeaderMist: document.getElementById('btn-header-mist') as HTMLButtonElement | null,
     connectionStatePill: document.getElementById('connection-state-pill') as HTMLElement | null,
     serialPortSelect: document.getElementById('serial-port-select') as HTMLSelectElement,
     selectedPort: document.getElementById('selected-port') as HTMLElement,
@@ -99,10 +116,13 @@ function init(): void {
     btnLoadOrgs: document.getElementById('btn-load-orgs') as HTMLButtonElement,
     btnLoadSites: document.getElementById('btn-load-sites') as HTMLButtonElement,
     btnOpenMistModal: document.getElementById('btn-open-mist-modal') as HTMLButtonElement,
+    drawerMistModalButtons: document.querySelectorAll<HTMLButtonElement>('[data-open-mist-modal]'),
     btnCloseMistModal: document.getElementById('btn-close-mist-modal') as HTMLButtonElement,
     btnCancelMistModal: document.getElementById('btn-cancel-mist-modal') as HTMLButtonElement,
     btnSaveMistModal: document.getElementById('btn-save-mist-modal') as HTMLButtonElement,
     mistModalOverlay: document.getElementById('mist-modal-overlay') as HTMLElement,
+    mistModalTitle: document.getElementById('mist-modal-title') as HTMLElement | null,
+    mistModalDescription: document.getElementById('mist-modal-description') as HTMLElement | null,
     mistApiStatus: document.getElementById('mist-api-status') as HTMLElement,
     mistModalStatus: document.getElementById('mist-modal-status') as HTMLElement,
 
@@ -121,8 +141,14 @@ function init(): void {
     cloudStatusLastUpdated: document.getElementById('cloud-status-last-updated') as HTMLElement,
     mistMonitorPill: document.getElementById('mist-monitor-pill') as HTMLElement,
     mistMonitorDetail: document.getElementById('mist-monitor-detail') as HTMLElement,
+    mistMonitorWhy: document.getElementById('mist-monitor-why') as HTMLElement | null,
     jmaMonitorPill: document.getElementById('jma-monitor-pill') as HTMLElement,
     jmaMonitorDetail: document.getElementById('jma-monitor-detail') as HTMLElement,
+    jmaMonitorWhy: document.getElementById('jma-monitor-why') as HTMLElement | null,
+    mistLaunchCard: document.getElementById('mist-launch-card') as HTMLElement | null,
+    mistLaunchPill: document.getElementById('mist-launch-pill') as HTMLElement | null,
+    mistLaunchDetail: document.getElementById('mist-launch-detail') as HTMLElement | null,
+    mistLaunchWhy: document.getElementById('mist-launch-why') as HTMLElement | null,
     jmaRecommendation: document.getElementById('jma-recommendation') as HTMLElement,
     btnRootPassword: document.getElementById('btn-root-password') as HTMLButtonElement,
     rootPasswordResult: document.getElementById('root-password-result') as HTMLElement,
@@ -139,6 +165,12 @@ function init(): void {
     adoptResults: document.getElementById('adopt-results') as HTMLElement,
 
     // Device summary (workspace top strip)
+    btnSessionConnect: document.getElementById('btn-session-connect') as HTMLButtonElement | null,
+    btnSessionDisconnect: document.getElementById('btn-session-disconnect') as HTMLButtonElement | null,
+    btnSessionLogin: document.getElementById('btn-session-login') as HTMLButtonElement | null,
+    btnSessionIdentify: document.getElementById('btn-session-identify') as HTMLButtonElement | null,
+    btnSessionRootPassword: (document.getElementById('btn-session-root-password')
+      ?? document.getElementById('btn-session-root')) as HTMLButtonElement | null,
     deviceSummary: document.getElementById('device-summary') as HTMLElement,
     consoleTaskIndicator: document.getElementById('console-task-indicator') as HTMLElement,
 
@@ -147,10 +179,53 @@ function init(): void {
     resultsResizeHandle: document.getElementById('results-resize-handle') as HTMLElement,
     guidancePanel: document.getElementById('guidance-panel') as HTMLElement,
     guidanceResizeHandle: document.getElementById('guidance-resize-handle') as HTMLElement,
+    btnQuickDhcpRefresh: (document.getElementById('btn-quick-dhcp-refresh')
+      ?? document.getElementById('btn-guidance-dhcp-refresh')) as HTMLButtonElement | null,
+    btnQuickRestartMistAgent: (document.getElementById('btn-quick-restart-mist-agent')
+      ?? document.getElementById('btn-guidance-restart-mist-agent')) as HTMLButtonElement | null,
+    btnQuickConfigSync: (document.getElementById('btn-quick-config-sync')
+      ?? document.getElementById('btn-guidance-config-sync')) as HTMLButtonElement | null,
+    btnQuickAdopt: (document.getElementById('btn-quick-adopt')
+      ?? document.getElementById('btn-guidance-adopt')) as HTMLButtonElement | null,
     resultsTabs: document.querySelectorAll<HTMLButtonElement>('.results-tab'),
     resultsPanes: document.querySelectorAll<HTMLElement>('.results-pane'),
     actionsContent: document.getElementById('actions-content') as HTMLElement,
   };
+
+  function openSessionToolsDrawer(): void {
+    if (!ui.sidebar) return;
+    ui.sessionToolsOverlay?.classList.remove('is-hidden');
+    ui.sessionToolsOverlay?.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('session-tools-open');
+    ui.sidebar.classList.add('is-open');
+    ui.sidebar.setAttribute('aria-hidden', 'false');
+  }
+
+  function closeSessionToolsDrawer(): void {
+    ui.sessionToolsOverlay?.classList.add('is-hidden');
+    ui.sessionToolsOverlay?.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('session-tools-open');
+    ui.sidebar?.classList.remove('is-open');
+    ui.sidebar?.setAttribute('aria-hidden', 'true');
+  }
+
+  function bindProxyButton(proxy: HTMLButtonElement | null, source: HTMLButtonElement): void {
+    if (!proxy) return;
+    const sync = (): void => {
+      proxy.disabled = source.disabled;
+      proxy.className = source.className;
+      proxy.textContent = source.textContent;
+    };
+    proxy.addEventListener('click', () => source.click());
+    new MutationObserver(sync).observe(source, {
+      attributes: true,
+      attributeFilter: ['disabled', 'class'],
+      childList: true,
+      characterData: true,
+      subtree: true,
+    });
+    sync();
+  }
 
   // ---- Populate Mist cloud dropdown ----
   MIST_CLOUDS.forEach((cloud) => {
@@ -327,6 +402,7 @@ function init(): void {
   let pendingInitialShellToCli = false;
   let initialShellToCliInFlight = false;
   let latestCloudStatusState: CloudStatusState | null = null;
+  let extensionLaunchContext: ExtensionLaunchContext | null = null;
   interface GuidedAnalysisCard {
     eyebrow: string;
     title: string;
@@ -530,16 +606,17 @@ function init(): void {
           }
         }
 
-        ui.btnConfigSyncPreview.disabled = !mistDevice.site_id;
-        ui.btnRootPassword.disabled = !mistDevice.site_id;
-        ui.btnOfflineTimeline.disabled = !mistDevice.site_id;
+        const effectiveTarget = getEffectiveMistTarget();
+        ui.btnConfigSyncPreview.disabled = !effectiveTarget.siteId || !effectiveTarget.deviceId;
+        ui.btnRootPassword.disabled = !effectiveTarget.siteId;
+        ui.btnOfflineTimeline.disabled = !effectiveTarget.siteId;
         // Re-apply staged constraint on top of identification-derived button state
         updateConfigSyncUIState();
 
         if (mistDevice.site_id && !result.mistSiteName) {
           void ensureMatchedSiteName(mistDevice.site_id, identity);
         }
-      } else if (!mistApi.isConfigured) {
+      } else if (!mistApi.isConfigured && !extensionLaunchContext) {
         if (!options?.silent) term.writeSystem('  Mist: API not configured');
       } else {
         if (!options?.silent) term.writeSystem('  Mist: Not found in inventory');
@@ -681,6 +758,7 @@ function init(): void {
     const selectedCloud = getCloudById(ui.mistCloud.value);
     const selectedOrgName = getSelectedOrgName();
     const selectedSiteName = getSelectedSiteName();
+    const effectiveTarget = getEffectiveMistTarget();
     const promptMode = getRecentPromptMode();
     const recentTail = recentConsoleTail.trim();
     const blockingConsoleTask = getBlockingConsoleTask();
@@ -730,9 +808,9 @@ function init(): void {
         cloudId: selectedCloud?.id ?? null,
         cloudName: selectedCloud?.name ?? null,
         apiHost: selectedCloud?.apiHost ?? null,
-        orgId: mistContext.state.orgId || null,
+        orgId: effectiveTarget.orgId ?? null,
         orgName: selectedOrgName,
-        siteId: deviceContext.matchResult?.mistDevice?.site_id ?? mistContext.state.siteId ?? null,
+        siteId: effectiveTarget.siteId ?? null,
         siteName: selectedSiteName,
         orgCount: mistContext.state.orgs.length,
         siteCount: mistContext.state.sites.length,
@@ -1266,6 +1344,9 @@ function init(): void {
     const staged = configSync.hasStagedCandidate();
     const sessionInfo = configSync.sessionInfo;
     const canCommit = staged && !!sessionInfo?.canCommit;
+    const effectiveTarget = getEffectiveMistTarget();
+    const hasSite = !!effectiveTarget.siteId;
+    const hasDevice = hasSite && !!effectiveTarget.deviceId;
 
     // While a candidate config is staged, background Mist/JMA polling must stay
     // quiet so the app does not issue unrelated commands into the same session.
@@ -1283,8 +1364,7 @@ function init(): void {
     ui.btnRollbackSync.disabled = !staged;
 
     // Preview button: disabled while staged (can't start a new preview over an existing candidate)
-    const hasMatchedDevice = !!deviceContext.matchResult?.mistDevice?.site_id;
-    ui.btnConfigSyncPreview.disabled = staged || !hasMatchedDevice;
+    ui.btnConfigSyncPreview.disabled = staged || !hasDevice;
 
     // Workflows that would conflict with an open config-mode session.
     // Anything that mutates config must stay disabled for the full staged window.
@@ -1300,7 +1380,6 @@ function init(): void {
       ui.btnDhcpRefresh.disabled = false;
       ui.btnRestartMistAgent.disabled = false;
       // Offline timeline re-enabled only if device is identified with a site
-      const hasSite = !!deviceContext.matchResult?.mistDevice?.site_id;
       ui.btnOfflineTimeline.disabled = !hasSite;
       ui.btnAdopt.disabled = !serial.isConnected;
     }
@@ -1526,6 +1605,299 @@ function init(): void {
     ui.mistModalStatus.className = `status-text mist-modal-status-area ${type}`;
   }
 
+  function normalizeLooseId(value: string | null | undefined): string | null {
+    if (!value) return null;
+    const cleaned = value.trim().toLowerCase();
+    return cleaned || null;
+  }
+
+  function normalizeHexId(value: string | null | undefined): string | null {
+    if (!value) return null;
+    const cleaned = value.toLowerCase().replace(/[^0-9a-f]/g, '');
+    return cleaned || null;
+  }
+
+  function extractMistDeviceIdSuffix(deviceId: string | null | undefined): string | null {
+    const normalized = normalizeHexId(deviceId);
+    if (!normalized || normalized.length < 12) return null;
+    return normalized.slice(-12);
+  }
+
+  function formatMacFromHex(value: string | null | undefined): string | null {
+    const normalized = normalizeHexId(value);
+    if (!normalized || normalized.length !== 12) return null;
+    return normalized.match(/.{1,2}/g)?.join(':') ?? null;
+  }
+
+  function buildIdentityLabel(identity: {
+    hostname: string | null;
+    serial: string | null;
+    mac: string | null;
+    model: string | null;
+    junosVersion: string | null;
+  } | null | undefined): string {
+    if (!identity) return 'the console-connected switch';
+    const parts = [
+      identity.hostname,
+      identity.serial,
+      identity.mac,
+    ].filter(Boolean) as string[];
+    return parts[0] ?? 'the console-connected switch';
+  }
+
+  function buildIdentityDetail(identity: {
+    hostname: string | null;
+    serial: string | null;
+    mac: string | null;
+    model: string | null;
+    junosVersion: string | null;
+  } | null | undefined): string {
+    if (!identity) return 'Unknown console switch';
+    const parts = [
+      identity.hostname,
+      identity.serial,
+      identity.mac,
+    ].filter(Boolean) as string[];
+    return parts.join(' · ') || 'Unknown console switch';
+  }
+
+  function getMistLaunchExpectedLabel(): string {
+    if (!extensionLaunchContext) return 'the Mist-launched switch';
+    return extensionLaunchContext.deviceName
+      ?? extensionLaunchContext.deviceSerial
+      ?? extensionLaunchContext.deviceMac
+      ?? extensionLaunchContext.deviceId
+      ?? 'the Mist-launched switch';
+  }
+
+  function buildMistLaunchExpectedDetail(): string {
+    if (!extensionLaunchContext) return 'Unknown Mist switch';
+    const macFromDeviceId = formatMacFromHex(extractMistDeviceIdSuffix(extensionLaunchContext.deviceId));
+    const parts = [
+      extensionLaunchContext.deviceName,
+      extensionLaunchContext.deviceSerial,
+      extensionLaunchContext.deviceMac ?? macFromDeviceId,
+    ].filter(Boolean) as string[];
+    return parts.join(' · ') || 'Unknown Mist switch';
+  }
+
+  function buildMistLaunchSummaryText(): string {
+    if (!extensionLaunchContext) {
+      return 'Configure your Mist Cloud credentials to enable cloud-managed diagnostics and automated onboarding features.';
+    }
+
+    const cloudName = getCloudById(ui.mistCloud.value)?.name ?? extensionLaunchContext.cloudHost ?? 'Mist';
+    const launchDetail = buildMistLaunchExpectedDetail();
+    if (launchDetail !== 'Unknown Mist switch') {
+      return `This session was launched from Mist for ${launchDetail} on ${cloudName}. Manual API token setup is optional fallback only.`;
+    }
+    return `This session was launched from Mist on ${cloudName}. Manual API token setup is optional fallback only.`;
+  }
+
+  function getMistLaunchVerification(): {
+    active: boolean;
+    state: MistLaunchVerificationState;
+    detail: string;
+    why: string;
+    unlocksWorkflow: boolean;
+  } {
+    if (!extensionLaunchContext) {
+      return {
+        active: false,
+        state: 'inactive',
+        detail: 'Open Junos Console from a Mist switch page to verify the console session against that launched switch.',
+        why: 'Mist launch verification is not active for this session.',
+        unlocksWorkflow: true,
+      };
+    }
+
+    const expectedLabel = getMistLaunchExpectedLabel();
+    const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity ?? null;
+    const matchedMistDeviceId = deviceContext.matchResult?.mistDevice?.id ?? null;
+    const expectedMistDeviceId = extensionLaunchContext.deviceId ?? null;
+
+    if (!serial.isConnected) {
+      return {
+        active: true,
+        state: 'waiting',
+        detail: `Launched from Mist for ${expectedLabel}. Connect the serial session, log in, and identify the switch.`,
+        why: 'Checks, actions, config sync, and adoption stay locked until the console-connected switch is verified.',
+        unlocksWorkflow: false,
+      };
+    }
+
+    if (!identity) {
+      return {
+        active: true,
+        state: 'waiting',
+        detail: `Launched from Mist for ${expectedLabel}. Identify the console-connected switch to verify the session.`,
+        why: 'Checks, actions, config sync, and adoption stay locked until the console-connected switch is verified.',
+        unlocksWorkflow: false,
+      };
+    }
+
+    if (matchedMistDeviceId && expectedMistDeviceId) {
+      if (matchedMistDeviceId === expectedMistDeviceId) {
+        return {
+          active: true,
+          state: 'matched',
+          detail: `Matched ${expectedLabel}. The identified console session maps to the same Mist switch.`,
+          why: 'Mist launch verification succeeded, so troubleshooting workflows are now available.',
+          unlocksWorkflow: true,
+        };
+      }
+
+      return {
+        active: true,
+        state: 'mismatch',
+        detail: `${buildIdentityLabel(identity)} does not match the switch launched from Mist (${expectedLabel}).`,
+        why: 'Disconnect and move the console cable to the Mist-launched switch before running checks or actions.',
+        unlocksWorkflow: false,
+      };
+    }
+
+    const comparisons: Array<{ label: string; matched: boolean }> = [];
+    const expectedSerial = normalizeLooseId(extensionLaunchContext.deviceSerial);
+    const actualSerial = normalizeLooseId(identity.serial);
+    if (expectedSerial && actualSerial) {
+      comparisons.push({ label: 'serial', matched: expectedSerial === actualSerial });
+    }
+
+    const actualMac = normalizeHexId(identity.mac);
+    const expectedMac = normalizeHexId(extensionLaunchContext.deviceMac);
+    if (expectedMac && actualMac) {
+      comparisons.push({ label: 'MAC', matched: expectedMac === actualMac });
+    }
+
+    const expectedMacSuffix = extractMistDeviceIdSuffix(extensionLaunchContext.deviceId);
+    if (expectedMacSuffix && actualMac) {
+      comparisons.push({ label: 'MAC', matched: expectedMacSuffix === actualMac.slice(-12) });
+    }
+
+    const expectedHostname = normalizeLooseId(extensionLaunchContext.deviceName);
+    const actualHostname = normalizeLooseId(identity.hostname);
+    if (expectedHostname && actualHostname) {
+      comparisons.push({ label: 'hostname', matched: expectedHostname === actualHostname });
+    }
+
+    const mismatch = comparisons.find((comparison) => !comparison.matched);
+    if (mismatch) {
+      return {
+        active: true,
+        state: 'mismatch',
+        detail: `${buildIdentityLabel(identity)} does not match the switch launched from Mist (${expectedLabel}).`,
+        why: `Verification failed on ${mismatch.label}. Disconnect and move the console cable to the Mist-launched switch before continuing.`,
+        unlocksWorkflow: false,
+      };
+    }
+
+    if (comparisons.length > 0) {
+      return {
+        active: true,
+        state: 'matched',
+        detail: `Matched ${expectedLabel}. The console-connected switch aligns with the Mist launch context.`,
+        why: 'Mist launch verification succeeded, so troubleshooting workflows are now available.',
+        unlocksWorkflow: true,
+      };
+    }
+
+    return {
+      active: true,
+      state: 'waiting',
+      detail: `Launched from Mist for ${expectedLabel}. Identify the console-connected switch to complete verification.`,
+      why: 'This workflow remains locked until the app can compare the console identity to the Mist launch context.',
+      unlocksWorkflow: false,
+    };
+  }
+
+  function getMistLaunchBlockedReason(): string | null {
+    const verification = getMistLaunchVerification();
+    if (!verification.active || verification.unlocksWorkflow) return null;
+    if (verification.state === 'mismatch') {
+      return 'The console-connected switch does not match the switch launched from Mist.';
+    }
+    return 'Identify and verify the console-connected switch against the Mist launch context first.';
+  }
+
+  function isMistLaunchWorkflowUnlocked(): boolean {
+    return getMistLaunchVerification().unlocksWorkflow;
+  }
+
+  function renderMistLaunchVerification(): void {
+    if (!ui.mistLaunchCard || !ui.mistLaunchPill || !ui.mistLaunchDetail || !ui.mistLaunchWhy) {
+      return;
+    }
+
+    const verification = getMistLaunchVerification();
+    if (!verification.active) {
+      ui.mistLaunchCard.classList.add('is-hidden');
+      setCloudStatusPill(ui.mistLaunchPill, 'Not active', 'unknown');
+      ui.mistLaunchDetail.textContent = verification.detail;
+      ui.mistLaunchWhy.textContent = verification.why;
+      return;
+    }
+
+    ui.mistLaunchCard.classList.remove('is-hidden');
+    if (verification.state === 'matched') {
+      setCloudStatusPill(ui.mistLaunchPill, 'Matched', 'pass');
+    } else if (verification.state === 'mismatch') {
+      setCloudStatusPill(ui.mistLaunchPill, 'Mismatch', 'fail');
+    } else {
+      setCloudStatusPill(ui.mistLaunchPill, 'Waiting for match', 'warn');
+    }
+    if (verification.state === 'mismatch' || verification.state === 'matched') {
+      const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity ?? null;
+      ui.mistLaunchDetail.innerHTML = `
+        <span class="mist-launch-compare-label">Console switch:</span> ${escapeHtml(buildIdentityDetail(identity))}<br>
+        <span class="mist-launch-compare-label">Mist launch:</span> ${escapeHtml(buildMistLaunchExpectedDetail())}
+      `;
+    } else {
+      ui.mistLaunchDetail.textContent = verification.detail;
+    }
+    ui.mistLaunchWhy.textContent = verification.why;
+  }
+
+  function applyMistLaunchWorkflowGates(): void {
+    renderMistLaunchVerification();
+    const workflowUnlocked = isMistLaunchWorkflowUnlocked();
+    const blockedReason = getMistLaunchBlockedReason();
+    const staged = configSync.hasStagedCandidate();
+    const effectiveTarget = getEffectiveMistTarget();
+    const hasSite = !!effectiveTarget.siteId;
+    const hasDevice = hasSite && !!effectiveTarget.deviceId;
+
+    const gatedButtons = [
+      ui.btnDhcpRefresh,
+      ui.btnRestartMistAgent,
+      ui.btnConfigSyncPreview,
+      ui.btnOfflineTimeline,
+      ui.btnAdopt,
+      ui.btnCommitSync,
+    ];
+
+    if (workflowUnlocked) {
+      gatedButtons.forEach((button) => {
+        button.removeAttribute('title');
+      });
+      ui.btnDhcpRefresh.disabled = !serial.isConnected || staged;
+      ui.btnRestartMistAgent.disabled = !serial.isConnected || staged;
+      ui.btnConfigSyncPreview.disabled = staged || !hasDevice;
+      ui.btnOfflineTimeline.disabled = staged || !hasSite;
+      ui.btnAdopt.disabled = staged || !serial.isConnected;
+      ui.btnCommitSync.disabled = !staged || !configSync.sessionInfo?.canCommit;
+      refreshCatalogRunButtons(staged || !serial.isConnected);
+      return;
+    }
+
+    refreshCatalogRunButtons(true);
+    gatedButtons.forEach((button) => {
+      button.disabled = true;
+      if (blockedReason) {
+        button.title = blockedReason;
+      }
+    });
+  }
+
   function getSelectedOrgName(): string | null {
     const state = mistContext.state;
     if (!state.orgId) return null;
@@ -1533,6 +1905,7 @@ function init(): void {
   }
 
   function getSelectedSiteName(): string | null {
+    if (extensionLaunchContext?.siteName) return extensionLaunchContext.siteName;
     const matchedSiteName = deviceContext.matchResult?.mistSiteName ?? resolvedMatchedSiteName ?? null;
     if (matchedSiteName) return matchedSiteName;
 
@@ -1540,6 +1913,98 @@ function init(): void {
     const siteId = deviceContext.matchResult?.mistDevice?.site_id ?? state.siteId ?? null;
     if (!siteId) return null;
     return state.sites.find((site) => site.id === siteId)?.name ?? null;
+  }
+
+  function getEffectiveMistTarget(): { siteId: string | null; deviceId: string | null; orgId: string | null } {
+    return {
+      siteId: deviceContext.matchResult?.mistDevice?.site_id ?? extensionLaunchContext?.siteId ?? mistContext.state.siteId ?? null,
+      deviceId: deviceContext.matchResult?.mistDevice?.id ?? extensionLaunchContext?.deviceId ?? null,
+      orgId: deviceContext.matchResult?.mistDevice?.org_id ?? extensionLaunchContext?.orgId ?? mistContext.state.orgId ?? null,
+    };
+  }
+
+  function applyExtensionLaunchContext(context: ExtensionLaunchContext | null): void {
+    extensionLaunchContext = context;
+    mistApi.setLaunchOverlay(context);
+
+    if (context) {
+      sessionStorage.setItem(EXTENSION_LAUNCH_CONTEXT_STORAGE_KEY, JSON.stringify(context));
+    } else {
+      sessionStorage.removeItem(EXTENSION_LAUNCH_CONTEXT_STORAGE_KEY);
+    }
+
+    if (!context) return;
+
+    if (context.apiHost) {
+      const matchedCloud = MIST_CLOUDS.find((cloud) => cloud.apiHost === context.apiHost);
+      if (matchedCloud) {
+        ui.mistCloud.value = matchedCloud.id;
+        saveSelectedMistCloud();
+      }
+    }
+
+    const parts = [
+      context.apiHost ? (MIST_CLOUDS.find((cloud) => cloud.apiHost === context.apiHost)?.name ?? context.apiHost) : null,
+      context.deviceName ?? null,
+      context.deviceSerial ?? null,
+      context.deviceMac ?? null,
+    ].filter(Boolean);
+    if (parts.length > 0) {
+      term.writeSystem(`Mist launch context imported: ${parts.join(' / ').replace(' / ', ' / ')}`);
+    }
+
+    renderMistLaunchVerification();
+    renderJmaRecommendation(latestJmaCode);
+    refreshCatalogRunButtons(false);
+    updateConfigSyncUIState();
+    scheduleAgentContextPush();
+  }
+
+  async function consumeLaunchContextFromUrl(): Promise<void> {
+    const url = new URL(window.location.href);
+    let payload: ExtensionLaunchContext | null = null;
+
+    const launchToken = url.searchParams.get('mistLaunchToken');
+    const rawContext = url.searchParams.get('mistContext');
+
+    if (launchToken) {
+      try {
+        const response = await fetch(`http://127.0.0.1:3333/extension-launch/${encodeURIComponent(launchToken)}`);
+        if (response.ok) {
+          payload = await response.json() as ExtensionLaunchContext;
+        }
+      } catch {
+        // Fall through to any raw mistContext if present.
+      }
+      url.searchParams.delete('mistLaunchToken');
+    }
+
+    if (!payload && rawContext) {
+      try {
+        payload = JSON.parse(rawContext) as ExtensionLaunchContext;
+      } catch {
+        payload = null;
+      }
+      url.searchParams.delete('mistContext');
+    }
+
+    if (!payload) {
+      const storedContext = sessionStorage.getItem(EXTENSION_LAUNCH_CONTEXT_STORAGE_KEY);
+      if (storedContext) {
+        try {
+          payload = JSON.parse(storedContext) as ExtensionLaunchContext;
+        } catch {
+          sessionStorage.removeItem(EXTENSION_LAUNCH_CONTEXT_STORAGE_KEY);
+        }
+      }
+    }
+
+    if (payload) {
+      applyExtensionLaunchContext(payload);
+    }
+
+    const cleanedUrl = `${url.pathname}${url.search}${url.hash}`;
+    window.history.replaceState({}, document.title, cleanedUrl);
   }
 
   function getDeviceSummaryLoadingMessage(): string | null {
@@ -1594,14 +2059,12 @@ function init(): void {
       return;
     }
 
+    const summaryLine = `<span class="device-summary-line">${values.map((v) => escapeHtml(v)).join(' · ')}</span>`;
     const sep = '<span class="device-summary-sep" aria-hidden="true">·</span>';
-    const chips = values
-      .map((v) => `<span class="device-summary-item">${v}</span>`)
-      .join(sep);
     const loading = buildDeviceSummaryLoadingMarkup();
     ui.deviceSummary.innerHTML = loading
-      ? `${chips}${sep}${loading}`
-      : chips;
+      ? `${summaryLine}${sep}${loading}`
+      : summaryLine;
     ui.deviceSummary.classList.remove('device-summary-empty');
   }
 
@@ -1864,15 +2327,64 @@ function init(): void {
     el.className = `cloud-status-pill state-${state}`;
   }
 
+  function getMistMonitorWhy(status: CloudStatusState['mist']): string {
+    switch (status.pillState) {
+      case 'connected':
+        return 'Mist inventory and recent cloud telemetry agree that the switch is online.';
+      case 'disconnected':
+        return 'Mist stopped hearing from the switch, so cloud-side reachability is currently broken.';
+      default:
+        return 'Mist evidence is incomplete until the switch is matched and recent cloud data is available.';
+    }
+  }
+
+  function getJmaMonitorWhy(status: CloudStatusState['jma']): string {
+    if (status.code === 106) {
+      return 'DNS is configured, but hostname lookups are failing before cloud recovery can happen.';
+    }
+    if (status.code === 108) {
+      return 'Routing may exist, but the switch still cannot establish usable cloud connectivity.';
+    }
+    if (status.severity === 'pass') {
+      return 'The switch itself believes cloud connectivity is healthy.';
+    }
+    if (status.severity === 'warn') {
+      return 'The switch is reporting a degraded state that usually needs targeted investigation.';
+    }
+    if (status.severity === 'fail') {
+      return 'The switch is reporting a hard cloud-connectivity failure from its own local perspective.';
+    }
+    return 'The switch has not yet reported enough state to explain the current cloud condition.';
+  }
+
   function renderCloudStatus(state: CloudStatusState): void {
+    if (extensionLaunchContext && !isMistLaunchWorkflowUnlocked()) {
+      latestJmaCode = null;
+      setCloudStatusPill(ui.mistMonitorPill, 'Unknown', 'unknown');
+      setCloudStatusPill(ui.jmaMonitorPill, 'Unknown', 'unknown');
+      ui.mistMonitorDetail.textContent = 'Identify and match the switch in Mist to enable Mist status monitoring.';
+      ui.jmaMonitorDetail.textContent = 'Identify and verify the console-connected switch before trusting switch-reported cloud status.';
+      if (ui.mistMonitorWhy) ui.mistMonitorWhy.textContent = 'Mist status is intentionally hidden until the console-connected switch is verified against the Mist launch context.';
+      if (ui.jmaMonitorWhy) ui.jmaMonitorWhy.textContent = 'Switch cloud state is intentionally hidden until the console-connected switch is verified against the Mist launch context.';
+      ui.cloudStatusLastUpdated.textContent = 'Waiting for verification';
+      renderJmaRecommendation(null);
+      renderMistLaunchVerification();
+      applyMistLaunchWorkflowGates();
+      return;
+    }
+
     if (!state.matchResult && !state.lastUpdatedUtcIso) {
       latestJmaCode = null;
       setCloudStatusPill(ui.mistMonitorPill, 'Unknown', 'unknown');
       setCloudStatusPill(ui.jmaMonitorPill, 'Unknown', 'unknown');
       ui.mistMonitorDetail.textContent = 'Identify and match the switch in Mist to enable Mist status monitoring.';
       ui.jmaMonitorDetail.textContent = 'Log in or detect a Junos CLI prompt to start the switch-reported cloud status monitor.';
+      if (ui.mistMonitorWhy) ui.mistMonitorWhy.textContent = 'Mist evidence is incomplete until the switch is matched and recent cloud data is available.';
+      if (ui.jmaMonitorWhy) ui.jmaMonitorWhy.textContent = 'The switch has not yet reported enough state to explain the current cloud condition.';
       ui.cloudStatusLastUpdated.textContent = 'Not yet checked';
       renderJmaRecommendation(null);
+      renderMistLaunchVerification();
+      applyMistLaunchWorkflowGates();
       return;
     }
 
@@ -1886,12 +2398,15 @@ function init(): void {
     if (lastSeen) mistParts.push(`Last seen: ${lastSeen}`);
     if (lastConfig) mistParts.push(`Last config: ${lastConfig}`);
     ui.mistMonitorDetail.textContent = mistParts.join(' · ');
+    if (ui.mistMonitorWhy) ui.mistMonitorWhy.textContent = getMistMonitorWhy(state.mist);
 
     const jmaParts = [state.jma.detail];
     if (state.jma.message) jmaParts.push(`Message: ${state.jma.message}`);
     if (state.jma.errno != null) jmaParts.push(`Errno: ${state.jma.errno}`);
     ui.jmaMonitorDetail.textContent = jmaParts.join(' · ');
+    if (ui.jmaMonitorWhy) ui.jmaMonitorWhy.textContent = getJmaMonitorWhy(state.jma);
     renderJmaRecommendation(state.jma.code);
+    applyMistLaunchWorkflowGates();
 
     ui.cloudStatusLastUpdated.textContent = state.lastUpdatedUtcIso
       ? `Refreshed ${formatBrowserLocalDisplay(state.lastUpdatedUtcIso)}`
@@ -2599,8 +3114,9 @@ function init(): void {
       return { available: false, reason: 'Select a Mist cloud region first.' };
     }
     if (check.requiresMistApi) {
-      const hasSite = !!deviceContext.matchResult?.mistDevice?.site_id;
-      const hasDevice = !!deviceContext.matchResult?.mistDevice?.id;
+      const effectiveTarget = getEffectiveMistTarget();
+      const hasSite = !!effectiveTarget.siteId;
+      const hasDevice = !!effectiveTarget.deviceId;
       if (!hasSite || !hasDevice) {
         return { available: false, reason: 'Identify and match the switch in Mist first.' };
       }
@@ -2652,8 +3168,9 @@ function init(): void {
         return { error: `Select a Mist cloud region before running ${check.name}.` };
       }
       if (check.requiresMistApi) {
-        const hasSite = !!deviceContext.matchResult?.mistDevice?.site_id;
-        const hasDevice = !!deviceContext.matchResult?.mistDevice?.id;
+        const effectiveTarget = getEffectiveMistTarget();
+        const hasSite = !!effectiveTarget.siteId;
+        const hasDevice = !!effectiveTarget.deviceId;
         if (!hasSite || !hasDevice) {
           return { error: `${check.name} requires the switch to be identified and matched in Mist first.` };
         }
@@ -2665,12 +3182,13 @@ function init(): void {
       return { error: 'Select a Mist cloud region first.' };
     }
 
+    const effectiveTarget = getEffectiveMistTarget();
     return {
       options: {
         cloud,
         uplinkPort: ui.tsUplinkPort.value.trim(),
-        siteId: deviceContext.matchResult?.mistDevice?.site_id || undefined,
-        deviceId: deviceContext.matchResult?.mistDevice?.id || undefined,
+        siteId: effectiveTarget.siteId || undefined,
+        deviceId: effectiveTarget.deviceId || undefined,
         checkIds,
         onProgress: handleProgressResult,
       },
@@ -2984,11 +3502,12 @@ function init(): void {
         }
 
         try {
+          const effectiveTarget = getEffectiveMistTarget();
           const results = await troubleshooter.runAll({
             cloud,
             uplinkPort: ui.tsUplinkPort.value.trim(),
-            siteId: deviceContext.matchResult?.mistDevice?.site_id || undefined,
-            deviceId: deviceContext.matchResult?.mistDevice?.id || undefined,
+            siteId: effectiveTarget.siteId || undefined,
+            deviceId: effectiveTarget.deviceId || undefined,
             onProgress: handleProgressResult,
           });
           setLatestAgentCheckResults(results);
@@ -3533,8 +4052,8 @@ function init(): void {
 
             // Try to get root password from Mist
             let rootPw: string | null = null;
-            const siteId = ui.mistSite.value;
-            if (siteId && mistApi.isConfigured) {
+            const siteId = getEffectiveMistTarget().siteId ?? ui.mistSite.value;
+            if (siteId) {
               rootPw = await mistApi.getRootPassword(siteId);
             }
 
@@ -3547,7 +4066,7 @@ function init(): void {
                 outputEl.innerHTML += `<div class="check-modal-cmd-line">Using root password from Mist site settings…</div>`;
                 const passResult = await cmdRunner.sendAndWaitFor(rootPw + '\n', />|#|%|login:/i, 10000);
 
-                if (/login:/i.test(passResult.output)) {
+                if (await passwordLoginWasRejected(passResult.output)) {
                   // Mist password rejected — ask user
                   outputEl.innerHTML += `<div class="check-modal-cmd-error">Mist root password was rejected.</div>`;
                   const userPw = await promptForFixInput(
@@ -3563,7 +4082,7 @@ function init(): void {
                   // Try again with user-provided password
                   await cmdRunner.sendAndWaitFor('root\n', /[Pp]assword:/i, 5000);
                   const retry = await cmdRunner.sendAndWaitFor(userPw + '\n', />|#|%|login:/i, 10000);
-                  if (/login:/i.test(retry.output)) {
+                  if (await passwordLoginWasRejected(retry.output)) {
                     outputEl.innerHTML += `<div class="check-modal-cmd-error">Login failed. Check credentials.</div>`;
                     runFixBtn.textContent = 'Run Fix';
                     runFixBtn.removeAttribute('disabled');
@@ -3599,16 +4118,27 @@ function init(): void {
                 await new Promise((r) => setTimeout(r, 3000));
               }
 
-              // Check if we got past login
-              if (/%\s*$/.test(userResult.output) || /%/.test(await (async () => { const m = await cmdRunner.detectMode(); return m; })())) {
-                await cmdRunner.send('cli\n');
-                await new Promise((r) => setTimeout(r, 1500));
+              const reachedCli = await ensureJunosCliAfterLogin((message) => {
+                outputEl.innerHTML += `<div class="check-modal-cmd-line">${escapeHtml(message.trim())}</div>`;
+              });
+              if (!reachedCli) {
+                outputEl.innerHTML += `<div class="check-modal-cmd-error">Login did not return to a usable Junos CLI prompt.</div>`;
+                runFixBtn.textContent = 'Run Fix';
+                runFixBtn.removeAttribute('disabled');
+                return;
               }
             } else if (/%\s*$/.test(userResult.output)) {
               // Factory default — went straight to shell
               outputEl.innerHTML += `<div class="check-modal-cmd-line">Factory default switch (no password). Entering CLI…</div>`;
-              await cmdRunner.send('cli\n');
-              await new Promise((r) => setTimeout(r, 1500));
+              const reachedCli = await ensureJunosCliAfterLogin((message) => {
+                outputEl.innerHTML += `<div class="check-modal-cmd-line">${escapeHtml(message.trim())}</div>`;
+              });
+              if (!reachedCli) {
+                outputEl.innerHTML += `<div class="check-modal-cmd-error">Login did not return to a usable Junos CLI prompt.</div>`;
+                runFixBtn.textContent = 'Run Fix';
+                runFixBtn.removeAttribute('disabled');
+                return;
+              }
             } else if (/>\s*$/.test(userResult.output)) {
               // Factory default — went to operational mode
               outputEl.innerHTML += `<div class="check-modal-cmd-line">Factory default switch (no password). Logged in.</div>`;
@@ -3648,8 +4178,8 @@ function init(): void {
 
               // Try to get password from Mist API
               let rootPw: string | null = null;
-              const siteId = ui.mistSite.value;
-              if (siteId && mistApi.isConfigured) {
+              const siteId = getEffectiveMistTarget().siteId ?? ui.mistSite.value;
+              if (siteId) {
                 rootPw = await mistApi.getRootPassword(siteId);
                 if (rootPw) {
                   outputEl.innerHTML += `<div class="check-modal-cmd-line">Setting root password from Mist site settings…</div>`;
@@ -3836,11 +4366,12 @@ function init(): void {
         }
 
         try {
+          const effectiveTarget = getEffectiveMistTarget();
           const results = await troubleshooter.runRecommendedChecks({
             cloud,
             uplinkPort: ui.tsUplinkPort.value.trim(),
-            siteId: deviceContext.matchResult?.mistDevice?.site_id || undefined,
-            deviceId: deviceContext.matchResult?.mistDevice?.id || undefined,
+            siteId: effectiveTarget.siteId || undefined,
+            deviceId: effectiveTarget.deviceId || undefined,
             checkIds: recommendation.checks.map((check) => check.id),
             onProgress: handleProgressResult,
           });
@@ -4128,6 +4659,62 @@ function init(): void {
     return servers.join(', ');
   }
 
+  async function ensureJunosCliAfterLogin(
+    log: (message: string) => void,
+    options: { successMessage?: string } = {},
+  ): Promise<boolean> {
+    const mode = await cmdRunner.detectMode();
+    if (mode !== 'shell') {
+      return mode === 'operational' || mode === 'config';
+    }
+
+    log('  Shell prompt detected — entering Junos CLI…');
+    const cliResult = await cmdRunner.sendAndWaitFor('cli\n', />\s*$|#\s*$|login:/i, 5000);
+    if (/login:/i.test(cliResult.output)) {
+      return false;
+    }
+    if (/[>#]\s*$/.test(cliResult.output)) {
+      log(options.successMessage ?? '  Entered Junos CLI.');
+      return true;
+    }
+
+    const settleResult = await cmdRunner.sendAndWaitFor('\n', />\s*$|#\s*$|login:/i, 4000);
+    if (/login:/i.test(settleResult.output)) {
+      return false;
+    }
+    if (/[>#]\s*$/.test(settleResult.output)) {
+      log(options.successMessage ?? '  Entered Junos CLI.');
+      return true;
+    }
+
+    const finalMode = await cmdRunner.detectMode();
+    if (finalMode === 'operational' || finalMode === 'config') {
+      log(options.successMessage ?? '  Entered Junos CLI.');
+      return true;
+    }
+    return false;
+  }
+
+  async function sendLoginFieldAndWaitFor(
+    value: string,
+    pattern: RegExp,
+    timeoutMs = 10000,
+  ): Promise<{ output: string; matched: boolean }> {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return cmdRunner.sendAndWaitFor(`${value}\r`, pattern, timeoutMs);
+  }
+
+  async function passwordLoginWasRejected(passResultOutput: string): Promise<boolean> {
+    const mode = await cmdRunner.detectMode();
+    if (mode === 'shell' || mode === 'operational' || mode === 'config') {
+      return false;
+    }
+    if (mode === 'login') {
+      return true;
+    }
+    return /(?:^|\n)\s*login:/i.test(passResultOutput);
+  }
+
   // ---- Login to Switch ----
   async function loginToSwitch(): Promise<void> {
     await withCloudStatusPollingPaused(async () => {
@@ -4136,9 +4723,17 @@ function init(): void {
       term.writeSystem('— Attempting to log in to switch —');
 
       try {
-      // Step 1: Send Enter to see what prompt we get
-      const initial = await cmdRunner.sendAndWaitFor('\n', /login:|>|#|%/, 5000);
-      const output = initial.output;
+      // Prefer the current visible prompt when it is already unambiguous.
+      // Sending an extra newline while a login/password prompt is active can
+      // cause the username/password exchange to drift onto the wrong prompt.
+      const visibleMode = getRecentPromptMode();
+      let output = '';
+      if (visibleMode === 'login' || visibleMode === 'password' || visibleMode === 'shell' || visibleMode === 'config' || visibleMode === 'operational') {
+        output = recentConsoleTail.trimEnd();
+      } else {
+        const initial = await cmdRunner.sendAndWaitFor('\n', /login:|>|#|%/, 5000);
+        output = initial.output;
+      }
 
       // Case 1: Already at a CLI prompt (already logged in)
       if (/>\s*$|#\s*$/.test(output)) {
@@ -4164,10 +4759,73 @@ function init(): void {
       }
 
       // Case 3: Login prompt
-      if (/login:/i.test(output)) {
+      if (/login:/i.test(output) || /[Pp]assword:\s*$/i.test(output)) {
+        const siteId = getEffectiveMistTarget().siteId ?? ui.mistSite.value;
+        const mistRootPassword = extensionLaunchContext?.deviceRootPassword
+          ?? (siteId ? await mistApi.getRootPassword(siteId) : null);
+
+        if (mistRootPassword) {
+          let passResult;
+
+          if (/[Pp]assword:\s*$/i.test(output)) {
+            term.writeSystem('  Password prompt detected. Using root password from Mist launch context…');
+            passResult = await sendLoginFieldAndWaitFor(
+              mistRootPassword,
+              /(?:login:\s*$|[>#%]\s*$)/im,
+              10000,
+            );
+          } else {
+            term.writeSystem('  Login prompt detected. Using Mist Launch root password…');
+
+            const userResult = await sendLoginFieldAndWaitFor('root', /[Pp]assword:\s*$/im, 5000);
+            if (!userResult.matched) {
+              ui.loginResult.innerHTML = '<div class="device-mist-match not-found">' +
+                '<strong>Login failed</strong> — did not receive a password prompt after sending the root username.' +
+                '</div>';
+              term.writeError('  Login failed — password prompt not reached.');
+              ui.btnLogin.disabled = false;
+              return;
+            }
+
+            term.writeSystem('  Password required. Using root password from Mist launch context…');
+            passResult = await sendLoginFieldAndWaitFor(
+              mistRootPassword,
+              /(?:login:\s*$|[>#%]\s*$)/im,
+              10000,
+            );
+          }
+
+          if (await passwordLoginWasRejected(passResult.output)) {
+            ui.loginResult.innerHTML = '<div class="device-mist-match not-found">' +
+              '<strong>Login failed</strong> — Mist site root password was rejected.<br><br>' +
+              'The switch may have a different password than what is configured in the Mist site settings.' +
+              '</div>';
+            term.writeError('  Login failed — Mist password rejected.');
+            ui.btnLogin.disabled = false;
+            return;
+          }
+
+          const reachedCli = await ensureJunosCliAfterLogin((message) => term.writeSystem(message));
+          if (!reachedCli) {
+            ui.loginResult.innerHTML = '<div class="device-mist-match not-found">' +
+              '<strong>Login state unclear</strong> — the switch did not return to a usable Junos CLI prompt.<br><br>' +
+              'Check the console session manually and try again.' +
+              '</div>';
+            term.writeError('  Login did not reach a usable Junos CLI prompt.');
+            ui.btnLogin.disabled = false;
+            return;
+          }
+
+          ui.loginResult.innerHTML = '<div class="device-mist-match found">Logged in as root using Mist launch password.</div>';
+          term.writeSystem('  Login successful.');
+          await ensureLoggedInBootstrap();
+          ui.btnIdentify.disabled = false;
+          ui.btnLogin.disabled = false;
+          return;
+        }
+
         term.writeSystem('  Login prompt detected. Trying root with no password (factory default)…');
 
-        // Try root with no password first (factory default)
         const userResult = await cmdRunner.sendAndWaitFor('root\n', /[Pp]assword:|>|#|%/, 5000);
 
         // Factory default: root with no password goes straight to shell/CLI
@@ -4202,42 +4860,7 @@ function init(): void {
 
         // Got a password prompt — switch has a password set
         if (/[Pp]assword:/i.test(userResult.output)) {
-          term.writeSystem('  Password required. Attempting to retrieve from Mist API…');
-
-          // Try Mist site root password
-          let rootPw: string | null = null;
-          const siteId = ui.mistSite.value;
-          if (siteId && mistApi.isConfigured) {
-            rootPw = await mistApi.getRootPassword(siteId);
-          }
-
-          if (rootPw) {
-            term.writeSystem('  Got root password from Mist. Logging in…');
-            const passResult = await cmdRunner.sendAndWaitFor(rootPw + '\n', />|#|%|login:/, 10000);
-
-            if (/login:/i.test(passResult.output)) {
-              // Login failed — wrong password
-              ui.loginResult.innerHTML = '<div class="device-mist-match not-found">' +
-                '<strong>Login failed</strong> — Mist site root password was rejected.<br><br>' +
-                'The switch may have a different password than what is configured in the Mist site settings.' +
-                '</div>';
-              term.writeError('  Login failed — Mist password rejected.');
-              ui.btnLogin.disabled = false;
-              return;
-            }
-
-            if (/%\s*$/.test(passResult.output)) {
-              await cmdRunner.send('cli\n');
-              await new Promise((r) => setTimeout(r, 1500));
-            }
-
-            ui.loginResult.innerHTML = '<div class="device-mist-match found">Logged in as root using Mist site password.</div>';
-            term.writeSystem('  Login successful.');
-            await ensureLoggedInBootstrap();
-            ui.btnIdentify.disabled = false;
-            ui.btnLogin.disabled = false;
-            return;
-          }
+          term.writeSystem('  Password required. Attempting to retrieve from Mist…');
 
           // No Mist password available — tell the user
           // Send Ctrl+C to cancel the password prompt
@@ -4246,9 +4869,11 @@ function init(): void {
 
           let html = '<div class="device-mist-match not-found">';
           html += '<strong>Password required but not available.</strong><br><br>';
-          if (!mistApi.isConfigured) {
+          if (!siteId) {
+            html += 'Launch from a Mist switch page or select a site in Mist integration mode to auto-retrieve the root password.<br><br>';
+          } else if (!mistApi.isConfigured && !extensionLaunchContext) {
             html += 'Configure the Mist API (cloud, token, org ID) and select a site to auto-retrieve the root password.<br><br>';
-          } else if (!siteId) {
+          } else if (mistApi.isConfigured) {
             html += 'Select a site in the Mist API section to retrieve the root password.<br><br>';
           } else {
             html += 'No root password is set in the Mist site settings for this site.<br><br>';
@@ -4288,6 +4913,7 @@ function init(): void {
         ui.deviceIdentity.innerHTML = '';
         term.writeSystem('— Identifying connected switch —');
         await deviceContext.runIdentify({ silent: false });
+        await cloudStatus.refresh(deviceContext.matchResult, serial.isConnected);
         ui.btnIdentify.disabled = false;
         term.writeSystem('— Identification complete —');
       });
@@ -4299,8 +4925,8 @@ function init(): void {
     if (!ensureConsoleTaskAvailable('Config sync', 'config-sync-preview')) return;
     await withCloudStatusPollingPaused(async () => {
       await withConsoleTask('config-sync-preview', 'exclusive', 'config sync preview', async () => {
-        const matchResult = deviceContext.matchResult;
-        if (!matchResult?.mistDevice?.site_id || !matchResult.mistDevice.id) {
+        const effectiveTarget = getEffectiveMistTarget();
+        if (!effectiveTarget.siteId || !effectiveTarget.deviceId) {
           ui.configSyncResults.innerHTML =
             '<div class="status-text error">Identify the switch first and ensure it is found in Mist with a site assignment.</div>';
           return;
@@ -4310,8 +4936,8 @@ function init(): void {
         activateResultsTab('config-sync');
         ui.configSyncResults.innerHTML = '<div class="status-text info">Fetching Mist intended config…</div>';
 
-        const siteId = matchResult.mistDevice.site_id;
-        const deviceId = matchResult.mistDevice.id;
+        const siteId = effectiveTarget.siteId;
+        const deviceId = effectiveTarget.deviceId;
 
         term.writeSystem('— Starting config sync —');
 
@@ -4517,7 +5143,8 @@ function init(): void {
   // ---- Get Root Password ----
   async function getRootPassword(): Promise<void> {
     await withCloudStatusPollingPaused(async () => {
-      if (!deviceContext.matchResult?.mistDevice?.site_id) {
+      const effectiveTarget = getEffectiveMistTarget();
+      if (!effectiveTarget.siteId) {
         activateResultsTab('actions');
         renderActionResult(
           'Get Root Password',
@@ -4534,7 +5161,7 @@ function init(): void {
       ui.rootPasswordResult.innerHTML = '<div class="status-text info">Fetching root password from Mist…</div>';
 
       try {
-        const siteId = deviceContext.matchResult!.mistDevice!.site_id;
+        const siteId = effectiveTarget.siteId;
         const rootPw = await mistApi.getRootPassword(siteId);
 
         let html = '';
@@ -4613,7 +5240,7 @@ function init(): void {
         term.writeSystem('  No root authentication configured — need to set one before adoption.');
 
         // Try Mist site password first
-        const siteId = ui.mistSite.value;
+        const siteId = getEffectiveMistTarget().siteId ?? ui.mistSite.value;
         if (siteId) {
           rootPassword = await mistApi.getRootPassword(siteId);
           if (rootPassword) {
@@ -4759,7 +5386,8 @@ function init(): void {
   // ---- Offline Timeline (standalone) ----
   async function checkOfflineTimeline(): Promise<void> {
     await withCloudStatusPollingPaused(async () => {
-      if (!deviceContext.matchResult?.mistDevice?.site_id || !deviceContext.matchResult?.mistDevice?.id) {
+      const effectiveTarget = getEffectiveMistTarget();
+      if (!effectiveTarget.siteId || !effectiveTarget.deviceId) {
         ui.timelineResults.innerHTML = '<div class="status-text error">Identify the switch first and ensure it is found in Mist with a site.</div>';
         return;
       }
@@ -4771,8 +5399,8 @@ function init(): void {
 
       try {
         const results = await troubleshooter.checkOfflineTimeline(
-          deviceContext.matchResult!.mistDevice!.site_id,
-          deviceContext.matchResult!.mistDevice!.id,
+          effectiveTarget.siteId,
+          effectiveTarget.deviceId,
         );
 
         ui.timelineResults.innerHTML = '';
@@ -4798,10 +5426,38 @@ function init(): void {
   }
 
   // ---- Event listeners ----
+  bindProxyButton(ui.btnSessionConnect, ui.btnConnect);
+  bindProxyButton(ui.btnSessionDisconnect, ui.btnDisconnect);
+  bindProxyButton(ui.btnSessionLogin, ui.btnLogin);
+  bindProxyButton(ui.btnSessionIdentify, ui.btnIdentify);
+  bindProxyButton(ui.btnSessionRootPassword, ui.btnRootPassword);
+  bindProxyButton(ui.btnQuickDhcpRefresh, ui.btnDhcpRefresh);
+  bindProxyButton(ui.btnQuickRestartMistAgent, ui.btnRestartMistAgent);
+  bindProxyButton(ui.btnQuickConfigSync, ui.btnConfigSyncPreview);
+  bindProxyButton(ui.btnQuickAdopt, ui.btnAdopt);
+
   ui.btnConnect.addEventListener('click', connect);
   ui.btnDisconnect.addEventListener('click', disconnect);
   ui.btnClearConnection.addEventListener('click', () => term.clear());
   ui.btnClear.addEventListener('click', () => term.clear());
+  ui.btnSessionToolsOpen?.addEventListener('click', () => {
+    if (ui.sidebar.classList.contains('is-open')) {
+      closeSessionToolsDrawer();
+    } else {
+      openSessionToolsDrawer();
+    }
+  });
+  ui.btnSessionToolsClose?.addEventListener('click', closeSessionToolsDrawer);
+  ui.sessionToolsOverlay?.addEventListener('click', closeSessionToolsDrawer);
+  ui.btnHeaderMist?.addEventListener('click', openMistModal);
+  document.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof Node)) return;
+    if (!ui.sidebar.classList.contains('is-open')) return;
+    if (ui.sidebar.contains(target)) return;
+    if (ui.btnSessionToolsOpen?.contains(target as Node)) return;
+    closeSessionToolsDrawer();
+  });
   ui.serialPortSelect.addEventListener('change', () => {
     const selectedPort = getSelectedAuthorizedPort();
     if (selectedPort) {
@@ -4814,6 +5470,7 @@ function init(): void {
     }
   });
   ui.btnOpenMistModal.addEventListener('click', openMistModal);
+  ui.drawerMistModalButtons.forEach((button) => button.addEventListener('click', openMistModal));
   ui.btnCloseMistModal.addEventListener('click', closeMistModal);
   ui.btnCancelMistModal.addEventListener('click', closeMistModal);
   ui.btnLoadOrgs.addEventListener('click', () => {
@@ -4854,6 +5511,10 @@ function init(): void {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && !ui.mistModalOverlay.classList.contains('is-hidden')) {
       closeMistModal();
+      return;
+    }
+    if (e.key === 'Escape') {
+      closeSessionToolsDrawer();
     }
   });
   ui.btnLoadSites.addEventListener('click', loadSites);
@@ -4922,6 +5583,7 @@ function init(): void {
   renderCheckCatalog();
   activateResultsTab('checks');
   setConnectedState(false);
+  void consumeLaunchContextFromUrl();
   term.writeSystem('Junos Console ready. Click "Connect" to select a serial port.');
   term.focus();
   void refreshAuthorizedPortsCache().then(() => tryAutoReconnectAuthorizedPort());
