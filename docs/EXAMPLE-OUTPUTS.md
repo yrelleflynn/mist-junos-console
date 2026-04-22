@@ -1,12 +1,20 @@
 # Example Outputs
 
+> **The best example of this product in action is the recorded live demo.**
+> It shows the complete arc: switch offline, 22 checks run in parallel,
+> root cause identified (stale DHCP lease, gateway unreachable), DHCP refresh
+> triggered, switch back in Mist — with an AI agent driving the diagnostic
+> and remediation sequence via MCP.
+>
+> *Demo recording available on SharePoint with the submission.*
+
+---
+
 ## Purpose
 
-Provide concrete examples of what the product produces during real
-troubleshooting and recovery workflows.
-
-These are sanitized, representative examples intended for reviewers and demo
-preparation.
+Provide representative text examples of what the product produces during
+real troubleshooting and recovery workflows, as a supplement to the
+recorded demo.
 
 ## Example 1: Recommended Checks For `106 DNSLookupFailed`
 
