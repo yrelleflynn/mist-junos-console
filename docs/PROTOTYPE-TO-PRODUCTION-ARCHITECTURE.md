@@ -72,7 +72,7 @@ That means:
 - durable retries and audit trails are limited
 - tenancy and authorization boundaries are lightweight
 
-This is acceptable for a hackathon prototype and small controlled deployments,
+This is acceptable for the current submission implementation and small controlled deployments,
 but not ideal for thousands of customer orgs and concurrent support sessions.
 
 ## What A Mist-Scale Version Would Need

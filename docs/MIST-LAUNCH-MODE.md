@@ -243,7 +243,7 @@ paste a Mist API key into the local UI.
 - better operator experience
 - closer to a Mist-native workflow
 - less credential friction
-- easier demo story
+- clearer product story
 - cleaner separation between browser-authenticated Mist session and local app
 
 ## Required Extension Capabilities

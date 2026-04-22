@@ -3,7 +3,7 @@
 ## Purpose
 
 Provide explicit setup and run instructions for reviewers, developers, and
-hackathon judges.
+submission reviewers.
 
 ## Prerequisites
 
@@ -70,6 +70,7 @@ Expected behavior in Mist Launch Mode:
 - the Mist Launch card shows waiting, mismatch, or matched state
 - `Mist Status` and `Switch Cloud State` remain `Unknown` until verification succeeds
 - the manual Mist API modal remains available as fallback only
+- `Adopt Switch` uses the same staged candidate preview flow as `Config Sync`, so both workflows end in diff review plus Commit / Rollback
 
 ## Manual Fallback Mode
 
@@ -98,7 +99,7 @@ Workflow:
 Current security note:
 
 - treat the session ID as a secret
-- use only in controlled/demo environments until stronger auth is added
+- use only in controlled/reviewer environments until stronger auth is added
 
 ## Build And Test
 

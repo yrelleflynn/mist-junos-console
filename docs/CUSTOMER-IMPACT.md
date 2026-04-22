@@ -142,7 +142,8 @@ The tool is deployed today as an internal-facing application and can be used imm
 - JMA Connectivity State and Mist Status monitoring
 - structured cloud-connectivity troubleshooting workflow
 - Config drift comparison
-- Staged config sync with Commit Confirmed, Commit, and Rollback
+- Staged config sync with diff review, `commit check`, and Commit / Rollback
+- Staged adoption using the same candidate workflow as config sync
 - Remote session mirroring
 
 ### Production-leaning, needs hardening

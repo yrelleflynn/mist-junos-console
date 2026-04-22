@@ -6,7 +6,7 @@ For ongoing product and engineering direction, see:
 - [`docs/DEVELOPMENT-METHODOLOGY.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/DEVELOPMENT-METHODOLOGY.md)
 - [`docs/ENGINEERING-REVIEW.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/ENGINEERING-REVIEW.md)
 
-For hackathon / reviewer readiness, start with:
+For submission / reviewer readiness, start with:
 
 - [`docs/HACKATHON-SUBMISSION.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/HACKATHON-SUBMISSION.md)
 - [`docs/SETUP.md`](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/SETUP.md)
@@ -19,9 +19,9 @@ A browser-based serial terminal and automated troubleshooting tool for Juniper M
 
 ---
 
-## Hackathon & reviewer guide
+## Reviewer Guide
 
-This section aligns the README with **hackathon judging** (customer impact, self-driving depth, production readiness, broad applicability, Mist-native use, innovation) without replacing the technical documentation below.
+This section aligns the README with **submission review** (customer impact, self-driving depth, production readiness, broad applicability, Mist-native use, innovation) without replacing the technical documentation below.
 
 ### Problem statement
 
@@ -33,7 +33,7 @@ Mist-managed **EX** switches that are **offline or never adopted** still show up
 |-------|---------|--------------------------------|
 | **1 — Intelligent detection** | Automatically surface problems using Mist + device signals | **Identify switch** (inventory match), **config drift** (Mist vs running), **cloud connectivity suite** (uplink/IP/route/DNS/Mist endpoints/agent), **Mist status** / **firewall policy** checks |
 | **2 — Automated diagnosis** | Reason about root cause from correlated data | **Ordered checks** with **stop conditions** (e.g. no mgmt IP → skip downstream); **LLDP + Mist upstream port context** when API is configured; **SSL inspection** and **traceroute on failure**; **offline timeline** (events + logs) |
-| **3 — Autonomous action** | Fix or mitigate with clear safety boundaries | **Adoption workflow** (API-fetched commands + root pre-check + apply via console); **actionable remediation** text; **remote session** for guided/assisted intervention; *deliberately operator-in-the-loop for risky config on production hardware* |
+| **3 — Autonomous action** | Fix or mitigate with clear safety boundaries | **Staged candidate workflows** for **Config Sync** and **Adopt Switch** (Mist intent or adoption commands loaded, diffed, `commit check` run, then operator-gated Commit / Rollback); **actionable remediation** text; **remote session** for guided/assisted intervention; *deliberately operator-in-the-loop for risky config on production hardware* |
 
 ### Customer impact (why deploy)
 
@@ -255,7 +255,7 @@ server/
 - **Identify Switch** — serial/MAC from console, matches to Mist inventory in manual mode and verifies the console-connected switch against the Mist-launched switch in Mist Launch Mode
 - **Get Root Password** — from Mist site settings in manual mode; Mist Launch Mode prefers the extension-backed root password path and hides the manual button
 - **Check Config Drift** — compares Mist intended config vs actual running config
-- **Adopt Switch** — fetches adoption commands from API, pre-checks root auth, applies via console
+- **Adopt Switch** — fetches Mist adoption commands and stages them through the same candidate preview / `commit check` / Commit-or-Rollback path used by Config Sync
 
 ### Cloud Connectivity Check (17 tests)
 
@@ -312,10 +312,10 @@ Ideas and follow-ups (not committed work). Add or tick items as you go.
 - **Support session auth** — Replace session-ID-only join with SSO / short-lived tokens; view-only vs type enforced server-side.
 - **Hosted deployment** — Single Docker image or systemd unit: static `dist/` + `server/index.mjs` + TLS.
 
-### Hackathon / product
+### Submission / product
 
 - **Marvis or event stream** — Deep link or API pull for one “smart” correlation in the deck.
-- **Screenshots** — `docs/images/` for README “example output” and demo slides.
+- **Screenshots** — `docs/images/` for README “example output” and submission slides.
 
 ---
 

@@ -124,9 +124,9 @@ Based on the current implementation, the product already includes:
   - effective config retrieval
   - bounded log retrieval, including rotated logs
 
-### Demoable scope as of hackathon (April 2026)
+### Current shipped scope (April 2026)
 
-The product demonstrates all three self-driving levels from the hackathon brief:
+The current implementation demonstrates all three self-driving levels from the submission brief:
 
 **Detection (Level 1):**
 The troubleshooting engine runs 14 ordered checks over the live console.
@@ -170,8 +170,8 @@ operator-owned session.
 
 1. Operator opens the app in Chrome or Edge.
 2. Operator connects to the switch over serial.
-3. Operator configures Mist org, site, and API context.
-4. Operator identifies the switch.
+3. Operator either launches from a Mist switch page or uses the manual Mist API fallback path.
+4. The app verifies the console-connected switch against Mist context, or the operator identifies the switch manually if not launched from Mist.
 5. Operator runs troubleshooting checks.
 6. Tool highlights critical failures, skipped downstream checks, and remediation.
 7. Operator resolves or escalates with supporting evidence.
@@ -182,8 +182,9 @@ operator-owned session.
 2. Operator retrieves root password guidance if needed.
 3. Operator authenticates and verifies operational mode.
 4. Tool fetches adoption commands from Mist.
-5. Tool applies commands through the console with operator visibility.
-6. Operator confirms the switch begins cloud onboarding.
+5. Tool stages the adoption candidate, shows the diff, and runs `commit check`.
+6. Operator chooses Commit or Rollback from the same staged-candidate workflow used by Config Sync.
+7. Operator confirms the switch begins cloud onboarding.
 
 ### Journey 3: Assisted support session
 
@@ -281,6 +282,7 @@ See [`docs/MIST-API-INTEGRATION.md`](/Users/mdusty/Library/CloudStorage/OneDrive
 - The app must fetch Mist adoption commands from the backend.
 - The app must validate login state before attempting adoption.
 - The app must present commands and actions clearly before execution.
+- The app should reuse the same staged candidate model as Config Sync where possible, so adoption benefits from the same diff review and operator-gated Commit / Rollback flow.
 
 ### Remote support
 

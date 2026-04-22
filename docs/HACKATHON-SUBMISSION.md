@@ -13,6 +13,26 @@ for:
 This document is intended as the reviewer-friendly entry point for the
 production-readiness portion of the submission.
 
+## Submission Scope Summary
+
+The submission version on `master` demonstrates:
+
+- browser-based serial console access for EX switches
+- Mist Launch Mode with extension-backed switch context and verification gating
+- manual Mist API setup as fallback only
+- structured troubleshooting with gated checks and JMA cloud-state awareness
+- staged Config Sync with diff review, `commit check`, and operator-gated Commit / Rollback
+- staged Adopt Switch using the same candidate workflow as Config Sync
+- opt-in remote support console mirroring
+- backend MCP proof-of-concept for bounded reads and actions
+
+What is intentionally documented as future-facing rather than finished:
+
+- broader production auth / SSO for remote support
+- stronger audit / transcript retention controls
+- richer AI orchestration beyond the current bounded MCP surface
+- Mist-native hosted auth replacing the fallback manual token flow everywhere
+
 ## Requirement Mapping
 
 ### Problem statement
@@ -21,7 +41,7 @@ production-readiness portion of the submission.
 - [docs/PRD.md](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/PRD.md)
 - [docs/CUSTOMER-IMPACT.md](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/CUSTOMER-IMPACT.md)
 
-### Architecture
+### Architecture and implementation direction
 
 - [README.md](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/README.md)
 - [docs/PRD.md](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/PRD.md)
@@ -70,5 +90,11 @@ Instead, it makes the current secure-use assumptions explicit:
 2. Review [docs/SETUP.md](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/SETUP.md)
 3. Review [docs/EXAMPLE-OUTPUTS.md](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/EXAMPLE-OUTPUTS.md)
 4. Review [docs/SECURITY.md](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/SECURITY.md)
-5. Use [docs/HACKATHON-DEMO.md](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/HACKATHON-DEMO.md)
-   as the live-demo script
+5. Review [docs/CUSTOMER-IMPACT.md](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/CUSTOMER-IMPACT.md)
+6. Use [docs/HACKATHON-DEMO.md](/Users/mdusty/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/Documents/03%20Mist%20Docs/07%20Projects/mist-junos-console/docs/HACKATHON-DEMO.md)
+   as the live walkthrough script
+
+## Notes For Reviewers
+
+- The most important shipped operator path is Mist Launch Mode plus the browser extension. Manual Mist API setup is still present, but it is fallback, not the primary product story.
+- Architecture and roadmap docs in this repository include forward-looking material. For judging the submission itself, prefer the reviewer path above over the deeper implementation-planning docs.
