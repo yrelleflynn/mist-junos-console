@@ -288,6 +288,60 @@ async function fetchMistDeviceConfig(context) {
   }
 }
 
+async function fetchMistAdoptionCommands(context) {
+  if (!context?.apiHost || !context?.orgId) {
+    return { ok: false, message: 'Missing apiHost/org context.' };
+  }
+
+  try {
+    const url = `https://${context.apiHost}/api/v1/orgs/${encodeURIComponent(context.orgId)}/ocdevices/outbound_ssh_cmd`;
+    const response = await fetch(url, {
+      method: 'GET',
+      credentials: 'include',
+      headers: {
+        Accept: 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        message: `HTTP ${response.status} ${response.statusText}`,
+      };
+    }
+
+    const payload = await response.json();
+    if (typeof payload === 'string') {
+      return { ok: true, payload };
+    }
+    if (payload && typeof payload === 'object') {
+      if (typeof payload.cmd === 'string') {
+        return { ok: true, payload: payload.cmd };
+      }
+      const values = Object.values(payload);
+      for (const value of values) {
+        if (typeof value === 'string' && value.includes('set ')) {
+          return { ok: true, payload: value };
+        }
+      }
+      return {
+        ok: false,
+        message: 'Adoption commands endpoint returned a non-command payload.',
+      };
+    }
+
+    return {
+      ok: false,
+      message: 'Adoption commands endpoint returned an unsupported payload.',
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      message: error instanceof Error ? error.message : 'Unknown adoption commands fetch error',
+    };
+  }
+}
+
 async function fetchMistDeviceMonitor(context) {
   if (!context?.apiHost || !context?.siteId || !context?.deviceId) {
     return { ok: false, message: 'Missing apiHost/site/device context.' };
@@ -528,6 +582,7 @@ async function createLaunchUrl({ url, title, pageContext } = {}) {
   const { context } = resolved;
   try {
     const configResult = await fetchMistDeviceConfig(context);
+    const adoptionCommandsResult = await fetchMistAdoptionCommands(context);
     const monitorResult = await fetchMistDeviceMonitor(context);
     const eventsResult = await fetchMistDeviceEvents(context);
     const payload = {
@@ -535,6 +590,7 @@ async function createLaunchUrl({ url, title, pageContext } = {}) {
       source: 'mist-extension',
       capturedAt: context.capturedAt || new Date().toISOString(),
       deviceConfig: configResult.ok ? configResult.payload : null,
+      adoptionCommands: adoptionCommandsResult.ok ? adoptionCommandsResult.payload : null,
       mistMonitor: monitorResult.ok ? monitorResult.payload : null,
       deviceEvents: eventsResult.ok ? eventsResult.payload : [],
     };

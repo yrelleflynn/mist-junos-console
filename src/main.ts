@@ -14,7 +14,7 @@ import type { MistDeviceConfig, MistDeviceEvent, MistLaunchOverlay } from './ser
 import { TroubleshootService, CheckResult, CheckStatus } from './services/troubleshoot.service';
 import { SwitchIdentityService } from './services/switch-identity.service';
 import { ConfigSyncService, isConfigSyncStagingWarning } from './services/config-sync.service';
-import type { ConfigSyncActionResult } from './services/config-sync.service';
+import type { CandidatePreviewInput, ConfigSyncActionResult, ConfigSyncPreviewResult } from './services/config-sync.service';
 import { DhcpRefreshService } from './services/dhcp-refresh.service';
 import type { DhcpRefreshResult, DhcpBindingChange, DhcpRefreshStep } from './services/dhcp-refresh.service';
 import { MistAgentRestartService } from './services/mist-agent-restart.service';
@@ -27,6 +27,9 @@ import type { CloudStatusState } from './types/cloud-status.types';
 import { MIST_CLOUDS, getCloudById } from './config/mist-clouds.config';
 import type { MistCloud } from './config/mist-clouds.config';
 import { getJmaRecommendation } from './config/jma-recommendations';
+import {
+  prepareAdoptionPlan,
+} from './features/adoption/workflow';
 import {
   CATALOG_GROUPS,
   ALL_CATALOG_CHECK_IDS,
@@ -5171,6 +5174,134 @@ function init(): void {
   }
 
   // ---- Config Sync Preview ----
+  function renderStagedCandidatePreview(
+    result: ConfigSyncPreviewResult,
+    options: {
+      title: string;
+      summary: string;
+      commandPreviewLines?: string[];
+      diffEmptySummary: string;
+      decisionSummary: string;
+    },
+  ): void {
+    let html = '';
+
+    html += `<div class="config-sync-section-title">${escapeHtml(options.title)}</div>`;
+    html += `<div class="config-sync-summary">${options.summary}</div>`;
+
+    if (options.commandPreviewLines && options.commandPreviewLines.length > 0) {
+      html += `<pre class="config-sync-pre">${escapeHtml(options.commandPreviewLines.join('\n'))}</pre>`;
+    }
+
+    const stagingWarnings = result.stagingErrors.filter(isConfigSyncStagingWarning);
+    const stagingErrors = result.stagingErrors.filter((e) => !isConfigSyncStagingWarning(e));
+
+    if (stagingWarnings.length > 0) {
+      html += `<div class="config-sync-section-title">Load Warnings (${stagingWarnings.length})</div>`;
+      for (const w of stagingWarnings) {
+        html +=
+          `<div class="config-sync-warning">` +
+          `<span class="config-sync-warning-cmd">${escapeHtml(w.command)}</span>` +
+          `<span class="config-sync-warning-msg">${escapeHtml(w.error)}</span>` +
+          `</div>`;
+      }
+    }
+
+    if (stagingErrors.length > 0) {
+      html += `<div class="config-sync-section-title">Load Errors (${stagingErrors.length})</div>`;
+      for (const err of stagingErrors) {
+        html +=
+          `<div class="config-sync-error">` +
+          `<span class="config-sync-error-cmd">${escapeHtml(err.command)}</span>` +
+          `<span class="config-sync-error-msg">${escapeHtml(err.error)}</span>` +
+          `</div>`;
+      }
+    }
+
+    const checkLabel = result.commitCheckPassed
+      ? '<span class="config-sync-check-status pass">✓ Passed</span>'
+      : '<span class="config-sync-check-status fail">✗ Failed</span>';
+    if (result.compareOutput.trim()) {
+      html +=
+        '<div class="config-sync-section-title">Diff Review</div>' +
+        '<div class="config-sync-summary">Review the highlighted <code>show | compare</code> output in the main console above.</div>';
+    } else {
+      html +=
+        '<div class="config-sync-section-title">Diff Review</div>' +
+        `<div class="config-sync-summary">${options.diffEmptySummary}</div>`;
+    }
+
+    html += `<div class="config-sync-section-title">Pre-commit Validation ${checkLabel}</div>`;
+    if (result.commitCheckOutput.trim()) {
+      html += `<pre class="config-sync-pre">${escapeHtml(result.commitCheckOutput)}</pre>`;
+    }
+
+    if (result.staged) {
+      html +=
+        '<div class="config-sync-section-title" style="margin-top:12px;">Decision Required</div>' +
+        `<div class="config-sync-summary">${options.decisionSummary}</div>`;
+    } else {
+      html +=
+        '<div class="config-sync-error" style="margin-top:8px;">⚠ Staging did not complete — candidate was not left on the switch.</div>';
+    }
+
+    ui.configSyncResults.innerHTML = html;
+    ui.configSyncResults.scrollTop = 0;
+  }
+
+  async function previewCandidateWorkflow(
+    input: CandidatePreviewInput,
+    options: {
+      title: string;
+      summary: (result: ConfigSyncPreviewResult) => string;
+      commandPreviewLines?: string[];
+      diffEmptySummary: string;
+      decisionSummary: string;
+      startTerminalMessage: string;
+      successTerminalMessage: string;
+      noDiffTerminalMessage: string;
+      stagedTerminalMessage: string;
+      incompleteTerminalMessage: string;
+      candidateTerminalSummary: (result: ConfigSyncPreviewResult) => string;
+    },
+  ): Promise<ConfigSyncPreviewResult> {
+    term.writeSystem(options.startTerminalMessage);
+    const result = await configSync.previewCandidate(input);
+    renderStagedCandidatePreview(result, {
+      title: options.title,
+      summary: options.summary(result),
+      commandPreviewLines: options.commandPreviewLines,
+      diffEmptySummary: options.diffEmptySummary,
+      decisionSummary: options.decisionSummary,
+    });
+    updateConfigSyncUIState();
+    await waitForUiPaint();
+
+    const stagingWarnings = result.stagingErrors.filter(isConfigSyncStagingWarning);
+    const stagingErrors = result.stagingErrors.filter((e) => !isConfigSyncStagingWarning(e));
+    term.writeSystem(options.candidateTerminalSummary(result));
+    for (const w of stagingWarnings) {
+      term.writeSystem(`  Staging warning: ${w.command} — ${w.error}`);
+    }
+    for (const err of stagingErrors) {
+      term.writeError(`  Staging error: ${err.command} — ${err.error}`);
+    }
+    if (result.compareOutput.trim()) {
+      term.writeSystem('  ── Diff (show | compare) ──');
+      term.writeJunosHighlighted(result.compareOutput);
+    } else {
+      term.writeSystem(`  ${options.noDiffTerminalMessage}`);
+    }
+    term.writeSystem(`  Commit check: ${result.commitCheckPassed ? 'passed' : 'FAILED'}`);
+    if (result.staged) {
+      term.writeSystem(`  ${options.stagedTerminalMessage}`);
+    } else {
+      term.writeError(`  ${options.incompleteTerminalMessage}`);
+    }
+    term.writeSystem(options.successTerminalMessage);
+    return result;
+  }
+
   async function previewConfigSync(): Promise<void> {
     if (!ensureConsoleTaskAvailable('Config sync', 'config-sync-preview')) return;
     await withCloudStatusPollingPaused(async () => {
@@ -5189,113 +5320,25 @@ function init(): void {
         const siteId = effectiveTarget.siteId;
         const deviceId = effectiveTarget.deviceId;
 
-        term.writeSystem('— Starting config sync —');
-
         try {
-          const result = await configSync.previewSync(siteId, deviceId);
-
-          let html = '';
-
-          // Candidate summary
-          html += '<div class="config-sync-section-title">Config to Apply</div>';
-          html += `<div class="config-sync-summary">` +
-            `${result.candidateCommandCount} total commands — ` +
-            `${result.cleanupCommandCount} cleanup deletes + ` +
-            `${result.mistCliCommandCount} from Mist intent` +
-            `</div>`;
-
-          // Classify staging issues: warnings vs errors
-          const stagingWarnings = result.stagingErrors.filter(isConfigSyncStagingWarning);
-          const stagingErrors = result.stagingErrors.filter((e) => !isConfigSyncStagingWarning(e));
-
-          if (stagingWarnings.length > 0) {
-            html += `<div class="config-sync-section-title">Load Warnings (${stagingWarnings.length})</div>`;
-            for (const w of stagingWarnings) {
-              html +=
-                `<div class="config-sync-warning">` +
-                `<span class="config-sync-warning-cmd">${escapeHtml(w.command)}</span>` +
-                `<span class="config-sync-warning-msg">${escapeHtml(w.error)}</span>` +
-                `</div>`;
-            }
-          }
-
-          if (stagingErrors.length > 0) {
-            html += `<div class="config-sync-section-title">Load Errors (${stagingErrors.length})</div>`;
-            for (const err of stagingErrors) {
-              html +=
-                `<div class="config-sync-error">` +
-                `<span class="config-sync-error-cmd">${escapeHtml(err.command)}</span>` +
-                `<span class="config-sync-error-msg">${escapeHtml(err.error)}</span>` +
-                `</div>`;
-            }
-          }
-
-          // Compare diff (shown in the live console; bottom panel keeps the summary)
-          const checkLabel = result.commitCheckPassed
-            ? '<span class="config-sync-check-status pass">✓ Passed</span>'
-            : '<span class="config-sync-check-status fail">✗ Failed</span>';
-          if (result.compareOutput.trim()) {
-            html +=
-              '<div class="config-sync-section-title">Diff Review</div>' +
-              '<div class="config-sync-summary">Review the highlighted <code>show | compare</code> output in the main console above.</div>';
-          } else {
-            html +=
-              '<div class="config-sync-section-title">Diff Review</div>' +
-              '<div class="config-sync-summary">No changes detected — config is already aligned with Mist intent.</div>';
-          }
-
-          // Commit check (plain — output is already plain text, not a diff)
-          html += `<div class="config-sync-section-title">Pre-commit Validation ${checkLabel}</div>`;
-          if (result.commitCheckOutput.trim()) {
-            html += `<pre class="config-sync-pre">${escapeHtml(result.commitCheckOutput)}</pre>`;
-          }
-
-          if (result.staged) {
-            // Candidate is staged — show decision prompt, enable action buttons
-            html +=
-              '<div class="config-sync-section-title" style="margin-top:12px;">Decision Required</div>' +
-              '<div class="config-sync-summary">Candidate config is staged on the switch. ' +
-              'Review the diff above, then choose an action in the panel below.</div>';
-          } else {
-            // Preview failed to stage (exception was thrown and caught cleanly)
-            html +=
-              '<div class="config-sync-error" style="margin-top:8px;">⚠ Staging did not complete — candidate was not left on the switch.</div>';
-          }
-
-          ui.configSyncResults.innerHTML = html;
-          ui.configSyncResults.scrollTop = 0;
-          updateConfigSyncUIState();
-          await waitForUiPaint();
-
-          term.writeSystem(
-            `  Candidate: ${result.candidateCommandCount} commands ` +
-            `(${result.cleanupCommandCount} cleanup + ${result.mistCliCommandCount} from Mist intent)`,
-          );
-
-          for (const w of stagingWarnings) {
-            term.writeSystem(`  Staging warning: ${w.command} — ${w.error}`);
-          }
-
-          for (const err of stagingErrors) {
-            term.writeError(`  Staging error: ${err.command} — ${err.error}`);
-          }
-
-          if (result.compareOutput.trim()) {
-            term.writeSystem('  ── Diff (show | compare) ──');
-            term.writeJunosHighlighted(result.compareOutput);
-          } else {
-            term.writeSystem('  No diff detected — config already aligned with Mist intent.');
-          }
-
-          term.writeSystem(`  Commit check: ${result.commitCheckPassed ? 'passed' : 'FAILED'}`);
-
-          if (result.staged) {
-            term.writeSystem('  Candidate staged — choose Commit or Rollback below.');
-          } else {
-            term.writeError('  Warning: staging did not complete cleanly.');
-          }
-
-          term.writeSystem('— Config sync complete —');
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const configCmd = await mistApi.getDeviceConfig(siteId, deviceId) as any;
+          const cliLines: string[] = Array.isArray(configCmd?.cli) ? configCmd.cli : [];
+          await previewCandidateWorkflow({
+            cli: cliLines,
+            stagedCandidateErrorMessage: 'A config sync candidate is already staged on the switch. Commit or roll back before starting a new preview.',
+          }, {
+            title: 'Config to Apply',
+            summary: (result) => `${result.candidateCommandCount} total commands — ${result.cleanupCommandCount} cleanup deletes + ${result.mistCliCommandCount} from Mist intent`,
+            diffEmptySummary: 'No changes detected — config is already aligned with Mist intent.',
+            decisionSummary: 'Candidate config is staged on the switch. Review the diff above, then choose an action in the panel below.',
+            startTerminalMessage: '— Starting config sync —',
+            successTerminalMessage: '— Config sync complete —',
+            noDiffTerminalMessage: 'No diff detected — config already aligned with Mist intent.',
+            stagedTerminalMessage: 'Candidate staged — choose Commit or Rollback below.',
+            incompleteTerminalMessage: 'Warning: staging did not complete cleanly.',
+            candidateTerminalSummary: (result) => `  Candidate: ${result.candidateCommandCount} commands (${result.cleanupCommandCount} cleanup + ${result.mistCliCommandCount} from Mist intent)`,
+          });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
@@ -5453,183 +5496,67 @@ function init(): void {
 
   // ---- Adopt Switch ----
   async function adoptSwitch(): Promise<void> {
+    if (!ensureConsoleTaskAvailable('Adopt Switch', 'adopt-switch-preview')) return;
     await withCloudStatusPollingPaused(async () => {
-      if (configSync.hasStagedCandidate()) {
-        ui.adoptResults.innerHTML = '<div class="status-text error">Rollback or commit the staged config sync candidate before starting switch adoption.</div>';
-        term.writeError('Adopt Switch is blocked while a config sync candidate is staged.');
-        return;
-      }
+      await withConsoleTask('adopt-switch-preview', 'exclusive', 'switch adoption preview', async () => {
+        activateResultsTab('config-sync');
 
-      if (!mistApi.isConfigured) {
-        ui.adoptResults.innerHTML = '<div class="status-text error">Configure Mist API first (cloud, token, org ID).</div>';
-        return;
-      }
-
-      ui.btnAdopt.disabled = true;
-      ui.adoptResults.innerHTML = '<div class="status-text info">Fetching adoption commands from Mist…</div>';
-
-      try {
-      const commands = await mistApi.getAdoptionCommands();
-
-      if (!commands || !commands.includes('set ')) {
-        ui.adoptResults.innerHTML = '<div class="status-text error">No adoption commands returned from API. The endpoint may not be available for your account.</div>';
-        ui.btnAdopt.disabled = false;
-        return;
-      }
-
-      // Check if root-authentication is configured on the switch
-      term.writeSystem('— Checking root authentication before adoption —');
-      await cmdRunner.ensureOperationalMode();
-      const rootAuthCmd = await cmdRunner.execute('show configuration system root-authentication', 10000);
-      const hasRootAuth = rootAuthCmd.success &&
-        (rootAuthCmd.output.includes('encrypted-password') || rootAuthCmd.output.includes('ssh-'));
-
-      // Determine root password to use if needed
-      let rootPassword: string | null = null;
-      if (!hasRootAuth) {
-        term.writeSystem('  No root authentication configured — need to set one before adoption.');
-
-        // Try Mist site password first
-        const siteId = getEffectiveMistTarget().siteId ?? ui.mistSite.value;
-        if (siteId) {
-          rootPassword = await mistApi.getRootPassword(siteId);
-          if (rootPassword) {
-            term.writeSystem('  Using root password from Mist site settings.');
-          }
-        }
-
-        // Fall back to user-provided password
-        if (!rootPassword) {
-          rootPassword = ui.adoptRootPw.value.trim();
-        }
-
-        if (!rootPassword) {
-          ui.adoptResults.innerHTML = '<div class="status-text error">' +
-            '<strong>Root authentication is not configured on this switch.</strong><br><br>' +
-            'A root password is required before adoption commands can be committed.<br><br>' +
-            'Either:<br>' +
-            '1. Enter a root password in the field above and click Adopt again, or<br>' +
-            '2. Select a Mist site (in the Mist API section) that has a root password configured' +
-            '</div>';
-          ui.btnAdopt.disabled = false;
+        if (configSync.hasStagedCandidate()) {
+          const message = 'Rollback or commit the staged candidate configuration before starting switch adoption.';
+          ui.adoptResults.innerHTML = `<div class="status-text error">${message}</div>`;
+          ui.configSyncResults.innerHTML = `<div class="status-text error">${message}</div>`;
+          term.writeError('Adopt Switch is blocked while another candidate configuration is staged.');
           return;
         }
-      } else {
-        term.writeSystem('  Root authentication is configured.');
-      }
 
-      // Display the commands (including root password set if needed)
-      const commandLines = commands.split('\n').filter((l: string) => l.trim().length > 0);
-      const totalCommands = commandLines.length + (rootPassword ? 1 : 0);
+        if (!mistApi.isConfigured && !mistApi.hasLaunchOverlay) {
+          const message = 'Configure Mist API first (cloud, token, org ID), or launch from Mist.';
+          ui.adoptResults.innerHTML = `<div class="status-text error">${message}</div>`;
+          ui.configSyncResults.innerHTML = `<div class="status-text error">${message}</div>`;
+          return;
+        }
 
-      let html = '<div class="drift-section-title">Adoption Commands (' + totalCommands + ' lines)</div>';
-      html += '<div style="max-height:200px;overflow-y:auto;margin-bottom:8px;">';
-      if (rootPassword) {
-        html += '<div class="drift-line mist-only"><span class="drift-category">Root Auth</span>set system root-authentication plain-text-password ••••••••</div>';
-      }
-      for (const line of commandLines) {
-        html += `<div class="drift-line mist-only">${escapeHtml(line.trim())}</div>`;
-      }
-      html += '</div>';
-
-      if (!hasRootAuth) {
-        html += '<div class="status-text info" style="margin-bottom:8px;">Root password will be set before adoption commands are applied.</div>';
-      }
-
-      html += '<div class="sidebar-actions" style="margin-top:8px;">';
-      html += '<button id="btn-adopt-apply" class="btn btn-primary">Apply to Switch</button>';
-      html += '<button id="btn-adopt-cancel" class="btn btn-secondary">Cancel</button>';
-      html += '</div>';
-      html += '<div id="adopt-apply-status"></div>';
-
-      ui.adoptResults.innerHTML = html;
-      term.writeSystem(`— Retrieved ${commandLines.length} adoption commands from Mist —`);
-
-      // Wire up the apply button
-      const applyBtn = document.getElementById('btn-adopt-apply') as HTMLButtonElement;
-      const cancelBtn = document.getElementById('btn-adopt-cancel') as HTMLButtonElement;
-      const statusEl = document.getElementById('adopt-apply-status') as HTMLElement;
-
-      cancelBtn.addEventListener('click', () => {
-        ui.adoptResults.innerHTML = '';
-        ui.btnAdopt.disabled = false;
-      });
-
-      applyBtn.addEventListener('click', async () => {
-        applyBtn.disabled = true;
-        cancelBtn.disabled = true;
-        statusEl.innerHTML = '<div class="status-text info">Entering config mode…</div>';
-        term.writeSystem('— Applying adoption commands to switch —');
+        ui.btnAdopt.disabled = true;
+        ui.adoptResults.innerHTML = '<div class="status-text info">Fetching adoption commands from Mist…</div>';
+        ui.configSyncResults.innerHTML = '<div class="status-text info">Fetching adoption commands from Mist…</div>';
 
         try {
-          // Enter config mode
-          const editResult = await cmdRunner.execute('edit', 5000);
-          if (!editResult.output.includes('#') && !editResult.success) {
-            statusEl.innerHTML = '<div class="status-text error">Failed to enter config mode. Are you logged in as root?</div>';
-            term.writeError('Failed to enter config mode.');
-            applyBtn.disabled = false;
-            cancelBtn.disabled = false;
-            return;
-          }
+          const prepared = await prepareAdoptionPlan({
+            getAdoptionCommands: () => mistApi.getAdoptionCommands(),
+            getSiteId: () => (getEffectiveMistTarget().siteId ?? ui.mistSite.value) || null,
+            getRootPassword: (siteId) => mistApi.getRootPassword(siteId),
+            getUserProvidedRootPassword: () => ui.adoptRootPw.value,
+            term,
+          });
 
-          // Set root password first if needed
-          if (rootPassword) {
-            statusEl.innerHTML = '<div class="status-text info">Setting root password…</div>';
-            term.writeSystem('  Setting root authentication…');
-
-            // Use plain-text-password which prompts for password twice
-            await cmdRunner.send('set system root-authentication plain-text-password\n');
-            await new Promise((r) => setTimeout(r, 1000));
-
-            // Enter password at "New password:" prompt
-            const pw1 = await cmdRunner.sendAndWaitFor(rootPassword + '\n', /password:|secret:/, 5000);
-            if (pw1.matched) {
-              // Enter password again at "Retype new password:" prompt
-              await cmdRunner.sendAndWaitFor(rootPassword + '\n', /#/, 5000);
-            }
-
-            term.writeSystem('  Root password set.');
-          }
-
-          statusEl.innerHTML = '<div class="status-text info">Applying adoption commands…</div>';
-
-          // Apply each command
-          let applied = 0;
-          for (const line of commandLines) {
-            const trimmed = line.trim();
-            if (trimmed.length === 0) continue;
-            await cmdRunner.execute(trimmed, 5000, 500);
-            applied++;
-          }
-
-          statusEl.innerHTML = `<div class="status-text info">Applied ${applied} commands. Committing…</div>`;
-          term.writeSystem(`  Applied ${applied} commands. Committing…`);
-
-          // Commit
-          const commitResult = await cmdRunner.execute('commit and-quit', 60000, 5000);
-          if (commitResult.output.includes('commit complete') || commitResult.output.includes('configuration check succeeds')) {
-            statusEl.innerHTML = '<div class="status-text success">Adoption commands applied and committed successfully. The switch should connect to Mist within a few minutes.</div>';
-            term.writeSystem('  Commit successful. Switch should connect to Mist shortly.');
-          } else if (commitResult.output.includes('error')) {
-            statusEl.innerHTML = '<div class="status-text error">Commit returned errors. Check the terminal output.</div>';
-            term.writeError('Commit may have failed. Check output above.');
-          } else {
-            statusEl.innerHTML = '<div class="status-text info">Commit sent. Check terminal for result.</div>';
-          }
+          const { plan } = prepared;
+          await previewCandidateWorkflow({
+            cli: plan.commandLines,
+            cleanupDeletes: [],
+            stagedCandidateErrorMessage: 'A config candidate is already staged on the switch. Commit or roll back before starting a new preview.',
+          }, {
+            title: 'Adoption Commands',
+            summary: (result) => `${result.mistCliCommandCount} total commands from Mist adoption intent.`,
+            commandPreviewLines: plan.commandLines,
+            diffEmptySummary: 'No changes detected — adoption config already appears to be present on the switch.',
+            decisionSummary: 'Adoption candidate is staged on the switch. Review the diff above, then choose Commit or Rollback in the panel below.',
+            startTerminalMessage: '— Starting switch adoption preview —',
+            successTerminalMessage: '— Adoption preview complete —',
+            noDiffTerminalMessage: 'No diff detected — adoption config already appears to be present.',
+            stagedTerminalMessage: 'Adoption candidate staged — choose Commit or Rollback below.',
+            incompleteTerminalMessage: 'Warning: adoption staging did not complete cleanly.',
+            candidateTerminalSummary: (result) => `  Candidate: ${result.candidateCommandCount} adoption commands from Mist intent`,
+          });
+          ui.adoptResults.innerHTML = '<div class="status-text info">Adoption candidate staged — see Config Sync tab and choose Commit or Rollback.</div>';
+          term.writeSystem(`— Retrieved ${plan.commandLines.length} adoption commands from Mist —`);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          statusEl.innerHTML = `<div class="status-text error">Error: ${msg}</div>`;
-          term.writeError(`Adoption apply error: ${msg}`);
-        } finally {
-          ui.btnAdopt.disabled = false;
+          ui.adoptResults.innerHTML = `<div class="status-text error">Failed to fetch adoption commands: ${escapeHtml(msg)}</div>`;
+          ui.configSyncResults.innerHTML = `<div class="status-text error">Failed to fetch adoption commands: ${escapeHtml(msg)}</div>`;
+          term.writeError(`Adoption fetch error: ${msg}`);
+          updateConfigSyncUIState();
         }
       });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ui.adoptResults.innerHTML = `<div class="status-text error">Failed to fetch adoption commands: ${msg}</div>`;
-        term.writeError(`Adoption fetch error: ${msg}`);
-        ui.btnAdopt.disabled = false;
-      }
     });
   }
 

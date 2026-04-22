@@ -140,3 +140,34 @@ describe('MistApiService.getAccessibleOrgs', () => {
     expect(orgs).toEqual([{ id: 'org-1', name: 'Morrison' }]);
   });
 });
+
+describe('MistApiService.getAdoptionCommands', () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it('uses launch overlay adoption commands before requiring manual Mist API config', async () => {
+    const api = new MistApiService();
+    api.setLaunchOverlay({
+      orgId: 'org-1',
+      adoptionCommands: 'set system host-name sw1\n',
+    });
+
+    await expect(api.getAdoptionCommands()).resolves.toBe('set system host-name sw1\n');
+  });
+
+  it('throws a launch-specific error when launch mode is active but adoption commands are unavailable', async () => {
+    const api = new MistApiService();
+    api.setLaunchOverlay({
+      orgId: 'org-1',
+      adoptionCommands: null,
+    });
+
+    await expect(api.getAdoptionCommands()).rejects.toThrow(
+      'Adoption commands were not included in the Mist Launch context. Reload from Mist or configure Mist API manually.',
+    );
+  });
+});

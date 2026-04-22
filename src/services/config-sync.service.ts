@@ -179,6 +179,12 @@ export interface ConfigSyncPreviewResult {
   staged: boolean;
 }
 
+export interface CandidatePreviewInput {
+  cli: string[];
+  cleanupDeletes?: readonly string[];
+  stagedCandidateErrorMessage?: string;
+}
+
 export class ConfigSyncService {
   private readonly cmdRunner: CommandRunnerService;
   private readonly mistApi: MistApiService;
@@ -235,18 +241,21 @@ export class ConfigSyncService {
     this._sessionInfo = null;
   }
 
-  /**
-   * Build a candidate command list from Mist `config_cmd` CLI lines.
-   *
-   * Prepends the known Mist cleanup delete commands, then appends the
-   * filtered CLI lines. Blank lines and lines starting with `#` are dropped.
-   * Line trimming happens before filtering.
-   */
-  buildCandidate(cli: string[]): string[] {
-    const mistLines = cli
+  normalizeCliLines(cli: string[]): string[] {
+    return cli
       .map((l) => l.trim())
       .filter((l) => l.length > 0 && !l.startsWith('#'));
-    return [...MIST_CLEANUP_DELETES, ...mistLines];
+  }
+
+  /**
+   * Build a candidate command list from CLI lines.
+   *
+   * Optionally prepends cleanup deletes before the filtered CLI lines.
+   * Blank lines and lines starting with `#` are dropped.
+   */
+  buildCandidate(cli: string[], cleanupDeletes: readonly string[] = MIST_CLEANUP_DELETES): string[] {
+    const normalizedLines = this.normalizeCliLines(cli);
+    return [...cleanupDeletes, ...normalizedLines];
   }
 
   /**
@@ -281,7 +290,14 @@ export class ConfigSyncService {
    *
    * Commands are executed visibly (operator workflow — not silent).
    */
-  async previewSync(siteId: string, deviceId: string): Promise<ConfigSyncPreviewResult> {
+  private async stageCandidate(
+    candidate: string[],
+    metadata: {
+      cleanupCommandCount: number;
+      mistCliCommandCount: number;
+      stagedCandidateErrorMessage: string;
+    },
+  ): Promise<ConfigSyncPreviewResult> {
     const stagingErrors: ConfigSyncStagingError[] = [];
     let compareOutput = '';
     let commitCheckOutput = '';
@@ -291,20 +307,8 @@ export class ConfigSyncService {
 
     // Guard: refuse if we already own a staged candidate
     if (this.hasStagedCandidate()) {
-      throw new Error(
-        'A config sync candidate is already staged on the switch. Commit or roll back before starting a new preview.',
-      );
+      throw new Error(metadata.stagedCandidateErrorMessage);
     }
-
-    // 1. Fetch Mist intended config
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const configCmd = await this.mistApi.getDeviceConfig(siteId, deviceId) as any;
-    const cliLines: string[] = Array.isArray(configCmd?.cli) ? configCmd.cli : [];
-
-    // 2. Build candidate
-    const candidate = this.buildCandidate(cliLines);
-    const cleanupCount = MIST_CLEANUP_DELETES.length;
-    const mistCliCount = candidate.length - cleanupCount;
 
     try {
       // 3. Refuse to run inside an existing config session not owned by this
@@ -394,14 +398,38 @@ export class ConfigSyncService {
 
     return {
       candidateCommandCount: candidate.length,
-      cleanupCommandCount: cleanupCount,
-      mistCliCommandCount: mistCliCount,
+      cleanupCommandCount: metadata.cleanupCommandCount,
+      mistCliCommandCount: metadata.mistCliCommandCount,
       compareOutput,
       commitCheckOutput,
       commitCheckPassed,
       stagingErrors,
       staged: shouldLeaveStaged,
     };
+  }
+
+  async previewCandidate(input: CandidatePreviewInput): Promise<ConfigSyncPreviewResult> {
+    const cleanupDeletes = input.cleanupDeletes ?? MIST_CLEANUP_DELETES;
+    const candidate = this.buildCandidate(input.cli, cleanupDeletes);
+    const normalizedCliLines = this.normalizeCliLines(input.cli);
+    return this.stageCandidate(candidate, {
+      cleanupCommandCount: cleanupDeletes.length,
+      mistCliCommandCount: normalizedCliLines.length,
+      stagedCandidateErrorMessage:
+        input.stagedCandidateErrorMessage
+        ?? 'A config sync candidate is already staged on the switch. Commit or roll back before starting a new preview.',
+    });
+  }
+
+  async previewSync(siteId: string, deviceId: string): Promise<ConfigSyncPreviewResult> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const configCmd = await this.mistApi.getDeviceConfig(siteId, deviceId) as any;
+    const cliLines: string[] = Array.isArray(configCmd?.cli) ? configCmd.cli : [];
+    return this.previewCandidate({
+      cli: cliLines,
+      cleanupDeletes: MIST_CLEANUP_DELETES,
+      stagedCandidateErrorMessage: 'A config sync candidate is already staged on the switch. Commit or roll back before starting a new preview.',
+    });
   }
 
   /**

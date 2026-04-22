@@ -105,6 +105,7 @@ export interface MistLaunchOverlay {
   deviceMac?: string | null;
   deviceRootPassword?: string | null;
   deviceConfig?: MistDeviceConfig | null;
+  adoptionCommands?: string | null;
   mistMonitor?: {
     mistInventoryConnected?: boolean | null;
     mistStatsStatus?: string | null;
@@ -468,6 +469,12 @@ export class MistApiService {
    * Returns the raw 'set' commands string that can be pasted into the switch console.
    */
   async getAdoptionCommands(): Promise<string> {
+    if (typeof this.launchOverlay?.adoptionCommands === 'string' && this.launchOverlay.adoptionCommands.trim()) {
+      return this.launchOverlay.adoptionCommands;
+    }
+    if (this.launchOverlay && !this.isConfigured) {
+      throw new Error('Adoption commands were not included in the Mist Launch context. Reload from Mist or configure Mist API manually.');
+    }
     // The API may return a JSON object with a 'cmd' field, or raw text
     const data = await this.get<{ cmd?: string } | string>(
       `/api/v1/orgs/${this.orgId}/ocdevices/outbound_ssh_cmd`
