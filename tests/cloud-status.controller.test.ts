@@ -41,6 +41,7 @@ function makeJmaState(overrides: Partial<JmaConnectivityStatus> = {}): JmaConnec
 
 function createSwitchIdentityStub(refreshed: Partial<MistMatchResult> = {}) {
   return {
+    getLaunchMistDevice: vi.fn().mockReturnValue(null),
     refreshMistCloudStatus: vi.fn().mockImplementation(async (result: MistMatchResult) => ({
       ...result,
       ...refreshed,

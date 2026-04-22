@@ -502,6 +502,56 @@ describe('ConfigSyncService.previewSync()', () => {
   });
 });
 
+describe('ConfigSyncService.previewCandidate()', () => {
+  it('stages set/delete commands without prepending Mist cleanup deletes', async () => {
+    const cmdRunner = makeCmdRunnerStub({
+      'show | compare': { output: '[edit]\n+ set system services ssh protocol-version v2' },
+      __commit_check_wait__: { output: 'commit check\nconfiguration check succeeds\nroot@switch# ' },
+    });
+    const service = new ConfigSyncService(cmdRunner as any, makeMistApiStub([]) as any);
+
+    const result = await service.previewCandidate({
+      cli: [
+        'set system services ssh protocol-version v2',
+        'delete system phone-home',
+      ],
+      cleanupDeletes: [],
+      stagedCandidateErrorMessage: 'A config candidate is already staged on the switch. Commit or roll back before starting a new preview.',
+    });
+
+    expect(result.cleanupCommandCount).toBe(0);
+    expect(result.mistCliCommandCount).toBe(2);
+    expect(result.candidateCommandCount).toBe(2);
+    const payload = cmdRunner.sendAndWaitFor.mock.calls[1][0] as string;
+    expect(payload).toContain('set system services ssh protocol-version v2');
+    expect(payload).toContain('delete system phone-home');
+    expect(payload).not.toContain('delete protocols');
+  });
+
+  it('filters blank and comment lines before staging arbitrary set commands', async () => {
+    const cmdRunner = makeCmdRunnerStub({
+      'show | compare': { output: '' },
+      __commit_check_wait__: { output: 'commit check\nconfiguration check succeeds\nroot@switch# ' },
+    });
+    const service = new ConfigSyncService(cmdRunner as any, makeMistApiStub([]) as any);
+
+    const result = await service.previewCandidate({
+      cli: [
+        '  set system services ssh protocol-version v2  ',
+        '',
+        '   ',
+        '# comment',
+        'delete system phone-home',
+      ],
+      cleanupDeletes: [],
+      stagedCandidateErrorMessage: 'A config candidate is already staged on the switch. Commit or roll back before starting a new preview.',
+    });
+
+    expect(result.mistCliCommandCount).toBe(2);
+    expect(result.candidateCommandCount).toBe(2);
+  });
+});
+
 // =========================================================================
 // Staged session state
 // =========================================================================

@@ -85,6 +85,8 @@ screen share may not be practical. A core scenario is:
 - Create a safe path toward assisted remediation and adoption.
 - Keep remote diagnosis and support viable on weak cellular links where video
   or screen-sharing tools are unreliable.
+- Reduce operator clutter by preferring authoritative production-native
+  evidence and integrations over duplicate app-side recreations.
 
 ### Engineering goals
 
@@ -92,6 +94,8 @@ screen share may not be practical. A core scenario is:
 - Move sensitive API interactions and session orchestration to the backend.
 - Improve maintainability through modular workflows and testable services.
 - Establish a documented development process for future work.
+- Make capability ownership explicit so the app does not rebuild diagnostics or
+  integrations that already exist in production systems.
 
 ## Non-Goals
 
@@ -99,6 +103,28 @@ screen share may not be practical. A core scenario is:
 - Fully autonomous high-risk remediation on production switches.
 - Broad multi-vendor support in the current phase.
 - Public anonymous remote access without authentication and policy controls.
+- Keeping redundant checks or integrations just because they already exist in
+  the prototype.
+
+## Design Principle: Use The Authoritative Capability
+
+The product should not reimplement functionality that already exists in the
+most authoritative production system unless doing so adds clear new value.
+
+Examples:
+
+- If mcd already performs a diagnostic step and logs enough evidence to answer
+  the operator's question reliably, prefer parsing that device-native evidence
+  over adding a second app-side check that recreates the same test.
+- If Mist or a trusted Mist-owned integration already exposes the needed
+  context or bounded capability, prefer consuming that integration over
+  rebuilding an equivalent app-local version.
+- New checks, tools, or backend surfaces should be added only when they expose
+  information or actions that the existing authoritative system does not
+  already provide in a usable form.
+
+This principle exists to keep the operator workflow simpler, reduce app
+fragility, and avoid multiplying maintenance burden across parallel systems.
 
 ## Current Product Scope
 
@@ -248,6 +274,9 @@ See [`docs/MIST-API-INTEGRATION.md`](/Users/mdusty/Library/CloudStorage/OneDrive
 - The app must run ordered troubleshooting checks over the serial console.
 - Checks must support stop conditions for missing prerequisites such as no management IP or no default route.
 - Each check must produce a status, explanation, raw evidence, and remediation guidance where applicable.
+- Where device-native systems such as mcd already provide sufficient
+  diagnostic evidence, the product should prefer parsing that evidence over
+  adding a redundant live check that reproduces the same logic.
 - The troubleshooting flow must remain understandable to non-expert operators.
 - The troubleshooting UX should present high-level guidance in an operator-friendly
   format such as:
@@ -297,6 +326,9 @@ See [`docs/MIST-API-INTEGRATION.md`](/Users/mdusty/Library/CloudStorage/OneDrive
 - The product must make the trust boundary obvious to the operator.
 - The product must clearly indicate whether a session participant is a human support user or an AI agent.
 - AI agent integration should prefer read-only Mist context plus backend-owned live session/workflow tools rather than unrestricted raw command access.
+- AI and backend integrations should prefer existing authoritative bounded
+  capabilities, such as Mist-owned integrations or existing MCP tools, over
+  creating duplicate app-local tools with overlapping responsibility.
 
 ## Non-Functional Requirements
 

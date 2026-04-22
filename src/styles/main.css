@@ -1795,12 +1795,80 @@ html, body {
   max-height: 180px;
   overflow-y: auto;
 }
+.detail-output.mcd-analysis {
+  font-family: inherit;
+  white-space: normal;
+  overflow: hidden;
+  max-height: none;
+}
 .detail-output::-webkit-scrollbar { width: 4px; height: 4px; }
 .detail-output::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
 .detail-output.pass { border-left-color: #3fb950; }
 .detail-output.warn { border-left-color: #e3b341; }
 .detail-output.fail { border-left-color: var(--text-error); }
 .detail-output.info { border-left-color: var(--accent-blue); }
+
+.mcd-analysis-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mcd-analysis-eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-muted);
+}
+
+.mcd-analysis-summary {
+  font-size: 15px;
+  line-height: 1.3;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.mcd-analysis-copy,
+.mcd-analysis-note {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.mcd-analysis-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.mcd-analysis-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 150px) minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.mcd-analysis-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.mcd-analysis-value {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.mcd-analysis-notes {
+  display: grid;
+  gap: 6px;
+}
 .detail-raw-toggle {
   margin-top: 8px;
 }

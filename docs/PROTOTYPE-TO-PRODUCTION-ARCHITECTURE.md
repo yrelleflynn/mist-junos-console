@@ -52,6 +52,31 @@ The product model itself is strong and is compatible with a larger architecture:
 
 Those ideas are worth keeping.
 
+## Capability Ownership Principle
+
+Production architecture should make capability ownership clearer, not blurrier.
+
+The system should prefer the authoritative source of a capability rather than
+rebuilding equivalent logic in multiple layers.
+
+Examples:
+
+- device-native diagnostics should come from the device-native source when that
+  source already exists in usable form
+  for example, parsing mcd output rather than recreating the same check logic
+  as separate app-side tests
+- Mist control-plane context should come from Mist-owned integrations rather
+  than duplicated app-local approximations
+- bounded agent/MCP tools should be exposed once through the right backend
+  boundary, not reimplemented in parallel surfaces with overlapping semantics
+
+This matters for more than elegance:
+
+- fewer duplicated checks and integrations means less operator clutter
+- fewer parallel implementations means less drift and fragility
+- service boundaries become easier to reason about and secure
+- future production ownership is clearer
+
 ## Current Scaling Limits
 
 The main issue is not the workflow design. It is that the current backend keeps
@@ -140,6 +165,8 @@ Responsibilities:
 - normalize common responses
 - apply caching and rate limiting
 - isolate Mist failures from the console session path
+- expose shared Mist-side capabilities so product features and agent tooling do
+  not each invent separate integration paths for the same data
 
 This is especially important because:
 
@@ -156,6 +183,8 @@ Responsibilities:
 - produce analysis and recommendations
 - optionally suggest bounded actions
 - stay isolated from the live serial transport and session gateway
+- reuse existing authoritative backend capabilities rather than duplicating
+  Mist integration or device-diagnostic collection logic inside the AI layer
 
 This is a good fit for independent scaling because AI workloads are:
 
@@ -208,6 +237,11 @@ just separating the main runtime concerns:
 - bounded workflow execution
 - Mist control-plane integration
 - AI reasoning
+
+It should also avoid duplicating the same concern across services. A Mist-owned
+capability should stay Mist-owned. A device-native diagnostic should stay
+device-native. The application layer should orchestrate and interpret those
+capabilities, not rebuild them unnecessarily.
 
 ## How This Could Fit Into Mist Architecture
 

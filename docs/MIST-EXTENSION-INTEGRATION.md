@@ -111,6 +111,26 @@ Bad model:
 - localhost app tries to directly consume browser session cookies
 - raw Mist session material is copied into the local app or local backend
 
+## Capability Ownership Principle
+
+This integration should follow the same broader product rule: do not rebuild
+capabilities that already exist in the system that naturally owns them.
+
+In this context that means:
+
+- Mist-owned context and bounded Mist-side fetches should stay Mist-owned
+  rather than being re-created as separate app-local equivalents
+- the extension should bridge or fetch Mist-aware data where that is the most
+  natural ownership boundary
+- the local app should focus on serial workflows, operator UX, and device-side
+  orchestration rather than duplicating Mist control-plane logic
+- backend and MCP surfaces should prefer reusing shared Mist integration
+  capabilities rather than exposing multiple overlapping ways to get the same
+  Mist data
+
+This keeps the product simpler and avoids parallel implementations that drift
+out of sync over time.
+
 ## Roles And Responsibilities
 
 ## Browser Extension Responsibilities
@@ -153,6 +173,8 @@ The local app should continue owning:
 
 The local app should consume Mist-aware context, not try to become the Mist
 session owner.
+It also should not recreate Mist-owned capability when the extension or a
+trusted backend integration can provide the same result more directly.
 
 ## Backend Responsibilities
 
@@ -166,6 +188,9 @@ The backend should remain responsible for:
 
 In the longer term, the backend may also validate extension-provided context or
 exchange it for a short-lived scoped service token.
+Where Mist-backed capability is already available through a shared backend or
+MCP surface, new features should consume that surface rather than inventing
+another overlapping integration path.
 
 ## Recommended Integration Levels
 

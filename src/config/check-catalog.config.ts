@@ -50,6 +50,7 @@ export const CATALOG_GROUPS: CatalogGroup[] = [
     id: 'mist-agent',
     name: 'Mist Agent',
     checks: [
+      { id: 'mcd-log-analysis',    name: 'mcd Log Analysis',        desc: 'Parse mcd state-machine history for disconnect cause and current state',      requiresCloud: false, requiresMistApi: false, includeInRunAll: false },
       { id: 'mist-agent',          name: 'Agent Version',            desc: 'Installed Mist agent package and version',                                    requiresCloud: false, requiresMistApi: false },
       { id: 'mist-processes',      name: 'Agent Processes',          desc: 'mcd and jmd daemons are running',                                             requiresCloud: false, requiresMistApi: false },
       { id: 'outbound-ssh-config', name: 'Outbound SSH Config',      desc: 'outbound-ssh client "mist" configured with secret and device-id',             requiresCloud: false, requiresMistApi: false },

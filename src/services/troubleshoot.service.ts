@@ -21,6 +21,9 @@ import {
 } from './troubleshoot/parsers/lldp.parser';
 import { parseJmaConnectivityState } from './troubleshoot/parsers/jma-connectivity.parser';
 import { DhcpRefreshService } from './dhcp-refresh.service';
+import { buildMcdLogAnalysisResult } from '../features/troubleshoot/mcd-log-analysis';
+import { parseMcdLog } from '../features/troubleshoot/mcd-log-parser';
+import type { McdParsedCycle, McdParsedLog } from '../features/troubleshoot/mcd-log-parser.types';
 
 export type CheckStatus = 'pending' | 'running' | 'pass' | 'fail' | 'warn' | 'skip' | 'info';
 
@@ -63,6 +66,7 @@ export interface TroubleshootOptions {
   uplinkPort?: string;
   siteId?: string;
   deviceId?: string;
+  jmaStateCode?: number | null;
   onProgress: CheckProgressCallback;
 }
 
@@ -96,6 +100,89 @@ interface DefaultRoutePath {
   table: string;
   nextHop: string;
   iface: string;
+}
+
+const MCD_SIGNAL_FILTER_ERE = [
+  'ccstate\\.go:',
+  'connect\\.go:',
+  'will try again in [0-9]+s',
+  'ipc keep-alive timeout',
+  'ctx canceled; exiting sendCloudMsgs',
+  'stopping ipc server',
+  'killing monitored process',
+  'started jmd',
+].join('|');
+
+const DISCONNECT_REASON_JSON = /updated disconnect reason(?:(?: event sent status)?):\s+(\{.*\})/;
+const MCD_ANCHOR_MAX_DELTA_MS = 10 * 60 * 1000;
+
+function quoteForShellCommand(command: string): string {
+  return `'${command.replace(/'/g, `'\\''`)}'`;
+}
+
+function parseMcdLogRollTimestamp(fileName: string): number | null {
+  const match = fileName.match(/^mcd-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})(?:\.(\d{1,3}))?\.log(?:\.gz)?$/);
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second, millis = '0'] = match;
+  const paddedMillis = millis.padEnd(3, '0');
+  return Date.UTC(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hour),
+    Number(minute),
+    Number(second),
+    Number(paddedMillis),
+  );
+}
+
+function buildCombinedParsedLog(anchor: McdParsedLog | null, current: McdParsedLog): McdParsedLog {
+  const cycles: McdParsedCycle[] = [];
+  const pushCycles = (parsed: McdParsedLog | null) => {
+    if (!parsed) return;
+    for (const cycle of parsed.cycles) {
+      cycles.push({
+        ...cycle,
+        cycleNumber: cycles.length + 1,
+      });
+    }
+  };
+
+  pushCycles(anchor);
+  pushCycles(current);
+
+  return {
+    cycles,
+    totalLines: (anchor?.totalLines ?? 0) + current.totalLines,
+    signalLines: (anchor?.signalLines ?? 0) + current.signalLines,
+  };
+}
+
+function formatAnchorOffset(deltaMs: number): string {
+  const seconds = Math.round(Math.abs(deltaMs) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  return `${minutes}m`;
+}
+
+type McdAnchorWindow = {
+  parsed: McdParsedLog;
+  file: string;
+  matchedTimestampMs: number;
+  deltaMs: number;
+  source: 'mist-last-seen' | 'event-sent-transition';
+};
+
+type McdDisconnectEntry = {
+  file: string;
+  lineNumber: number;
+  timestampMs: number;
+  eventSent: boolean;
+};
+
+interface RawDisconnectReasonJson {
+  timestamp?: string;
+  event_sent?: boolean;
 }
 
 /** Mutable context for the modular troubleshoot step queue (Juniper EX). */
@@ -515,6 +602,10 @@ export class TroubleshootService {
         }
         case 'mist-agent': {
           report(await this.checkMistAgentVersion());
+          break;
+        }
+        case 'mcd-log-analysis': {
+          report(await this.checkMcdLogAnalysis(options.siteId, options.deviceId, options.jmaStateCode));
           break;
         }
         case 'mist-processes': {
@@ -2393,6 +2484,234 @@ export class TroubleshootService {
     }
 
     return this.parseMistProcesses(cmd.output);
+  }
+
+  private async executeShellSnippet(command: string, timeoutMs = 30000, settleMs = 2000): Promise<CommandResult> {
+    await this.runner.ensureShellMode();
+    try {
+      return await this.runner.execute(
+        `/bin/sh -c ${quoteForShellCommand(command)}`,
+        timeoutMs,
+        settleMs,
+      );
+    } finally {
+      await this.runner.ensureOperationalMode().catch(() => undefined);
+    }
+  }
+
+  private async listMcdLogFiles(): Promise<string[]> {
+    const cmd = await this.executeShellSnippet(
+      `ls -1 /var/log/mcd*.log.gz /var/log/mcd.log 2>/dev/null | sed 's#.*/##'`,
+      20000,
+      1500,
+    );
+    if (!cmd.success) return [];
+    return cmd.output
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => /^mcd(?:-\d{4}-\d{2}-\d{2}T[\d.-]+)?\.log(?:\.gz)?$/.test(line));
+  }
+
+  private async fetchCurrentMcdSignalLog(): Promise<McdParsedLog> {
+    const cmd = await this.executeShellSnippet(
+      `zcat -f /var/log/mcd.log | grep -E "${MCD_SIGNAL_FILTER_ERE}" | tail -n 200`,
+      30000,
+      1500,
+    );
+    if (!cmd.success) {
+      throw new Error(cmd.error || 'Could not read the live mcd log.');
+    }
+    return parseMcdLog(cmd.output);
+  }
+
+  private async listDisconnectReasonEntries(file: string): Promise<McdDisconnectEntry[]> {
+    const grepCmd = await this.executeShellSnippet(
+      `zcat -f /var/log/${file} | grep -n "updated disconnect reason"`,
+      file === 'mcd.log' ? 45000 : 60000,
+      1500,
+    );
+    if (!grepCmd.success || !grepCmd.output.trim()) return [];
+
+    const entries: McdDisconnectEntry[] = [];
+    for (const line of grepCmd.output.split('\n').map((entry) => entry.trim()).filter((entry) => /^\d+:/.test(entry))) {
+      const colonIndex = line.indexOf(':');
+      if (colonIndex <= 0) continue;
+      const lineNumber = Number(line.slice(0, colonIndex));
+      if (!Number.isFinite(lineNumber)) continue;
+      const payload = line.slice(colonIndex + 1);
+      const match = payload.match(DISCONNECT_REASON_JSON);
+      if (!match) continue;
+      try {
+        const parsed = JSON.parse(match[1]) as RawDisconnectReasonJson;
+        if (typeof parsed.timestamp !== 'string' || typeof parsed.event_sent !== 'boolean') continue;
+        const timestampMs = Date.parse(parsed.timestamp);
+        if (!Number.isFinite(timestampMs)) continue;
+        entries.push({
+          file,
+          lineNumber,
+          timestampMs,
+          eventSent: parsed.event_sent,
+        });
+      } catch {
+        continue;
+      }
+    }
+
+    return entries.sort((a, b) => a.timestampMs - b.timestampMs);
+  }
+
+  private async fetchMcdContextWindow(file: string, lineNumber: number): Promise<McdParsedLog | null> {
+    const start = Math.max(1, lineNumber - 100);
+    const end = lineNumber + 50;
+    const contextCmd = await this.executeShellSnippet(
+      `zcat -f /var/log/${file} | awk 'NR >= ${start} && NR <= ${end} { print }'`,
+      file === 'mcd.log' ? 45000 : 60000,
+      1500,
+    );
+    if (!contextCmd.success || !contextCmd.output.trim()) return null;
+    return parseMcdLog(contextCmd.output);
+  }
+
+  private async fetchMcdAnchorFromEventSent(files: string[]): Promise<McdAnchorWindow | null> {
+    const newestFirst = [...files].sort((a, b) => {
+      const aMs = a === 'mcd.log' ? Number.POSITIVE_INFINITY : (parseMcdLogRollTimestamp(a) ?? 0);
+      const bMs = b === 'mcd.log' ? Number.POSITIVE_INFINITY : (parseMcdLogRollTimestamp(b) ?? 0);
+      return bMs - aMs;
+    });
+
+    const entries: McdDisconnectEntry[] = [];
+    for (const file of newestFirst) {
+      const fileEntries = await this.listDisconnectReasonEntries(file);
+      entries.push(...fileEntries);
+    }
+
+    const newestToOldest = entries.sort((a, b) => b.timestampMs - a.timestampMs);
+    const successIndex = newestToOldest.findIndex((entry) => entry.eventSent);
+    if (successIndex <= 0) return null;
+
+    const candidate = newestToOldest[successIndex - 1];
+    if (candidate.eventSent) return null;
+
+    const parsed = await this.fetchMcdContextWindow(candidate.file, candidate.lineNumber);
+    if (!parsed) return null;
+
+    return {
+      parsed,
+      file: candidate.file,
+      matchedTimestampMs: candidate.timestampMs,
+      deltaMs: 0,
+      source: 'event-sent-transition',
+    };
+  }
+
+  private async fetchMcdAnchorLog(lastSeenMs: number): Promise<McdAnchorWindow | null> {
+    const files = await this.listMcdLogFiles();
+    if (files.length === 0) return null;
+
+    const searchOrder = [...files].sort((a, b) => {
+      const aMs = a === 'mcd.log' ? Number.POSITIVE_INFINITY : (parseMcdLogRollTimestamp(a) ?? 0);
+      const bMs = b === 'mcd.log' ? Number.POSITIVE_INFINITY : (parseMcdLogRollTimestamp(b) ?? 0);
+      return aMs - bMs;
+    });
+
+    let best: { file: string; lineNumber: number; timestampMs: number; deltaMs: number } | null = null;
+
+    for (const file of searchOrder) {
+      const entries = await this.listDisconnectReasonEntries(file);
+      for (const entry of entries) {
+        const deltaMs = entry.timestampMs - lastSeenMs;
+        if (!best || Math.abs(deltaMs) < Math.abs(best.deltaMs)) {
+          best = { file: entry.file, lineNumber: entry.lineNumber, timestampMs: entry.timestampMs, deltaMs };
+        }
+      }
+    }
+    if (!best || Math.abs(best.deltaMs) > MCD_ANCHOR_MAX_DELTA_MS) {
+      return this.fetchMcdAnchorFromEventSent(files);
+    }
+
+    const parsed = await this.fetchMcdContextWindow(best.file, best.lineNumber);
+    if (!parsed) return this.fetchMcdAnchorFromEventSent(files);
+
+    return {
+      parsed,
+      file: best.file,
+      matchedTimestampMs: best.timestampMs,
+      deltaMs: best.deltaMs,
+      source: 'mist-last-seen',
+    };
+  }
+
+  private async checkMcdLogAnalysis(siteId?: string, deviceId?: string, liveStateCode?: number | null): Promise<CheckResult> {
+    let currentParsed: McdParsedLog;
+    try {
+      currentParsed = await this.fetchCurrentMcdSignalLog();
+    } catch (err) {
+      return {
+        id: 'mcd-log-analysis',
+        name: 'mcd Log Analysis',
+        status: 'warn',
+        detail: 'Could not read the live mcd log — shell access may be restricted.',
+        raw: err instanceof Error ? err.message : String(err),
+      };
+    }
+
+    let anchorParsed: McdParsedLog | null = null;
+    const detailNotes: string[] = [];
+
+    if ((this.mistApi?.isConfigured || this.mistApi?.hasLaunchOverlay) && siteId && deviceId) {
+      try {
+        const stats = await this.mistApi.getDeviceStats(siteId, deviceId);
+        if (stats?.last_seen) {
+          const lastSeenMs = stats.last_seen * 1000;
+          detailNotes.push(`Mist last seen: ${new Date(lastSeenMs).toISOString()}`);
+          const anchorWindow = await this.fetchMcdAnchorLog(lastSeenMs);
+          if (anchorWindow?.parsed.cycles.length) {
+            anchorParsed = anchorWindow.parsed;
+            if (anchorWindow.source === 'mist-last-seen') {
+              const relative = anchorWindow.deltaMs === 0
+                ? 'at Mist last_seen'
+                : `${formatAnchorOffset(anchorWindow.deltaMs)} ${anchorWindow.deltaMs < 0 ? 'before' : 'after'} Mist last_seen`;
+              detailNotes.push(`Anchor match: ${relative} in ${anchorWindow.file}`);
+            } else {
+              detailNotes.push(`Anchor match: first unsent disconnect after the last sent event in ${anchorWindow.file}`);
+            }
+          } else {
+            detailNotes.push('Anchor match: no retained disconnect cycle was close to Mist last_seen.');
+          }
+        } else {
+          const files = await this.listMcdLogFiles();
+          const anchorWindow = await this.fetchMcdAnchorFromEventSent(files);
+          if (anchorWindow?.parsed.cycles.length) {
+            anchorParsed = anchorWindow.parsed;
+            detailNotes.push(`Anchor match: first unsent disconnect after the last sent event in ${anchorWindow.file}`);
+            detailNotes.push('Analysis scope: Mist did not provide a last_seen timestamp, so the anchor came from the mcd event_sent transition history.');
+          } else {
+            detailNotes.push('Analysis scope: Mist did not provide a last_seen timestamp, so analysis is based on the current live mcd window only.');
+          }
+        }
+      } catch (err) {
+        detailNotes.push(`Analysis scope: Could not retrieve the parser anchor from Mist last_seen: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      const files = await this.listMcdLogFiles();
+      const anchorWindow = await this.fetchMcdAnchorFromEventSent(files);
+      if (anchorWindow?.parsed.cycles.length) {
+        anchorParsed = anchorWindow.parsed;
+        detailNotes.push(`Anchor match: first unsent disconnect after the last sent event in ${anchorWindow.file}`);
+        detailNotes.push('Analysis scope: Mist context was unavailable, so the anchor came from the mcd event_sent transition history.');
+      } else {
+        detailNotes.push('Analysis scope: Mist context was unavailable, so analysis is based on the current live mcd window only.');
+      }
+    }
+
+    const combined = buildCombinedParsedLog(anchorParsed, currentParsed);
+    const result = buildMcdLogAnalysisResult(combined, {
+      fallbackStateCode: liveStateCode ?? null,
+    });
+    if (detailNotes.length > 0) {
+      result.detail = `${result.detail}\n${detailNotes.join('\n')}`.trim();
+    }
+    return result;
   }
 
   private async getConfiguredDnsServers(): Promise<{ servers: string[]; entries: DnsServerEntry[]; raw: string }> {

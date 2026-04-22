@@ -11,10 +11,16 @@ import { TerminalComponent } from './components/terminal.component';
 import { CommandRunnerService } from './services/command-runner.service';
 import { MistApiService } from './services/mist-api.service';
 import type { MistDeviceConfig, MistDeviceEvent, MistLaunchOverlay } from './services/mist-api.service';
-import { TroubleshootService, CheckResult, CheckStatus } from './services/troubleshoot.service';
+import {
+  TroubleshootService,
+  CheckResult,
+  CheckStatus,
+  type RecommendedChecksOptions,
+  type TroubleshootOptions,
+} from './services/troubleshoot.service';
 import { SwitchIdentityService } from './services/switch-identity.service';
 import { ConfigSyncService, isConfigSyncStagingWarning } from './services/config-sync.service';
-import type { ConfigSyncActionResult } from './services/config-sync.service';
+import type { CandidatePreviewInput, ConfigSyncActionResult, ConfigSyncPreviewResult } from './services/config-sync.service';
 import { DhcpRefreshService } from './services/dhcp-refresh.service';
 import type { DhcpRefreshResult, DhcpBindingChange, DhcpRefreshStep } from './services/dhcp-refresh.service';
 import { MistAgentRestartService } from './services/mist-agent-restart.service';
@@ -24,9 +30,39 @@ import { MistContextController } from './controllers/mist-context.controller';
 import { DeviceContextController } from './controllers/device-context.controller';
 import { CloudStatusController } from './controllers/cloud-status.controller';
 import type { CloudStatusState } from './types/cloud-status.types';
+import { ConsoleTaskGate, type ConsoleTaskKind } from './app/runtime/console-task-gate';
+import { classifyPromptMode as detectPromptMode } from './app/runtime/prompt-mode';
 import { MIST_CLOUDS, getCloudById } from './config/mist-clouds.config';
 import type { MistCloud } from './config/mist-clouds.config';
 import { getJmaRecommendation } from './config/jma-recommendations';
+import {
+  evaluateMistLaunchVerification,
+  type MistLaunchVerificationState,
+} from './features/mist-launch/verification';
+import {
+  buildGuidedAnalysisForRun,
+  type GuidedAnalysisCard,
+} from './features/troubleshoot/guided-analysis';
+import {
+  buildCatalogDetailHtml,
+  catalogBadgeText,
+  catalogBadgeTooltipText,
+  catalogWorstStatus,
+  formatMcdAnalysisDetailLines,
+} from './features/troubleshoot/catalog-formatters';
+import {
+  canRunFullBaseline,
+  getCatalogCheckAvailability,
+  resolveCatalogRunOptions,
+} from './features/troubleshoot/catalog-availability';
+import {
+  runRecommendedCatalogSuite,
+  runTroubleshootWorkflow,
+  type TroubleshootWorkflowDeps,
+} from './features/troubleshoot/catalog-runner';
+import {
+  prepareAdoptionPlan,
+} from './features/adoption/workflow';
 import {
   CATALOG_GROUPS,
   ALL_CATALOG_CHECK_IDS,
@@ -59,8 +95,6 @@ type ExtensionLaunchContext = MistLaunchOverlay & {
   apiHost?: string | null;
   capturedAt?: string | null;
 };
-
-type MistLaunchVerificationState = 'inactive' | 'waiting' | 'matched' | 'mismatch';
 
 // ---- Check Web Serial support ----
 if (!SerialService.isSupported()) {
@@ -409,13 +443,6 @@ function init(): void {
   let initialShellToCliInFlight = false;
   let latestCloudStatusState: CloudStatusState | null = null;
   let extensionLaunchContext: ExtensionLaunchContext | null = null;
-  interface GuidedAnalysisCard {
-    eyebrow: string;
-    title: string;
-    summary: string;
-    conclusion?: string;
-    findings?: string[];
-  }
   interface AgentCatalogCheckState {
     id: string;
     name: string;
@@ -467,9 +494,12 @@ function init(): void {
   let agentActionPollTimer: number | null = null;
   let agentActionPollInFlight = false;
   let authorizedPortsCache: SerialPort[] = [];
-  type ConsoleTaskKind = 'background' | 'user' | 'exclusive';
-  type ConsoleTaskOwner = { id: string; kind: ConsoleTaskKind; label: string; depth: number };
-  let consoleTaskOwner: ConsoleTaskOwner | null = null;
+  const consoleTaskGate = new ConsoleTaskGate((ownerId) => {
+    if (configSync.hasStagedCandidate() && !ownerId?.startsWith('config-sync')) {
+      return { kind: 'exclusive', label: 'staged config sync' };
+    }
+    return null;
+  });
 
   // ---- Mist context controller ----
   const mistContext = new MistContextController(mistApi, {
@@ -756,6 +786,65 @@ function init(): void {
     scheduleAgentContextPush();
   }
 
+  function getCatalogAvailabilityInput() {
+    return {
+      serialConnected: serial.isConnected,
+      catalogRunning,
+      selectedCloud: getCloudById(ui.mistCloud.value) ?? null,
+      effectiveTarget: getEffectiveMistTarget(),
+      getBlockingConsoleTask,
+    };
+  }
+
+  function resolveCatalogRunOptionsForWorkflow(checkIds: string[], cloudOverride?: MistCloud | null) {
+    return resolveCatalogRunOptions(checkIds, {
+      selectedCloud: getCloudById(ui.mistCloud.value) ?? null,
+      effectiveTarget: getEffectiveMistTarget(),
+      uplinkPort: ui.tsUplinkPort.value.trim(),
+      jmaStateCode: latestJmaCode,
+      onProgress: handleProgressResult,
+      cloudOverride,
+    });
+  }
+
+  function applyCheckResultsWithGuidedAnalysis(
+    results: CheckResult[],
+    options: {
+      title: string;
+      jmaCode?: number | null;
+    },
+  ): void {
+    setLatestAgentCheckResults(results);
+    renderGuidedCheckAnalysis(buildGuidedAnalysisForRun(results, options));
+  }
+
+  function setCatalogRunningState(running: boolean): void {
+    catalogRunning = running;
+  }
+
+  function getTroubleshootWorkflowDeps(): TroubleshootWorkflowDeps<EffectiveCloudResolution> {
+    return {
+      resolveEffectiveCloud: resolveEffectiveMistCloud,
+      withCloudStatusPollingPaused,
+      withConsoleTask,
+      beginLatestAgentCheckRun,
+      refreshCatalogRunButtons,
+      activateResultsTab,
+      describeEffectiveCloudResolution,
+      setCatalogRunning: setCatalogRunningState,
+      term,
+    };
+  }
+
+  function canRunFullBaselineNow(): boolean {
+    return canRunFullBaseline({
+      serialConnected: serial.isConnected,
+      catalogRunning,
+      selectedCloud: getCloudById(ui.mistCloud.value) ?? null,
+      getBlockingConsoleTask,
+    });
+  }
+
   function buildAgentContextPayload(sessionId: string, agentAccessEnabled: boolean): Record<string, unknown> {
     const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity;
     const mistDevice = deviceContext.matchResult?.mistDevice ?? null;
@@ -772,7 +861,7 @@ function init(): void {
     const blockingConsoleTask = getBlockingConsoleTask();
     const catalogGroups: AgentCatalogGroupState[] = CATALOG_GROUPS.map((group) => {
       const checks = group.checks.map((check) => {
-        const availability = getCatalogCheckAvailability(check.id);
+        const availability = getCatalogCheckAvailability(check.id, getCatalogAvailabilityInput());
         return {
           id: check.id,
           name: check.name,
@@ -857,8 +946,8 @@ function init(): void {
             : 'No current JMA recommendation is available.',
         },
         runFullBaseline: {
-          available: canRunFullBaseline(),
-          reason: canRunFullBaseline() ? null : 'Full baseline is not currently available.',
+          available: canRunFullBaselineNow(),
+          reason: canRunFullBaselineNow() ? null : 'Full baseline is not currently available.',
         },
         dhcpRefresh: {
           available: !ui.btnDhcpRefresh.disabled,
@@ -890,8 +979,8 @@ function init(): void {
             : null,
         },
         runFullBaseline: {
-          available: canRunFullBaseline(),
-          reason: canRunFullBaseline() ? null : 'Run Full Baseline is not currently available.',
+          available: canRunFullBaselineNow(),
+          reason: canRunFullBaselineNow() ? null : 'Run Full Baseline is not currently available.',
         },
       },
       identity: identity
@@ -1009,7 +1098,7 @@ function init(): void {
           if (!checkId || !getCatalogCheck(checkId)) {
             throw new Error('Unknown or missing checkId.');
           }
-          const availability = getCatalogCheckAvailability(checkId);
+          const availability = getCatalogCheckAvailability(checkId, getCatalogAvailabilityInput());
           if (!availability.available) {
             throw new Error(availability.reason ?? 'Check is not currently available.');
           }
@@ -1022,7 +1111,9 @@ function init(): void {
           if (!groupId || checks.length === 0) {
             throw new Error('Unknown or missing groupId.');
           }
-          const blocked = checks.map((check) => getCatalogCheckAvailability(check.id)).find((item) => !item.available);
+          const blocked = checks
+            .map((check) => getCatalogCheckAvailability(check.id, getCatalogAvailabilityInput()))
+            .find((item) => !item.available);
           if (blocked && !blocked.available) {
             throw new Error(blocked.reason ?? 'Check group is not currently available.');
           }
@@ -1037,7 +1128,13 @@ function init(): void {
           await withCloudStatusPollingPaused(async () => {
             await withConsoleTask('catalog-all-checks', 'user', 'all catalog checks', async () => {
               const effectiveCloud = await resolveEffectiveMistCloud();
-              const resolved = resolveCatalogRunOptions(runnableCheckIds, effectiveCloud.cloud);
+              const resolved = resolveCatalogRunOptions(runnableCheckIds, {
+                selectedCloud: getCloudById(ui.mistCloud.value) ?? null,
+                effectiveTarget: getEffectiveMistTarget(),
+                uplinkPort: ui.tsUplinkPort.value.trim(),
+                onProgress: handleProgressResult,
+                cloudOverride: effectiveCloud.cloud,
+              });
               if ('error' in resolved) {
                 throw new Error(resolved.error);
               }
@@ -1076,7 +1173,7 @@ function init(): void {
           break;
         }
         case 'run_full_baseline': {
-          if (!canRunFullBaseline()) {
+          if (!canRunFullBaselineNow()) {
             throw new Error('Run Full Baseline is not currently available.');
           }
           await runFullBaseline();
@@ -1397,7 +1494,7 @@ function init(): void {
     scheduleAgentContextPush();
   }
 
-  function ensureConfigSyncActionAllowed(action: 'commit' | 'rollback'): boolean {
+  function ensureStagedCandidateActionAllowed(action: 'commit' | 'rollback'): boolean {
     updateConfigSyncUIState();
 
     if (!serial.isConnected) {
@@ -1410,14 +1507,14 @@ function init(): void {
 
     if (!configSync.hasStagedCandidate()) {
       const label = action === 'commit' ? 'Commit' : 'Rollback';
-      const message = `${label} is unavailable because there is no staged config sync candidate.`;
+      const message = `${label} is unavailable because there is no staged candidate configuration.`;
       ui.configSyncResults.innerHTML = `<div class="status-text error">${escapeHtml(message)}</div>`;
       term.writeError(message);
       return false;
     }
 
     if (action === 'commit' && !configSync.sessionInfo?.canCommit) {
-      const message = 'Commit is unavailable because the staged config sync candidate is not in a committable state.';
+      const message = 'Commit is unavailable because the staged candidate is not in a committable state.';
       ui.configSyncResults.innerHTML = `<div class="status-text error">${escapeHtml(message)}</div>`;
       term.writeError(message);
       return false;
@@ -1733,6 +1830,13 @@ function init(): void {
     why: string;
     unlocksWorkflow: boolean;
   } {
+    const decision = evaluateMistLaunchVerification({
+      launchContext: extensionLaunchContext,
+      serialConnected: serial.isConnected,
+      identity: deviceContext.matchResult?.identity ?? deviceContext.localIdentity ?? null,
+      matchedMistDeviceId: deviceContext.matchResult?.mistDevice?.id ?? null,
+    });
+
     if (!extensionLaunchContext) {
       return {
         active: false,
@@ -1745,10 +1849,8 @@ function init(): void {
 
     const expectedLabel = getMistLaunchExpectedLabel();
     const identity = deviceContext.matchResult?.identity ?? deviceContext.localIdentity ?? null;
-    const matchedMistDeviceId = deviceContext.matchResult?.mistDevice?.id ?? null;
-    const expectedMistDeviceId = extensionLaunchContext.deviceId ?? null;
 
-    if (!serial.isConnected) {
+    if (decision.reason === 'not_connected') {
       return {
         active: true,
         state: 'waiting',
@@ -1758,7 +1860,7 @@ function init(): void {
       };
     }
 
-    if (!identity) {
+    if (decision.reason === 'identity_missing') {
       return {
         active: true,
         state: 'waiting',
@@ -1768,17 +1870,7 @@ function init(): void {
       };
     }
 
-    if (matchedMistDeviceId && expectedMistDeviceId) {
-      if (matchedMistDeviceId === expectedMistDeviceId) {
-        return {
-          active: true,
-          state: 'matched',
-          detail: `Matched ${expectedLabel}. The identified console session maps to the same Mist switch.`,
-          why: 'Mist launch verification succeeded, so troubleshooting workflows are now available.',
-          unlocksWorkflow: true,
-        };
-      }
-
+    if (decision.reason === 'mist_device_id_mismatch') {
       return {
         active: true,
         state: 'mismatch',
@@ -1788,42 +1880,27 @@ function init(): void {
       };
     }
 
-    const comparisons: Array<{ label: string; matched: boolean }> = [];
-    const expectedSerial = normalizeLooseId(extensionLaunchContext.deviceSerial);
-    const actualSerial = normalizeLooseId(identity.serial);
-    if (expectedSerial && actualSerial) {
-      comparisons.push({ label: 'serial', matched: expectedSerial === actualSerial });
-    }
-
-    const actualMac = normalizeHexId(identity.mac);
-    const expectedMac = normalizeHexId(extensionLaunchContext.deviceMac);
-    if (expectedMac && actualMac) {
-      comparisons.push({ label: 'MAC', matched: expectedMac === actualMac });
-    }
-
-    const expectedMacSuffix = extractMistDeviceIdSuffix(extensionLaunchContext.deviceId);
-    if (expectedMacSuffix && actualMac) {
-      comparisons.push({ label: 'MAC', matched: expectedMacSuffix === actualMac.slice(-12) });
-    }
-
-    const expectedHostname = normalizeLooseId(extensionLaunchContext.deviceName);
-    const actualHostname = normalizeLooseId(identity.hostname);
-    if (expectedHostname && actualHostname) {
-      comparisons.push({ label: 'hostname', matched: expectedHostname === actualHostname });
-    }
-
-    const mismatch = comparisons.find((comparison) => !comparison.matched);
-    if (mismatch) {
+    if (decision.reason === 'identity_mismatch') {
       return {
         active: true,
         state: 'mismatch',
         detail: `${buildIdentityLabel(identity)} does not match the switch launched from Mist (${expectedLabel}).`,
-        why: `Verification failed on ${mismatch.label}. Disconnect and move the console cable to the Mist-launched switch before continuing.`,
+        why: `Verification failed on ${decision.mismatchField}. Disconnect and move the console cable to the Mist-launched switch before continuing.`,
         unlocksWorkflow: false,
       };
     }
 
-    if (comparisons.length > 0) {
+    if (decision.reason === 'mist_device_id_match') {
+      return {
+        active: true,
+        state: 'matched',
+        detail: `Matched ${expectedLabel}. The identified console session maps to the same Mist switch.`,
+        why: 'Mist launch verification succeeded, so troubleshooting workflows are now available.',
+        unlocksWorkflow: true,
+      };
+    }
+
+    if (decision.reason === 'identity_match') {
       return {
         active: true,
         state: 'matched',
@@ -2251,14 +2328,7 @@ function init(): void {
   }
 
   function classifyPromptMode(output: string): 'operational' | 'config' | 'shell' | 'login' | 'password' | 'unknown' {
-    const trimmed = output.trimEnd();
-    if (!trimmed) return 'unknown';
-    if (/[Pp]assword:\s*$/.test(trimmed)) return 'password';
-    if (/login:\s*$/i.test(trimmed)) return 'login';
-    if (/(?:\{[^}\n]+\}\s*\n)?[\w\-@.:]+%\s*$/.test(trimmed)) return 'shell';
-    if (/(?:\{[^}\n]+\}\s*\n)?[\w\-@.:]+#\s*$/.test(trimmed)) return 'config';
-    if (/(?:\{[^}\n]+\}\s*\n)?[\w\-@.:]+>\s*$/.test(trimmed)) return 'operational';
-    return 'unknown';
+    return detectPromptMode(output);
   }
 
   function getRecentPromptMode(): 'operational' | 'config' | 'shell' | 'login' | 'password' | 'unknown' {
@@ -2482,13 +2552,7 @@ function init(): void {
   }
 
   function getBlockingConsoleTask(ownerId?: string): { kind: ConsoleTaskKind; label: string } | null {
-    if (configSync.hasStagedCandidate() && !ownerId?.startsWith('config-sync')) {
-      return { kind: 'exclusive', label: 'staged config sync' };
-    }
-    if (consoleTaskOwner && consoleTaskOwner.id !== ownerId) {
-      return { kind: consoleTaskOwner.kind, label: consoleTaskOwner.label };
-    }
-    return null;
+    return consoleTaskGate.getBlockingTask(ownerId);
   }
 
   function renderConsoleTaskIndicator(): void {
@@ -2512,21 +2576,11 @@ function init(): void {
   }
 
   function tryAcquireConsoleTask(ownerId: string, kind: ConsoleTaskKind, label: string): boolean {
-    if (getBlockingConsoleTask(ownerId)) return false;
-    if (consoleTaskOwner && consoleTaskOwner.id === ownerId) {
-      consoleTaskOwner.depth += 1;
-      return true;
-    }
-    consoleTaskOwner = { id: ownerId, kind, label, depth: 1 };
-    return true;
+    return consoleTaskGate.tryAcquire(ownerId, kind, label);
   }
 
   function releaseConsoleTask(ownerId: string): void {
-    if (!consoleTaskOwner || consoleTaskOwner.id !== ownerId) return;
-    consoleTaskOwner.depth -= 1;
-    if (consoleTaskOwner.depth <= 0) {
-      consoleTaskOwner = null;
-    }
+    consoleTaskGate.release(ownerId);
   }
 
   function onConsoleTaskOwnershipChanged(): void {
@@ -2564,17 +2618,8 @@ function init(): void {
       || identifyInFlight
       || cloudStatusRefreshInFlight
       || Boolean(loggedInBootstrapPromise)
-      || consoleTaskOwner?.kind === 'background';
+      || consoleTaskGate.getOwnerKind() === 'background';
   }
-
-  type CatalogRunOptions = {
-    cloud: MistCloud;
-    uplinkPort: string;
-    siteId?: string;
-    deviceId?: string;
-    checkIds: string[];
-    onProgress: typeof handleProgressResult;
-  };
 
   function jmaSupportsMistAgentRestart(code: number | null): boolean {
     return code === 109 || code === 110 || code === 112;
@@ -2933,44 +2978,6 @@ function init(): void {
 
   const CHEVRON_SVG = `<svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
-  function catalogWorstStatus(results: CheckResult[]): string {
-    const priority: Record<string, number> = { fail: 5, warn: 4, info: 3, skip: 2, pass: 1, pending: 0 };
-    return results.reduce((worst, r) => {
-      const p = priority[r.status] ?? 0;
-      return p > (priority[worst] ?? 0) ? r.status : worst;
-    }, 'pass');
-  }
-
-  function catalogBadgeText(catalogId: string, results: CheckResult[]): string {
-    if (results.length === 0) return '—';
-    if (catalogId === 'fw-check') {
-      const pass = results.filter(r => r.status === 'pass').length;
-      const fail = results.filter(r => r.status === 'fail').length;
-      const total = results.length;
-      if (fail === 0) return `${total}/${total} ok`;
-      return `${fail} blocked`;
-    }
-    if (catalogId === 'mist-last-seen') {
-      const seen = results.find(r => r.id === 'mist-last-seen');
-      if (seen) return seen.detail.length > 40 ? seen.detail.slice(0, 38) + '…' : seen.detail;
-    }
-    const last = results[results.length - 1];
-    const text = last.detail;
-    return text.length > 42 ? text.slice(0, 40) + '…' : text;
-  }
-
-  function catalogBadgeTooltipText(catalogId: string, results: CheckResult[]): string {
-    if (results.length === 0) return '';
-    if (catalogId === 'fw-check') {
-      return results.map((result) => result.detail).filter(Boolean).join('\n');
-    }
-    const last = [...results]
-      .reverse()
-      .find((result) => result.status !== 'running' && result.status !== 'pending') ?? results[results.length - 1];
-    const parts = [last.detail, last.remediation].filter(Boolean);
-    return parts.join('\n\n');
-  }
-
   function setCatalogBadgeState(badge: HTMLElement, status: string, text: string, title = ''): void {
     badge.className = status ? `check-result-badge ${status}` : 'check-result-badge';
     badge.textContent = text;
@@ -3022,164 +3029,6 @@ function init(): void {
     setLatestAgentGuidedAnalysis(card);
   }
 
-  function buildDnsGuidedAnalysis(results: CheckResult[]): GuidedAnalysisCard | null {
-    const dnsConfig = results.find((result) => result.id === 'dns-config');
-    const dnsReachability = results.find((result) => result.id === 'dns-server-reachability');
-    const dnsResolution = results.find((result) => result.id === 'dns-resolution');
-    const dnsResults = [dnsConfig, dnsReachability, dnsResolution].filter(Boolean) as CheckResult[];
-    if (dnsResults.length === 0) return null;
-
-    const relevantDnsIssues = dnsResults.filter((result) => result.status === 'fail' || result.status === 'warn' || result.status === 'skip');
-    if (relevantDnsIssues.length === 0) return null;
-
-    const findings = dnsResults
-      .filter((result) => result.detail)
-      .map((result) => `${result.name}: ${result.detail}`);
-
-    if (!dnsResolution) {
-      const title = dnsConfig?.status === 'fail'
-        ? 'DNS is not configured'
-        : 'DNS path needs attention';
-      const summary = dnsConfig?.status === 'fail'
-        ? 'The switch does not currently have usable DNS resolvers configured, so cloud hostname resolution cannot succeed yet.'
-        : 'DNS-related checks found a problem before hostname resolution completed. Review the findings below to restore resolver configuration or DNS-path reachability.';
-      const conclusion = dnsConfig?.status === 'fail'
-        ? 'Restore DNS servers first, either through DHCP Option 6 or static name-server configuration, then rerun the DNS checks.'
-        : 'Fix the earliest failing DNS prerequisite first, then rerun the DNS group to confirm hostname resolution is working again.';
-      return {
-        eyebrow: 'Guided Analysis',
-        title,
-        summary,
-        findings,
-        conclusion,
-      };
-    }
-
-    const raw = `${dnsResolution.raw || ''}`.toLowerCase();
-    let conclusion = 'DNS resolution failed, so the switch still cannot resolve the hostnames it needs for cloud connectivity.';
-    if ((dnsConfig?.detail || '').toLowerCase().includes('no dns servers found')) {
-      conclusion = 'No DNS resolvers are currently available to the switch. There are no usable entries in the runtime resolver configuration, so DNS cannot work until resolvers are supplied via static configuration or DHCP.';
-    } else if ((dnsReachability?.detail || '').toLowerCase().includes('no dns servers were available to test')) {
-      conclusion = 'No DNS resolvers are currently available to the switch, so hostname resolution could not even be attempted. Restore resolver entries first, then retry the lookup.';
-    } else if ((dnsReachability?.detail || '').toLowerCase().includes('reachable dns servers')
-      && (raw.includes('no servers could be reached') || raw.includes('connection timed out'))) {
-      conclusion = 'Configured DNS servers respond to ping, but Junos cannot reach them for actual DNS queries. This strongly suggests upstream DNS transport is being blocked, most likely firewall policy on UDP/TCP 53 between the switch and its resolvers.';
-    } else if (dnsResolution.detail === 'Mist hostnames are unknown to the resolver') {
-      conclusion = 'Public DNS still works, but the resolver reported the Mist hostname as unknown. This suggests split-DNS, selective filtering, or an internal DNS server that does not know or forward Juniper Mist domains.';
-    } else if (dnsResolution.detail === 'Resolver returned unknown host responses') {
-      conclusion = 'The resolver answered the queries, but returned unknown-host responses for both public and Mist names. That points to a resolver content, recursion, or DNS policy problem rather than pure transport blocking.';
-    } else if (dnsResolution.detail === 'Mist hostname was unknown to the resolver') {
-      conclusion = 'The resolver answered the lookup, but it does not know the Mist hostname being queried. This points to a resolver content or forwarding problem rather than a raw connectivity issue.';
-    } else if (raw.includes('unknown host') || raw.includes('host name lookup failure')) {
-      conclusion = 'The resolver answered the lookup, but reported the hostname as unknown. That points to a DNS content or hostname problem rather than pure transport blocking.';
-    }
-
-    return {
-      eyebrow: 'Guided Analysis',
-      title: 'DNS lookup is failing',
-      summary: 'The switch can see configured DNS servers, but name resolution is still failing. Use the findings below to decide whether the issue is transport, resolver content, or stale DHCP-supplied DNS settings.',
-      findings,
-      conclusion,
-    };
-  }
-
-  function buildGenericCheckSummary(
-    results: CheckResult[],
-    options: { title?: string | null } = {},
-  ): GuidedAnalysisCard | null {
-    if (results.length === 0) return null;
-
-    const counts = { pass: 0, fail: 0, warn: 0, skip: 0, info: 0 };
-    results.forEach((result) => {
-      if (result.status in counts) counts[result.status as keyof typeof counts] += 1;
-    });
-
-    const title = options.title ?? 'Check Summary';
-    const findings = results
-      .filter((result) => result.status === 'fail' || result.status === 'warn' || result.status === 'skip')
-      .slice(0, 4)
-      .map((result) => `${result.name}: ${result.detail}`);
-
-    const summary = `${results.length} checks completed: ${counts.pass} pass, ${counts.fail} fail, ${counts.warn} warn, ${counts.skip} skip.`;
-    let conclusion: string | undefined;
-    if (counts.fail > 0) {
-      conclusion = 'Address the failing checks first, then rerun the group to confirm the path is healthy end to end.';
-    } else if (counts.warn > 0) {
-      conclusion = 'The group completed without hard failures, but there are still warnings worth resolving before treating the path as healthy.';
-    } else if (counts.skip > 0) {
-      conclusion = 'Some checks were skipped because an earlier prerequisite was missing. Fix the prerequisite and rerun the group if you need full coverage.';
-    } else if (results.length > 1) {
-      conclusion = 'The group completed cleanly with no failing checks.';
-    } else {
-      return null;
-    }
-
-    return {
-      eyebrow: 'Guided Analysis',
-      title,
-      summary,
-      findings,
-      conclusion,
-    };
-  }
-
-  function buildGuidedAnalysisForJma(code: number | null, results: CheckResult[]): GuidedAnalysisCard | null {
-    if (results.length === 0) return null;
-
-    const dnsAnalysis = buildDnsGuidedAnalysis(results);
-    if (dnsAnalysis) return dnsAnalysis;
-
-    if (!code) return null;
-
-    const recommendation = getJmaRecommendation(code);
-    if (!recommendation) return null;
-    const failing = results.filter((result) => result.status === 'fail' || result.status === 'warn');
-    const findings = failing.slice(0, 3).map((result) => `${result.name}: ${result.detail}`);
-    return {
-      eyebrow: 'Guided Analysis',
-      title: recommendation.title,
-      summary: recommendation.summary,
-      findings,
-    };
-  }
-
-  function buildGuidedAnalysisForRun(
-    results: CheckResult[],
-    options: { jmaCode?: number | null; title?: string | null } = {},
-  ): GuidedAnalysisCard | null {
-    return buildGuidedAnalysisForJma(options.jmaCode ?? null, results)
-      ?? buildGenericCheckSummary(results, { title: options.title ?? null });
-  }
-
-  function buildCatalogDetailHtml(results: CheckResult[]): string {
-    if (results.length === 0) return '';
-    let html = '';
-    for (const result of results) {
-      if (result.commands && result.commands.length > 0) {
-        for (const cmd of result.commands) {
-          html += `<div class="detail-cmd"><span class="detail-cmd-prompt">&gt;</span><span class="detail-cmd-text">${escapeHtml(cmd)}</span></div>`;
-        }
-      }
-      if (result.detail) {
-        html += `<div class="detail-output ${result.status}">${escapeHtml(result.detail)}</div>`;
-      }
-      if (result.raw && result.raw.trim() && result.raw.trim() !== result.detail.trim()) {
-        html += `
-          <details class="detail-raw-toggle">
-            <summary>Raw console output</summary>
-            <div class="detail-output ${result.status}">${escapeHtml(result.raw)}</div>
-          </details>
-        `;
-      }
-      if (result.remediation && (result.status === 'fail' || result.status === 'warn' || result.status === 'info')) {
-        const remClass = result.status === 'fail' ? 'fail' : result.status === 'info' ? 'info' : '';
-        const icon = result.status === 'fail' ? '✕' : '⚠';
-        html += `<div class="detail-remediation ${remClass}"><span class="detail-remediation-icon">${icon}</span><span>${escapeHtml(result.remediation)}</span></div>`;
-      }
-    }
-    return html;
-  }
-
   function updateCatalogRow(catalogId: string, results: CheckResult[]): void {
     const dot = document.getElementById(`catalog-dot-${catalogId}`);
     const badge = document.getElementById(`catalog-badge-${catalogId}`);
@@ -3196,7 +3045,7 @@ function init(): void {
     setCatalogBadgeState(badge, status, badgeText, badgeTitle);
 
     item.classList.remove('no-detail');
-    detail.innerHTML = buildCatalogDetailHtml(results);
+    detail.innerHTML = buildCatalogDetailHtml(results, escapeHtml);
 
     // Auto-expand on failure/warning if not manually closed
     if (!catalogExpanded.has(catalogId) && (status === 'fail' || status === 'warn') && !isRunning) {
@@ -3213,7 +3062,21 @@ function init(): void {
     updateCatalogRow(catalogId, updated);
     latestAgentCheckResultMap.set(result.id, result);
     setLatestAgentCheckResults([...latestAgentCheckResultMap.values()], 'running');
-    term.writeSystem(`  [${statusIcon(result.status)}] ${result.name}: ${result.detail}`);
+    const detailLines = result.id === 'mcd-log-analysis'
+      ? formatMcdAnalysisDetailLines(result.detail)
+      : result.detail
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean);
+    if (detailLines.length <= 1) {
+      term.writeSystem(`  [${statusIcon(result.status)}] ${result.name}: ${result.detail}`);
+      return;
+    }
+
+    term.writeSystem(`  [${statusIcon(result.status)}] ${result.name}`);
+    for (const line of detailLines) {
+      term.writeSystem(`      ${line}`);
+    }
   }
 
   function resetCatalogRows(catalogIds: string[]): void {
@@ -3223,42 +3086,17 @@ function init(): void {
     });
   }
 
-  function getCatalogCheckAvailability(checkId: string): { available: boolean; reason: string | null } {
-    const check = getCatalogCheck(checkId);
-    if (!check) return { available: false, reason: 'Unknown check.' };
-    if (!serial.isConnected) {
-      return { available: false, reason: 'Serial session is not connected.' };
-    }
-    if (catalogRunning) {
-      return { available: false, reason: 'Another troubleshooting workflow is already running.' };
-    }
-    const blocking = getBlockingConsoleTask(`catalog-check:${checkId}`);
-    if (blocking) {
-      return { available: false, reason: `${blocking.label} is using the console.` };
-    }
-    if (check.requiresCloud && !getCloudById(ui.mistCloud.value)) {
-      return { available: false, reason: 'Select a Mist cloud region first.' };
-    }
-    if (check.requiresMistApi) {
-      const effectiveTarget = getEffectiveMistTarget();
-      const hasSite = !!effectiveTarget.siteId;
-      const hasDevice = !!effectiveTarget.deviceId;
-      if (!hasSite || !hasDevice) {
-        return { available: false, reason: 'Identify and match the switch in Mist first.' };
-      }
-    }
-    return { available: true, reason: null };
+  function markCatalogRowsRunning(catalogIds: string[]): void {
+    [...new Set(catalogIds)].forEach((catalogId) => {
+      const dot = document.getElementById(`catalog-dot-${catalogId}`);
+      const badge = document.getElementById(`catalog-badge-${catalogId}`);
+      if (dot) dot.className = 'check-status-dot running';
+      if (badge) setCatalogBadgeState(badge, 'running', '…', '');
+    });
   }
 
   function canRunCatalogCheck(checkId: string): boolean {
-    return getCatalogCheckAvailability(checkId).available;
-  }
-
-  function canRunFullBaseline(): boolean {
-    return serial.isConnected
-      && !catalogRunning
-      && !getBlockingConsoleTask('full-baseline')
-      && Boolean(getCloudById(ui.mistCloud.value));
+    return getCatalogCheckAvailability(checkId, getCatalogAvailabilityInput()).available;
   }
 
   function refreshCatalogRunButtons(forceDisabled = false): void {
@@ -3280,45 +3118,8 @@ function init(): void {
 
     const runBaselineBtn = document.getElementById('catalog-btn-run-baseline') as HTMLButtonElement | null;
     if (runBaselineBtn) {
-      runBaselineBtn.disabled = forceDisabled || !canRunFullBaseline();
+      runBaselineBtn.disabled = forceDisabled || !canRunFullBaselineNow();
     }
-  }
-
-  function resolveCatalogRunOptions(checkIds: string[], cloudOverride?: MistCloud | null): { options: CatalogRunOptions } | { error: string } {
-    for (const checkId of checkIds) {
-      const check = getCatalogCheck(checkId);
-      if (!check) {
-        return { error: `Unknown check: ${checkId}` };
-      }
-      if (check.requiresCloud && !(cloudOverride ?? getCloudById(ui.mistCloud.value))) {
-        return { error: `Select a Mist cloud region before running ${check.name}.` };
-      }
-      if (check.requiresMistApi) {
-        const effectiveTarget = getEffectiveMistTarget();
-        const hasSite = !!effectiveTarget.siteId;
-        const hasDevice = !!effectiveTarget.deviceId;
-        if (!hasSite || !hasDevice) {
-          return { error: `${check.name} requires the switch to be identified and matched in Mist first.` };
-        }
-      }
-    }
-
-    const cloud = cloudOverride ?? getCloudById(ui.mistCloud.value);
-    if (!cloud) {
-      return { error: 'Select a Mist cloud region first.' };
-    }
-
-    const effectiveTarget = getEffectiveMistTarget();
-    return {
-      options: {
-        cloud,
-        uplinkPort: ui.tsUplinkPort.value.trim(),
-        siteId: effectiveTarget.siteId || undefined,
-        deviceId: effectiveTarget.deviceId || undefined,
-        checkIds,
-        onProgress: handleProgressResult,
-      },
-    };
   }
 
   function clearCatalog(): void {
@@ -3462,48 +3263,29 @@ function init(): void {
     if (catalogRunning) return;
     if (!ensureCatalogCanRun('This check')) return;
     renderGuidedCheckAnalysis(null);
-    await withCloudStatusPollingPaused(async () => {
-      await withConsoleTask('catalog-single-check', 'user', 'catalog check', async () => {
-        const effectiveCloud = await resolveEffectiveMistCloud();
-        const resolved = resolveCatalogRunOptions([catalogId], effectiveCloud.cloud);
-        if ('error' in resolved) {
-          term.writeError(resolved.error);
-          refreshCatalogRunButtons(false);
-          return;
-        }
-        catalogRunning = true;
-        beginLatestAgentCheckRun();
-        refreshCatalogRunButtons(true);
-        activateResultsTab('checks');
-
-        const dot = document.getElementById(`catalog-dot-${catalogId}`);
-        const badge = document.getElementById(`catalog-badge-${catalogId}`);
-        resetCatalogRows([catalogId]);
-        if (dot) dot.className = 'check-status-dot running';
-        if (badge) setCatalogBadgeState(badge, 'running', '…', '');
-
-        term.writeSystem(`— Running check: ${getCatalogCheck(catalogId)?.name ?? catalogId} —`);
-        const cloudMessage = describeEffectiveCloudResolution(effectiveCloud);
-        if (cloudMessage) {
-          term.writeSystem(`  ${cloudMessage}`);
-        }
-
-        try {
-          const results = await troubleshooter.runRecommendedChecks(resolved.options);
-          setLatestAgentCheckResults(results);
-          renderGuidedCheckAnalysis(buildGuidedAnalysisForRun(results, {
-            title: `${getCatalogCheck(catalogId)?.name ?? 'Check'} summary`,
-          }));
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          term.writeError(`Check failed: ${msg}`);
-          if (dot) dot.className = 'check-status-dot fail';
-          if (badge) setCatalogBadgeState(badge, 'fail', 'error', msg);
-        } finally {
-          catalogRunning = false;
-          refreshCatalogRunButtons(false);
-        }
-      });
+    const isMcdAnalysis = catalogId === 'mcd-log-analysis';
+    await runRecommendedCatalogSuite({
+      ownerId: 'catalog-single-check',
+      ownerLabel: 'catalog check',
+      checkIds: [catalogId],
+      rowIdsToReset: [catalogId],
+      rowIdsToMarkRunning: [catalogId],
+      startMessage: `— Running check: ${getCatalogCheck(catalogId)?.name ?? catalogId} —`,
+      startNotes: isMcdAnalysis
+        ? [
+            'Using retained mcd log evidence rather than rerunning duplicate agent-side tests.',
+            'If Mist last_seen is available, anchor the most recent disconnect cycle from rotated logs before reading the live mcd.log window.',
+          ]
+        : undefined,
+      summaryTitle: `${getCatalogCheck(catalogId)?.name ?? 'Check'} summary`,
+      failureMessage: 'Check failed',
+    }, {
+      ...getTroubleshootWorkflowDeps(),
+      resolveRunOptions: resolveCatalogRunOptionsForWorkflow,
+      resetCatalogRows,
+      markCatalogRowsRunning,
+      runRecommendedChecks: (options) => troubleshooter.runRecommendedChecks(options),
+      handleResults: (results, summaryTitle) => applyCheckResultsWithGuidedAnalysis(results, { title: summaryTitle }),
     });
   }
 
@@ -3513,49 +3295,23 @@ function init(): void {
     renderGuidedCheckAnalysis(null);
     const checks = getCatalogGroupChecks(groupId);
     if (checks.length === 0) return;
-    await withCloudStatusPollingPaused(async () => {
-      await withConsoleTask('catalog-group-checks', 'user', 'catalog check group', async () => {
-        const effectiveCloud = await resolveEffectiveMistCloud();
-        const resolved = resolveCatalogRunOptions(checks.map(c => c.id), effectiveCloud.cloud);
-        if ('error' in resolved) {
-          term.writeError(resolved.error);
-          refreshCatalogRunButtons(false);
-          return;
-        }
-        catalogRunning = true;
-        beginLatestAgentCheckRun();
-        refreshCatalogRunButtons(true);
-        activateResultsTab('checks');
-
-        resetCatalogRows(checks.map((check) => check.id));
-        checks.forEach(check => {
-          const dot = document.getElementById(`catalog-dot-${check.id}`);
-          const badge = document.getElementById(`catalog-badge-${check.id}`);
-          if (dot) dot.className = 'check-status-dot running';
-          if (badge) setCatalogBadgeState(badge, 'running', '…', '');
-        });
-
-        const groupName = CATALOG_GROUPS.find(g => g.id === groupId)?.name ?? groupId;
-        term.writeSystem(`— Running group: ${groupName} —`);
-        const cloudMessage = describeEffectiveCloudResolution(effectiveCloud);
-        if (cloudMessage) {
-          term.writeSystem(`  ${cloudMessage}`);
-        }
-
-        try {
-          const results = await troubleshooter.runRecommendedChecks(resolved.options);
-          setLatestAgentCheckResults(results);
-          renderGuidedCheckAnalysis(buildGuidedAnalysisForRun(results, {
-            title: `${groupName} summary`,
-          }));
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          term.writeError(`Group checks failed: ${msg}`);
-        } finally {
-          catalogRunning = false;
-          refreshCatalogRunButtons(false);
-        }
-      });
+    const groupName = CATALOG_GROUPS.find(g => g.id === groupId)?.name ?? groupId;
+    await runRecommendedCatalogSuite({
+      ownerId: 'catalog-group-checks',
+      ownerLabel: 'catalog check group',
+      checkIds: checks.map((check) => check.id),
+      rowIdsToReset: checks.map((check) => check.id),
+      rowIdsToMarkRunning: checks.map((check) => check.id),
+      startMessage: `— Running group: ${groupName} —`,
+      summaryTitle: `${groupName} summary`,
+      failureMessage: 'Group checks failed',
+    }, {
+      ...getTroubleshootWorkflowDeps(),
+      resolveRunOptions: resolveCatalogRunOptionsForWorkflow,
+      resetCatalogRows,
+      markCatalogRowsRunning,
+      runRecommendedChecks: (options) => troubleshooter.runRecommendedChecks(options),
+      handleResults: (results, summaryTitle) => applyCheckResultsWithGuidedAnalysis(results, { title: summaryTitle }),
     });
   }
 
@@ -3563,51 +3319,23 @@ function init(): void {
     if (catalogRunning) return;
     if (!ensureCatalogCanRun('All catalog checks')) return;
     renderGuidedCheckAnalysis(null);
-    await withCloudStatusPollingPaused(async () => {
-      await withConsoleTask('catalog-all-checks', 'user', 'all catalog checks', async () => {
-        const effectiveCloud = await resolveEffectiveMistCloud();
-        const resolved = resolveCatalogRunOptions(RUN_ALL_CATALOG_CHECK_IDS, effectiveCloud.cloud);
-        if ('error' in resolved) {
-          term.writeError(resolved.error);
-          refreshCatalogRunButtons(false);
-          return;
-        }
-        catalogRunning = true;
-        beginLatestAgentCheckRun();
-        refreshCatalogRunButtons(true);
-        activateResultsTab('checks');
-
-        resetCatalogRows(ALL_CATALOG_CHECK_IDS);
-        CATALOG_GROUPS.forEach(group => {
-          group.checks.forEach(check => {
-            const dot = document.getElementById(`catalog-dot-${check.id}`);
-            const badge = document.getElementById(`catalog-badge-${check.id}`);
-            if (dot) dot.className = 'check-status-dot running';
-            if (badge) setCatalogBadgeState(badge, 'running', '…', '');
-          });
-        });
-
-        term.writeSystem('— Running all catalog checks —');
-        const cloudMessage = describeEffectiveCloudResolution(effectiveCloud);
-        if (cloudMessage) {
-          term.writeSystem(`  ${cloudMessage}`);
-        }
-
-        try {
-          const results = await troubleshooter.runRecommendedChecks(resolved.options);
-          setLatestAgentCheckResults(results);
-          renderGuidedCheckAnalysis(buildGuidedAnalysisForRun(results, {
-            title: 'Catalog checks summary',
-          }));
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          term.writeError(`Check suite failed: ${msg}`);
-        } finally {
-          catalogRunning = false;
-          refreshCatalogRunButtons(false);
-          term.writeSystem('— All catalog checks complete —');
-        }
-      });
+    await runRecommendedCatalogSuite({
+      ownerId: 'catalog-all-checks',
+      ownerLabel: 'all catalog checks',
+      checkIds: RUN_ALL_CATALOG_CHECK_IDS,
+      rowIdsToReset: ALL_CATALOG_CHECK_IDS,
+      rowIdsToMarkRunning: ALL_CATALOG_CHECK_IDS,
+      startMessage: '— Running all catalog checks —',
+      summaryTitle: 'Catalog checks summary',
+      failureMessage: 'Check suite failed',
+      completionMessage: '— All catalog checks complete —',
+    }, {
+      ...getTroubleshootWorkflowDeps(),
+      resolveRunOptions: resolveCatalogRunOptionsForWorkflow,
+      resetCatalogRows,
+      markCatalogRowsRunning,
+      runRecommendedChecks: (options) => troubleshooter.runRecommendedChecks(options),
+      handleResults: (results, summaryTitle) => applyCheckResultsWithGuidedAnalysis(results, { title: summaryTitle }),
     });
   }
 
@@ -3615,51 +3343,38 @@ function init(): void {
     if (catalogRunning) return;
     if (!ensureCatalogCanRun('The full baseline')) return;
     renderGuidedCheckAnalysis(null);
-    await withCloudStatusPollingPaused(async () => {
-      await withConsoleTask('full-baseline', 'user', 'full baseline troubleshooting', async () => {
-        const effectiveCloud = await resolveEffectiveMistCloud();
+    await runTroubleshootWorkflow<TroubleshootOptions, EffectiveCloudResolution>({
+      ownerId: 'full-baseline',
+      ownerLabel: 'full baseline troubleshooting',
+      startMessage: '— Running full baseline troubleshooting workflow —',
+      failureMessage: 'Full baseline failed',
+      completionMessage: '— Full baseline complete —',
+      beforeRun: () => {
+        resetCatalogRows(ALL_CATALOG_CHECK_IDS);
+      },
+      resolveExecution: (effectiveCloud) => {
         const cloud = effectiveCloud.cloud;
         if (!cloud) {
-          term.writeError('Select a Mist cloud region before running the full baseline.');
-          refreshCatalogRunButtons(false);
-          return;
+          return { error: 'Select a Mist cloud region before running the full baseline.' };
         }
-        catalogRunning = true;
-        beginLatestAgentCheckRun();
-        refreshCatalogRunButtons(true);
-        activateResultsTab('checks');
-        resetCatalogRows(ALL_CATALOG_CHECK_IDS);
-
-        term.writeSystem('— Running full baseline troubleshooting workflow —');
-        const cloudMessage = describeEffectiveCloudResolution(effectiveCloud);
-        if (cloudMessage) {
-          term.writeSystem(`  ${cloudMessage}`);
-        }
-
-        try {
-          const effectiveTarget = getEffectiveMistTarget();
-          const results = await troubleshooter.runAll({
+        const effectiveTarget = getEffectiveMistTarget();
+        return {
+          options: {
             cloud,
             uplinkPort: ui.tsUplinkPort.value.trim(),
             siteId: effectiveTarget.siteId || undefined,
             deviceId: effectiveTarget.deviceId || undefined,
+            jmaStateCode: latestJmaCode,
             onProgress: handleProgressResult,
-          });
-          setLatestAgentCheckResults(results);
-          renderGuidedCheckAnalysis(buildGuidedAnalysisForRun(results, {
-            jmaCode: latestJmaCode,
-            title: 'Full baseline summary',
-          }));
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          term.writeError(`Full baseline failed: ${msg}`);
-        } finally {
-          catalogRunning = false;
-          refreshCatalogRunButtons(false);
-          term.writeSystem('— Full baseline complete —');
-        }
-      });
-    });
+          },
+        };
+      },
+      execute: (options) => troubleshooter.runAll(options),
+      handleResults: (results) => applyCheckResultsWithGuidedAnalysis(results, {
+        jmaCode: latestJmaCode,
+        title: 'Full baseline summary',
+      }),
+    }, getTroubleshootWorkflowDeps());
   }
 
   function renderCheckResult(result: CheckResult, allResults?: CheckResult[]): HTMLElement {
@@ -4483,54 +4198,39 @@ function init(): void {
     const recommendation = getJmaRecommendation(latestJmaCode);
     if (!recommendation) return;
     if (!ensureCatalogCanRun('Recommended checks')) return;
-
-    await withCloudStatusPollingPaused(async () => {
-      await withConsoleTask('jma-recommended-checks', 'user', 'recommended checks', async () => {
-        const effectiveCloud = await resolveEffectiveMistCloud();
+    await runTroubleshootWorkflow<RecommendedChecksOptions, EffectiveCloudResolution>({
+      ownerId: 'jma-recommended-checks',
+      ownerLabel: 'recommended checks',
+      startMessage: `— Running recommended checks for JMA ${recommendation.code} ${recommendation.label} —`,
+      failureMessage: 'Recommended checks failed',
+      completionMessage: '— Recommended checks complete —',
+      afterRun: () => {
+        updateConfigSyncUIState();
+      },
+      resolveExecution: (effectiveCloud) => {
         const cloud = effectiveCloud.cloud;
         if (!cloud) {
-          term.writeError('Please select a Mist cloud region.');
-          return;
+          return { error: 'Please select a Mist cloud region.' };
         }
-
-        activateResultsTab('checks');
-        catalogRunning = true;
-        beginLatestAgentCheckRun();
-        refreshCatalogRunButtons(true);
-
-        term.writeSystem(`— Running recommended checks for JMA ${recommendation.code} ${recommendation.label} —`);
-        const cloudMessage = describeEffectiveCloudResolution(effectiveCloud);
-        if (cloudMessage) {
-          term.writeSystem(`  ${cloudMessage}`);
-        }
-
-        try {
-          const effectiveTarget = getEffectiveMistTarget();
-          const results = await troubleshooter.runRecommendedChecks({
+        const effectiveTarget = getEffectiveMistTarget();
+        return {
+          options: {
             cloud,
             uplinkPort: ui.tsUplinkPort.value.trim(),
             siteId: effectiveTarget.siteId || undefined,
             deviceId: effectiveTarget.deviceId || undefined,
+            jmaStateCode: latestJmaCode,
             checkIds: recommendation.checks.map((check) => check.id),
             onProgress: handleProgressResult,
-          });
-          setLatestAgentCheckResults(results);
-          renderGuidedCheckAnalysis(buildGuidedAnalysisForRun(results, {
-            jmaCode: recommendation.code,
-            title: 'Recommended checks summary',
-          }));
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          term.writeError(`Recommended checks failed: ${msg}`);
-        } finally {
-          catalogRunning = false;
-          updateConfigSyncUIState();
-          refreshCatalogRunButtons(false);
-        }
-
-        term.writeSystem('— Recommended checks complete —');
-      });
-    });
+          },
+        };
+      },
+      execute: (options) => troubleshooter.runRecommendedChecks(options),
+      handleResults: (results) => applyCheckResultsWithGuidedAnalysis(results, {
+        jmaCode: recommendation.code,
+        title: 'Recommended checks summary',
+      }),
+    }, getTroubleshootWorkflowDeps());
   }
 
   // ---- DHCP Refresh ----
@@ -5171,6 +4871,134 @@ function init(): void {
   }
 
   // ---- Config Sync Preview ----
+  function renderStagedCandidatePreview(
+    result: ConfigSyncPreviewResult,
+    options: {
+      title: string;
+      summary: string;
+      commandPreviewLines?: string[];
+      diffEmptySummary: string;
+      decisionSummary: string;
+    },
+  ): void {
+    let html = '';
+
+    html += `<div class="config-sync-section-title">${escapeHtml(options.title)}</div>`;
+    html += `<div class="config-sync-summary">${options.summary}</div>`;
+
+    if (options.commandPreviewLines && options.commandPreviewLines.length > 0) {
+      html += `<pre class="config-sync-pre">${escapeHtml(options.commandPreviewLines.join('\n'))}</pre>`;
+    }
+
+    const stagingWarnings = result.stagingErrors.filter(isConfigSyncStagingWarning);
+    const stagingErrors = result.stagingErrors.filter((e) => !isConfigSyncStagingWarning(e));
+
+    if (stagingWarnings.length > 0) {
+      html += `<div class="config-sync-section-title">Load Warnings (${stagingWarnings.length})</div>`;
+      for (const w of stagingWarnings) {
+        html +=
+          `<div class="config-sync-warning">` +
+          `<span class="config-sync-warning-cmd">${escapeHtml(w.command)}</span>` +
+          `<span class="config-sync-warning-msg">${escapeHtml(w.error)}</span>` +
+          `</div>`;
+      }
+    }
+
+    if (stagingErrors.length > 0) {
+      html += `<div class="config-sync-section-title">Load Errors (${stagingErrors.length})</div>`;
+      for (const err of stagingErrors) {
+        html +=
+          `<div class="config-sync-error">` +
+          `<span class="config-sync-error-cmd">${escapeHtml(err.command)}</span>` +
+          `<span class="config-sync-error-msg">${escapeHtml(err.error)}</span>` +
+          `</div>`;
+      }
+    }
+
+    const checkLabel = result.commitCheckPassed
+      ? '<span class="config-sync-check-status pass">✓ Passed</span>'
+      : '<span class="config-sync-check-status fail">✗ Failed</span>';
+    if (result.compareOutput.trim()) {
+      html +=
+        '<div class="config-sync-section-title">Diff Review</div>' +
+        '<div class="config-sync-summary">Review the highlighted <code>show | compare</code> output in the main console above.</div>';
+    } else {
+      html +=
+        '<div class="config-sync-section-title">Diff Review</div>' +
+        `<div class="config-sync-summary">${options.diffEmptySummary}</div>`;
+    }
+
+    html += `<div class="config-sync-section-title">Pre-commit Validation ${checkLabel}</div>`;
+    if (result.commitCheckOutput.trim()) {
+      html += `<pre class="config-sync-pre">${escapeHtml(result.commitCheckOutput)}</pre>`;
+    }
+
+    if (result.staged) {
+      html +=
+        '<div class="config-sync-section-title" style="margin-top:12px;">Decision Required</div>' +
+        `<div class="config-sync-summary">${options.decisionSummary}</div>`;
+    } else {
+      html +=
+        '<div class="config-sync-error" style="margin-top:8px;">⚠ Staging did not complete — candidate was not left on the switch.</div>';
+    }
+
+    ui.configSyncResults.innerHTML = html;
+    ui.configSyncResults.scrollTop = 0;
+  }
+
+  async function previewCandidateWorkflow(
+    input: CandidatePreviewInput,
+    options: {
+      title: string;
+      summary: (result: ConfigSyncPreviewResult) => string;
+      commandPreviewLines?: string[];
+      diffEmptySummary: string;
+      decisionSummary: string;
+      startTerminalMessage: string;
+      successTerminalMessage: string;
+      noDiffTerminalMessage: string;
+      stagedTerminalMessage: string;
+      incompleteTerminalMessage: string;
+      candidateTerminalSummary: (result: ConfigSyncPreviewResult) => string;
+    },
+  ): Promise<ConfigSyncPreviewResult> {
+    term.writeSystem(options.startTerminalMessage);
+    const result = await configSync.previewCandidate(input);
+    renderStagedCandidatePreview(result, {
+      title: options.title,
+      summary: options.summary(result),
+      commandPreviewLines: options.commandPreviewLines,
+      diffEmptySummary: options.diffEmptySummary,
+      decisionSummary: options.decisionSummary,
+    });
+    updateConfigSyncUIState();
+    await waitForUiPaint();
+
+    const stagingWarnings = result.stagingErrors.filter(isConfigSyncStagingWarning);
+    const stagingErrors = result.stagingErrors.filter((e) => !isConfigSyncStagingWarning(e));
+    term.writeSystem(options.candidateTerminalSummary(result));
+    for (const w of stagingWarnings) {
+      term.writeSystem(`  Staging warning: ${w.command} — ${w.error}`);
+    }
+    for (const err of stagingErrors) {
+      term.writeError(`  Staging error: ${err.command} — ${err.error}`);
+    }
+    if (result.compareOutput.trim()) {
+      term.writeSystem('  ── Diff (show | compare) ──');
+      term.writeJunosHighlighted(result.compareOutput);
+    } else {
+      term.writeSystem(`  ${options.noDiffTerminalMessage}`);
+    }
+    term.writeSystem(`  Commit check: ${result.commitCheckPassed ? 'passed' : 'FAILED'}`);
+    if (result.staged) {
+      term.writeSystem(`  ${options.stagedTerminalMessage}`);
+    } else {
+      term.writeError(`  ${options.incompleteTerminalMessage}`);
+    }
+    term.writeSystem(options.successTerminalMessage);
+    return result;
+  }
+
   async function previewConfigSync(): Promise<void> {
     if (!ensureConsoleTaskAvailable('Config sync', 'config-sync-preview')) return;
     await withCloudStatusPollingPaused(async () => {
@@ -5189,113 +5017,25 @@ function init(): void {
         const siteId = effectiveTarget.siteId;
         const deviceId = effectiveTarget.deviceId;
 
-        term.writeSystem('— Starting config sync —');
-
         try {
-          const result = await configSync.previewSync(siteId, deviceId);
-
-          let html = '';
-
-          // Candidate summary
-          html += '<div class="config-sync-section-title">Config to Apply</div>';
-          html += `<div class="config-sync-summary">` +
-            `${result.candidateCommandCount} total commands — ` +
-            `${result.cleanupCommandCount} cleanup deletes + ` +
-            `${result.mistCliCommandCount} from Mist intent` +
-            `</div>`;
-
-          // Classify staging issues: warnings vs errors
-          const stagingWarnings = result.stagingErrors.filter(isConfigSyncStagingWarning);
-          const stagingErrors = result.stagingErrors.filter((e) => !isConfigSyncStagingWarning(e));
-
-          if (stagingWarnings.length > 0) {
-            html += `<div class="config-sync-section-title">Load Warnings (${stagingWarnings.length})</div>`;
-            for (const w of stagingWarnings) {
-              html +=
-                `<div class="config-sync-warning">` +
-                `<span class="config-sync-warning-cmd">${escapeHtml(w.command)}</span>` +
-                `<span class="config-sync-warning-msg">${escapeHtml(w.error)}</span>` +
-                `</div>`;
-            }
-          }
-
-          if (stagingErrors.length > 0) {
-            html += `<div class="config-sync-section-title">Load Errors (${stagingErrors.length})</div>`;
-            for (const err of stagingErrors) {
-              html +=
-                `<div class="config-sync-error">` +
-                `<span class="config-sync-error-cmd">${escapeHtml(err.command)}</span>` +
-                `<span class="config-sync-error-msg">${escapeHtml(err.error)}</span>` +
-                `</div>`;
-            }
-          }
-
-          // Compare diff (shown in the live console; bottom panel keeps the summary)
-          const checkLabel = result.commitCheckPassed
-            ? '<span class="config-sync-check-status pass">✓ Passed</span>'
-            : '<span class="config-sync-check-status fail">✗ Failed</span>';
-          if (result.compareOutput.trim()) {
-            html +=
-              '<div class="config-sync-section-title">Diff Review</div>' +
-              '<div class="config-sync-summary">Review the highlighted <code>show | compare</code> output in the main console above.</div>';
-          } else {
-            html +=
-              '<div class="config-sync-section-title">Diff Review</div>' +
-              '<div class="config-sync-summary">No changes detected — config is already aligned with Mist intent.</div>';
-          }
-
-          // Commit check (plain — output is already plain text, not a diff)
-          html += `<div class="config-sync-section-title">Pre-commit Validation ${checkLabel}</div>`;
-          if (result.commitCheckOutput.trim()) {
-            html += `<pre class="config-sync-pre">${escapeHtml(result.commitCheckOutput)}</pre>`;
-          }
-
-          if (result.staged) {
-            // Candidate is staged — show decision prompt, enable action buttons
-            html +=
-              '<div class="config-sync-section-title" style="margin-top:12px;">Decision Required</div>' +
-              '<div class="config-sync-summary">Candidate config is staged on the switch. ' +
-              'Review the diff above, then choose an action in the panel below.</div>';
-          } else {
-            // Preview failed to stage (exception was thrown and caught cleanly)
-            html +=
-              '<div class="config-sync-error" style="margin-top:8px;">⚠ Staging did not complete — candidate was not left on the switch.</div>';
-          }
-
-          ui.configSyncResults.innerHTML = html;
-          ui.configSyncResults.scrollTop = 0;
-          updateConfigSyncUIState();
-          await waitForUiPaint();
-
-          term.writeSystem(
-            `  Candidate: ${result.candidateCommandCount} commands ` +
-            `(${result.cleanupCommandCount} cleanup + ${result.mistCliCommandCount} from Mist intent)`,
-          );
-
-          for (const w of stagingWarnings) {
-            term.writeSystem(`  Staging warning: ${w.command} — ${w.error}`);
-          }
-
-          for (const err of stagingErrors) {
-            term.writeError(`  Staging error: ${err.command} — ${err.error}`);
-          }
-
-          if (result.compareOutput.trim()) {
-            term.writeSystem('  ── Diff (show | compare) ──');
-            term.writeJunosHighlighted(result.compareOutput);
-          } else {
-            term.writeSystem('  No diff detected — config already aligned with Mist intent.');
-          }
-
-          term.writeSystem(`  Commit check: ${result.commitCheckPassed ? 'passed' : 'FAILED'}`);
-
-          if (result.staged) {
-            term.writeSystem('  Candidate staged — choose Commit or Rollback below.');
-          } else {
-            term.writeError('  Warning: staging did not complete cleanly.');
-          }
-
-          term.writeSystem('— Config sync complete —');
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const configCmd = await mistApi.getDeviceConfig(siteId, deviceId) as any;
+          const cliLines: string[] = Array.isArray(configCmd?.cli) ? configCmd.cli : [];
+          await previewCandidateWorkflow({
+            cli: cliLines,
+            stagedCandidateErrorMessage: 'A candidate configuration is already staged on the switch. Commit or roll back before starting a new preview.',
+          }, {
+            title: 'Config to Apply',
+            summary: (result) => `${result.candidateCommandCount} total commands — ${result.cleanupCommandCount} cleanup deletes + ${result.mistCliCommandCount} from Mist intent`,
+            diffEmptySummary: 'No changes detected — config is already aligned with Mist intent.',
+            decisionSummary: 'Candidate config is staged on the switch. Review the diff above, then choose an action in the panel below.',
+            startTerminalMessage: '— Starting config sync —',
+            successTerminalMessage: '— Config sync complete —',
+            noDiffTerminalMessage: 'No diff detected — config already aligned with Mist intent.',
+            stagedTerminalMessage: 'Candidate staged — choose Commit or Rollback below.',
+            incompleteTerminalMessage: 'Warning: staging did not complete cleanly.',
+            candidateTerminalSummary: (result) => `  Candidate: ${result.candidateCommandCount} commands (${result.cleanupCommandCount} cleanup + ${result.mistCliCommandCount} from Mist intent)`,
+          });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
@@ -5309,20 +5049,20 @@ function init(): void {
 
   // ---- Config Sync: Commit ----
   async function doCommitSync(): Promise<void> {
-    if (!ensureConsoleTaskAvailable('Config sync commit', 'config-sync-commit')) return;
-    if (!ensureConfigSyncActionAllowed('commit')) return;
+    if (!ensureConsoleTaskAvailable('Commit candidate', 'config-sync-commit')) return;
+    if (!ensureStagedCandidateActionAllowed('commit')) return;
     await withCloudStatusPollingPaused(async () => {
-      await withConsoleTask('config-sync-commit', 'exclusive', 'config sync commit', async () => {
-        if (!ensureConfigSyncActionAllowed('commit')) return;
+      await withConsoleTask('config-sync-commit', 'exclusive', 'candidate commit', async () => {
+        if (!ensureStagedCandidateActionAllowed('commit')) return;
         ui.btnCommitSync.disabled = true;
         ui.btnRollbackSync.disabled = true;
 
-        term.writeSystem('— Committing config sync candidate —');
+        term.writeSystem('— Committing staged candidate —');
         ui.configSyncResults.innerHTML = '<div class="status-text info">Running commit…</div>';
 
         try {
           const result = await configSync.commitSync();
-          renderConfigSyncActionOutcome(result, 'commit');
+          renderCandidateActionOutcome(result, 'commit');
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
@@ -5336,20 +5076,20 @@ function init(): void {
 
   // ---- Config Sync: Rollback ----
   async function doRollbackSync(): Promise<void> {
-    if (!ensureConsoleTaskAvailable('Config sync rollback', 'config-sync-rollback')) return;
-    if (!ensureConfigSyncActionAllowed('rollback')) return;
+    if (!ensureConsoleTaskAvailable('Rollback candidate', 'config-sync-rollback')) return;
+    if (!ensureStagedCandidateActionAllowed('rollback')) return;
     await withCloudStatusPollingPaused(async () => {
-      await withConsoleTask('config-sync-rollback', 'exclusive', 'config sync rollback', async () => {
-        if (!ensureConfigSyncActionAllowed('rollback')) return;
+      await withConsoleTask('config-sync-rollback', 'exclusive', 'candidate rollback', async () => {
+        if (!ensureStagedCandidateActionAllowed('rollback')) return;
         ui.btnCommitSync.disabled = true;
         ui.btnRollbackSync.disabled = true;
 
-        term.writeSystem('— Rolling back config sync candidate —');
+        term.writeSystem('— Rolling back staged candidate —');
         ui.configSyncResults.innerHTML = '<div class="status-text info">Running rollback 0…</div>';
 
         try {
           const result = await configSync.rollbackSync();
-          renderConfigSyncActionOutcome(result, 'rollback');
+          renderCandidateActionOutcome(result, 'rollback');
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           ui.configSyncResults.innerHTML = `<div class="status-text error">Error: ${escapeHtml(msg)}</div>`;
@@ -5362,7 +5102,7 @@ function init(): void {
   }
 
   /** Render the final outcome of a commit or rollback action in the results pane. */
-  function renderConfigSyncActionOutcome(
+  function renderCandidateActionOutcome(
     result: ConfigSyncActionResult,
     action: 'commit' | 'rollback',
   ): void {
@@ -5370,9 +5110,9 @@ function init(): void {
 
     if (result.success) {
       if (action === 'commit') {
-        html += '<div class="config-sync-rollback-notice">✓ Committed — config is now active and permanent.</div>';
+        html += '<div class="config-sync-rollback-notice">✓ Committed — candidate configuration is now active and permanent.</div>';
       } else {
-        html += '<div class="config-sync-rollback-notice">✓ Rolled back — running config is unchanged.</div>';
+        html += '<div class="config-sync-rollback-notice">✓ Rolled back — running configuration is unchanged.</div>';
       }
 
       if (result.output.trim()) {
@@ -5453,183 +5193,67 @@ function init(): void {
 
   // ---- Adopt Switch ----
   async function adoptSwitch(): Promise<void> {
+    if (!ensureConsoleTaskAvailable('Adopt Switch', 'adopt-switch-preview')) return;
     await withCloudStatusPollingPaused(async () => {
-      if (configSync.hasStagedCandidate()) {
-        ui.adoptResults.innerHTML = '<div class="status-text error">Rollback or commit the staged config sync candidate before starting switch adoption.</div>';
-        term.writeError('Adopt Switch is blocked while a config sync candidate is staged.');
-        return;
-      }
+      await withConsoleTask('adopt-switch-preview', 'exclusive', 'switch adoption preview', async () => {
+        activateResultsTab('config-sync');
 
-      if (!mistApi.isConfigured) {
-        ui.adoptResults.innerHTML = '<div class="status-text error">Configure Mist API first (cloud, token, org ID).</div>';
-        return;
-      }
-
-      ui.btnAdopt.disabled = true;
-      ui.adoptResults.innerHTML = '<div class="status-text info">Fetching adoption commands from Mist…</div>';
-
-      try {
-      const commands = await mistApi.getAdoptionCommands();
-
-      if (!commands || !commands.includes('set ')) {
-        ui.adoptResults.innerHTML = '<div class="status-text error">No adoption commands returned from API. The endpoint may not be available for your account.</div>';
-        ui.btnAdopt.disabled = false;
-        return;
-      }
-
-      // Check if root-authentication is configured on the switch
-      term.writeSystem('— Checking root authentication before adoption —');
-      await cmdRunner.ensureOperationalMode();
-      const rootAuthCmd = await cmdRunner.execute('show configuration system root-authentication', 10000);
-      const hasRootAuth = rootAuthCmd.success &&
-        (rootAuthCmd.output.includes('encrypted-password') || rootAuthCmd.output.includes('ssh-'));
-
-      // Determine root password to use if needed
-      let rootPassword: string | null = null;
-      if (!hasRootAuth) {
-        term.writeSystem('  No root authentication configured — need to set one before adoption.');
-
-        // Try Mist site password first
-        const siteId = getEffectiveMistTarget().siteId ?? ui.mistSite.value;
-        if (siteId) {
-          rootPassword = await mistApi.getRootPassword(siteId);
-          if (rootPassword) {
-            term.writeSystem('  Using root password from Mist site settings.');
-          }
-        }
-
-        // Fall back to user-provided password
-        if (!rootPassword) {
-          rootPassword = ui.adoptRootPw.value.trim();
-        }
-
-        if (!rootPassword) {
-          ui.adoptResults.innerHTML = '<div class="status-text error">' +
-            '<strong>Root authentication is not configured on this switch.</strong><br><br>' +
-            'A root password is required before adoption commands can be committed.<br><br>' +
-            'Either:<br>' +
-            '1. Enter a root password in the field above and click Adopt again, or<br>' +
-            '2. Select a Mist site (in the Mist API section) that has a root password configured' +
-            '</div>';
-          ui.btnAdopt.disabled = false;
+        if (configSync.hasStagedCandidate()) {
+          const message = 'Rollback or commit the staged candidate configuration before starting switch adoption.';
+          ui.adoptResults.innerHTML = `<div class="status-text error">${message}</div>`;
+          ui.configSyncResults.innerHTML = `<div class="status-text error">${message}</div>`;
+          term.writeError('Adopt Switch is blocked while another candidate configuration is staged.');
           return;
         }
-      } else {
-        term.writeSystem('  Root authentication is configured.');
-      }
 
-      // Display the commands (including root password set if needed)
-      const commandLines = commands.split('\n').filter((l: string) => l.trim().length > 0);
-      const totalCommands = commandLines.length + (rootPassword ? 1 : 0);
+        if (!mistApi.isConfigured && !mistApi.hasLaunchOverlay) {
+          const message = 'Configure Mist API first (cloud, token, org ID), or launch from Mist.';
+          ui.adoptResults.innerHTML = `<div class="status-text error">${message}</div>`;
+          ui.configSyncResults.innerHTML = `<div class="status-text error">${message}</div>`;
+          return;
+        }
 
-      let html = '<div class="drift-section-title">Adoption Commands (' + totalCommands + ' lines)</div>';
-      html += '<div style="max-height:200px;overflow-y:auto;margin-bottom:8px;">';
-      if (rootPassword) {
-        html += '<div class="drift-line mist-only"><span class="drift-category">Root Auth</span>set system root-authentication plain-text-password ••••••••</div>';
-      }
-      for (const line of commandLines) {
-        html += `<div class="drift-line mist-only">${escapeHtml(line.trim())}</div>`;
-      }
-      html += '</div>';
-
-      if (!hasRootAuth) {
-        html += '<div class="status-text info" style="margin-bottom:8px;">Root password will be set before adoption commands are applied.</div>';
-      }
-
-      html += '<div class="sidebar-actions" style="margin-top:8px;">';
-      html += '<button id="btn-adopt-apply" class="btn btn-primary">Apply to Switch</button>';
-      html += '<button id="btn-adopt-cancel" class="btn btn-secondary">Cancel</button>';
-      html += '</div>';
-      html += '<div id="adopt-apply-status"></div>';
-
-      ui.adoptResults.innerHTML = html;
-      term.writeSystem(`— Retrieved ${commandLines.length} adoption commands from Mist —`);
-
-      // Wire up the apply button
-      const applyBtn = document.getElementById('btn-adopt-apply') as HTMLButtonElement;
-      const cancelBtn = document.getElementById('btn-adopt-cancel') as HTMLButtonElement;
-      const statusEl = document.getElementById('adopt-apply-status') as HTMLElement;
-
-      cancelBtn.addEventListener('click', () => {
-        ui.adoptResults.innerHTML = '';
-        ui.btnAdopt.disabled = false;
-      });
-
-      applyBtn.addEventListener('click', async () => {
-        applyBtn.disabled = true;
-        cancelBtn.disabled = true;
-        statusEl.innerHTML = '<div class="status-text info">Entering config mode…</div>';
-        term.writeSystem('— Applying adoption commands to switch —');
+        ui.btnAdopt.disabled = true;
+        ui.adoptResults.innerHTML = '<div class="status-text info">Fetching adoption commands from Mist…</div>';
+        ui.configSyncResults.innerHTML = '<div class="status-text info">Fetching adoption commands from Mist…</div>';
 
         try {
-          // Enter config mode
-          const editResult = await cmdRunner.execute('edit', 5000);
-          if (!editResult.output.includes('#') && !editResult.success) {
-            statusEl.innerHTML = '<div class="status-text error">Failed to enter config mode. Are you logged in as root?</div>';
-            term.writeError('Failed to enter config mode.');
-            applyBtn.disabled = false;
-            cancelBtn.disabled = false;
-            return;
-          }
+          const prepared = await prepareAdoptionPlan({
+            getAdoptionCommands: () => mistApi.getAdoptionCommands(),
+            getSiteId: () => (getEffectiveMistTarget().siteId ?? ui.mistSite.value) || null,
+            getRootPassword: (siteId) => mistApi.getRootPassword(siteId),
+            getUserProvidedRootPassword: () => ui.adoptRootPw.value,
+            term,
+          });
 
-          // Set root password first if needed
-          if (rootPassword) {
-            statusEl.innerHTML = '<div class="status-text info">Setting root password…</div>';
-            term.writeSystem('  Setting root authentication…');
-
-            // Use plain-text-password which prompts for password twice
-            await cmdRunner.send('set system root-authentication plain-text-password\n');
-            await new Promise((r) => setTimeout(r, 1000));
-
-            // Enter password at "New password:" prompt
-            const pw1 = await cmdRunner.sendAndWaitFor(rootPassword + '\n', /password:|secret:/, 5000);
-            if (pw1.matched) {
-              // Enter password again at "Retype new password:" prompt
-              await cmdRunner.sendAndWaitFor(rootPassword + '\n', /#/, 5000);
-            }
-
-            term.writeSystem('  Root password set.');
-          }
-
-          statusEl.innerHTML = '<div class="status-text info">Applying adoption commands…</div>';
-
-          // Apply each command
-          let applied = 0;
-          for (const line of commandLines) {
-            const trimmed = line.trim();
-            if (trimmed.length === 0) continue;
-            await cmdRunner.execute(trimmed, 5000, 500);
-            applied++;
-          }
-
-          statusEl.innerHTML = `<div class="status-text info">Applied ${applied} commands. Committing…</div>`;
-          term.writeSystem(`  Applied ${applied} commands. Committing…`);
-
-          // Commit
-          const commitResult = await cmdRunner.execute('commit and-quit', 60000, 5000);
-          if (commitResult.output.includes('commit complete') || commitResult.output.includes('configuration check succeeds')) {
-            statusEl.innerHTML = '<div class="status-text success">Adoption commands applied and committed successfully. The switch should connect to Mist within a few minutes.</div>';
-            term.writeSystem('  Commit successful. Switch should connect to Mist shortly.');
-          } else if (commitResult.output.includes('error')) {
-            statusEl.innerHTML = '<div class="status-text error">Commit returned errors. Check the terminal output.</div>';
-            term.writeError('Commit may have failed. Check output above.');
-          } else {
-            statusEl.innerHTML = '<div class="status-text info">Commit sent. Check terminal for result.</div>';
-          }
+          const { plan } = prepared;
+          await previewCandidateWorkflow({
+            cli: plan.commandLines,
+            cleanupDeletes: [],
+            stagedCandidateErrorMessage: 'A config candidate is already staged on the switch. Commit or roll back before starting a new preview.',
+          }, {
+            title: 'Adoption Commands',
+            summary: (result) => `${result.mistCliCommandCount} total commands from Mist adoption intent.`,
+            commandPreviewLines: plan.commandLines,
+            diffEmptySummary: 'No changes detected — adoption config already appears to be present on the switch.',
+            decisionSummary: 'Adoption candidate is staged on the switch. Review the diff above, then choose Commit or Rollback in the panel below.',
+            startTerminalMessage: '— Starting switch adoption preview —',
+            successTerminalMessage: '— Adoption preview complete —',
+            noDiffTerminalMessage: 'No diff detected — adoption config already appears to be present.',
+            stagedTerminalMessage: 'Adoption candidate staged — choose Commit or Rollback below.',
+            incompleteTerminalMessage: 'Warning: adoption staging did not complete cleanly.',
+            candidateTerminalSummary: (result) => `  Candidate: ${result.candidateCommandCount} adoption commands from Mist intent`,
+          });
+          ui.adoptResults.innerHTML = '<div class="status-text info">Adoption candidate staged — see Config Sync tab and choose Commit or Rollback.</div>';
+          term.writeSystem(`— Retrieved ${plan.commandLines.length} adoption commands from Mist —`);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          statusEl.innerHTML = `<div class="status-text error">Error: ${msg}</div>`;
-          term.writeError(`Adoption apply error: ${msg}`);
-        } finally {
-          ui.btnAdopt.disabled = false;
+          ui.adoptResults.innerHTML = `<div class="status-text error">Failed to fetch adoption commands: ${escapeHtml(msg)}</div>`;
+          ui.configSyncResults.innerHTML = `<div class="status-text error">Failed to fetch adoption commands: ${escapeHtml(msg)}</div>`;
+          term.writeError(`Adoption fetch error: ${msg}`);
+          updateConfigSyncUIState();
         }
       });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ui.adoptResults.innerHTML = `<div class="status-text error">Failed to fetch adoption commands: ${msg}</div>`;
-        term.writeError(`Adoption fetch error: ${msg}`);
-        ui.btnAdopt.disabled = false;
-      }
     });
   }
 
