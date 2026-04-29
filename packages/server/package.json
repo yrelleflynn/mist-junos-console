@@ -1,0 +1,31 @@
+{
+  "name": "@marvis/server",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc --build",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "clean": "rimraf dist *.tsbuildinfo public/assets",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@marvis/shared": "*",
+    "@hono/node-server": "^1.12.0",
+    "hono": "^4.4.0",
+    "ws": "^8.17.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/ws": "^8.5.10",
+    "@vitest/coverage-v8": "^2.1.0",
+    "rimraf": "^5.0.5",
+    "tsx": "^4.15.0",
+    "typescript": "^5.4.5",
+    "vitest": "^2.1.0"
+  }
+}

@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+.claude/
+*.tsbuildinfo
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+Thumbs.db
+packages/server/public/assets/
+packages/client/dist/
+coverage/
+.nyc_output/

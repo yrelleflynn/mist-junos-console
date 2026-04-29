@@ -1,0 +1,22 @@
+// Side-effect imports — each module calls registerCheck() at load time.
+import './uplink-port-status.js';
+import './uplink-port-errors.js';
+import './mgmt-ip-assigned.js';
+import './mgmt-vlan-reachable.js';
+import './default-gateway-ping.js';
+import './mtu-check.js';
+import './default-route-present.js';
+import './default-route-via-gateway.js';
+import './routing-table-size.js';
+import './arp-gateway.js';
+import './arp-mist-ep.js';
+import './dns-resolution.js';
+import './dns-mist-ep.js';
+import './dns-ntp.js';
+import './jma-state.js';
+import './mist-ep-reachable.js';
+import './ntp-sync.js';
+import './mist-websocket.js';
+import './mist-last-seen.js';
+import './mcd-logs-at-offline.js';
+import './config-changes-at-offline.js';
