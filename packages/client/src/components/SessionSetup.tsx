@@ -4,11 +4,20 @@ import { MIST_CLOUDS } from '@marvis/shared';
 import { buildManualSession, saveExtensionId } from '../session/providers.js';
 
 interface SessionSetupProps {
-  onComplete: (mac: string, session: MistSession, hostname?: string) => void;
+  onComplete: (mac: string, session: MistSession | null, hostname?: string) => void;
 }
 
+type Tab = 'console' | 'mist' | 'extension';
+
+const TAB_LABELS: Record<Tab, string> = {
+  console: 'Console Only',
+  mist: 'Mist Session',
+  extension: 'Extension',
+};
+
 export function SessionSetup({ onComplete }: SessionSetupProps) {
-  const [tab, setTab] = useState<'manual' | 'extension'>('manual');
+  const [tab, setTab] = useState<Tab>('console');
+  const [label, setLabel] = useState('');
   const [mac, setMac] = useState('');
   const [hostname, setHostname] = useState('');
   const [cloud, setCloud] = useState<MistCloud>('global01');
@@ -17,7 +26,13 @@ export function SessionSetup({ onComplete }: SessionSetupProps) {
   const [extId, setExtId] = useState('');
   const [error, setError] = useState('');
 
-  function handleManualSubmit(e: React.FormEvent) {
+  function handleConsoleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    const placeholderMac = 'local-' + Math.random().toString(16).slice(2, 10);
+    onComplete(placeholderMac, null, label.trim() || undefined);
+  }
+
+  function handleMistSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError('');
     if (!mac.trim()) { setError('Device MAC address is required'); return; }
@@ -51,6 +66,18 @@ export function SessionSetup({ onComplete }: SessionSetupProps) {
     marginBottom: '4px',
   };
 
+  const submitStyle: React.CSSProperties = {
+    padding: '9px',
+    fontSize: '13px',
+    fontWeight: 600,
+    background: 'var(--color-accent)',
+    color: '#fff',
+    border: 'none',
+    borderRadius: '6px',
+    marginTop: '4px',
+    cursor: 'pointer',
+  };
+
   return (
     <div
       style={{
@@ -72,31 +99,51 @@ export function SessionSetup({ onComplete }: SessionSetupProps) {
       >
         <h1 style={{ fontSize: '18px', fontWeight: 700, marginBottom: '6px' }}>Marvis Console</h1>
         <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', marginBottom: '24px' }}>
-          Connect a device session to begin troubleshooting.
+          Connect a switch via USB serial cable, optionally with a Mist session for troubleshooting checks.
         </p>
 
-        <div style={{ display: 'flex', gap: '8px', marginBottom: '20px' }}>
-          {(['manual', 'extension'] as const).map((t) => (
+        <div style={{ display: 'flex', gap: '6px', marginBottom: '20px' }}>
+          {(['console', 'mist', 'extension'] as Tab[]).map((t) => (
             <button
               key={t}
-              onClick={() => setTab(t)}
+              onClick={() => { setTab(t); setError(''); }}
               style={{
-                padding: '5px 14px',
+                padding: '5px 12px',
                 fontSize: '12px',
                 fontWeight: 600,
                 borderRadius: '5px',
                 border: '1px solid var(--color-border)',
                 background: tab === t ? 'var(--color-accent)' : 'var(--color-surface-2)',
                 color: tab === t ? '#fff' : 'var(--color-text-muted)',
+                cursor: 'pointer',
               }}
             >
-              {t === 'manual' ? 'Manual' : 'Extension'}
+              {TAB_LABELS[t]}
             </button>
           ))}
         </div>
 
-        {tab === 'manual' && (
-          <form onSubmit={handleManualSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+        {tab === 'console' && (
+          <form onSubmit={handleConsoleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+            <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', margin: 0 }}>
+              Opens a serial console terminal. No Mist credentials needed — you will be prompted
+              to select the USB serial port after clicking Open Console.
+            </p>
+            <div>
+              <label style={labelStyle}>Device Label <span style={{ fontWeight: 400 }}>(optional)</span></label>
+              <input
+                style={inputStyle}
+                value={label}
+                onChange={(e) => setLabel(e.target.value)}
+                placeholder="e.g. ex2300-closet-1"
+              />
+            </div>
+            <button type="submit" style={submitStyle}>Open Console</button>
+          </form>
+        )}
+
+        {tab === 'mist' && (
+          <form onSubmit={handleMistSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
             <div>
               <label style={labelStyle}>Device MAC Address *</label>
               <input style={inputStyle} value={mac} onChange={(e) => setMac(e.target.value)} placeholder="xx:xx:xx:xx:xx:xx" />
@@ -121,28 +168,14 @@ export function SessionSetup({ onComplete }: SessionSetupProps) {
               <label style={labelStyle}>Session ID *</label>
               <input style={inputStyle} value={sid} onChange={(e) => setSid(e.target.value)} placeholder="from Mist browser cookies" />
             </div>
-            {error && <p style={{ fontSize: '12px', color: 'var(--color-fail)' }}>{error}</p>}
-            <button
-              type="submit"
-              style={{
-                padding: '9px',
-                fontSize: '13px',
-                fontWeight: 600,
-                background: 'var(--color-accent)',
-                color: '#fff',
-                border: 'none',
-                borderRadius: '6px',
-                marginTop: '4px',
-              }}
-            >
-              Start Session
-            </button>
+            {error && <p style={{ fontSize: '12px', color: 'var(--color-fail)', margin: 0 }}>{error}</p>}
+            <button type="submit" style={submitStyle}>Start Session</button>
           </form>
         )}
 
         {tab === 'extension' && (
           <form onSubmit={handleExtensionSave} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-            <p style={{ fontSize: '12px', color: 'var(--color-text-muted)' }}>
+            <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', margin: 0 }}>
               Install the Marvis Console Chrome extension, then paste its Extension ID below.
               The extension will automatically inject Mist session credentials.
             </p>
@@ -151,24 +184,11 @@ export function SessionSetup({ onComplete }: SessionSetupProps) {
               <input style={inputStyle} value={extId} onChange={(e) => setExtId(e.target.value)} placeholder="abcdefghijklmnopqrstuvwxyzabcdef" />
             </div>
             {error && (
-              <p style={{ fontSize: '12px', color: error.startsWith('Extension ID saved') ? 'var(--color-pass)' : 'var(--color-fail)' }}>
+              <p style={{ fontSize: '12px', color: error.startsWith('Extension ID saved') ? 'var(--color-pass)' : 'var(--color-fail)', margin: 0 }}>
                 {error}
               </p>
             )}
-            <button
-              type="submit"
-              style={{
-                padding: '9px',
-                fontSize: '13px',
-                fontWeight: 600,
-                background: 'var(--color-accent)',
-                color: '#fff',
-                border: 'none',
-                borderRadius: '6px',
-              }}
-            >
-              Save Extension ID
-            </button>
+            <button type="submit" style={submitStyle}>Save Extension ID</button>
           </form>
         )}
       </div>

@@ -75,12 +75,16 @@ export function App() {
     [ws, serial, sessionId],
   );
 
-  async function handleSetupComplete(mac: string, session: MistSession, hostname?: string) {
-    setMistSession(session);
+  async function handleSetupComplete(mac: string, session: MistSession | null, hostname?: string) {
+    if (session) setMistSession(session);
     const res = await fetch('/api/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ deviceMac: mac, deviceHostname: hostname, mistSession: session }),
+      body: JSON.stringify({
+        deviceMac: mac,
+        deviceHostname: hostname,
+        ...(session && { mistSession: session }),
+      }),
     });
     const json = (await res.json()) as { success: boolean; data?: { id: string } };
     if (json.success && json.data) {
@@ -131,23 +135,6 @@ export function App() {
               {mistSession.cloud}
             </span>
           )}
-          {serial.status === 'closed' && (
-            <button
-              onClick={() => serial.open(handleSerialRx)}
-              style={{
-                marginLeft: 'auto',
-                padding: '4px 10px',
-                fontSize: '11px',
-                fontWeight: 600,
-                background: 'var(--color-surface-2)',
-                color: 'var(--color-accent)',
-                border: '1px solid var(--color-accent)',
-                borderRadius: '4px',
-              }}
-            >
-              Connect Serial
-            </button>
-          )}
           {serial.status === 'open' && (
             <button
               onClick={() => serial.close()}
@@ -159,14 +146,48 @@ export function App() {
                 color: 'var(--color-text-muted)',
                 border: '1px solid var(--color-border)',
                 borderRadius: '4px',
+                cursor: 'pointer',
               }}
             >
               Disconnect
             </button>
           )}
         </header>
-        <div style={{ flex: 1, minHeight: 0 }}>
+        <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
           <Terminal ref={termRef} onData={handleTerminalInput} />
+          {serial.status !== 'open' && (
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                background: 'rgba(13,13,15,0.88)',
+                gap: '10px',
+              }}
+            >
+              <span style={{ fontSize: '13px', color: 'var(--color-text-muted)' }}>
+                {serial.status === 'error' ? 'Serial port error — try again' : 'No serial port connected'}
+              </span>
+              <button
+                onClick={() => serial.open(handleSerialRx)}
+                style={{
+                  padding: '10px 22px',
+                  fontSize: '13px',
+                  fontWeight: 700,
+                  background: 'var(--color-accent)',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                }}
+              >
+                Select Serial Port
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
