@@ -4,7 +4,7 @@ import { MIST_CLOUDS } from '@marvis/shared';
 import { buildManualSession, saveExtensionId } from '../session/providers.js';
 
 interface SessionSetupProps {
-  onComplete: (mac: string, session: MistSession | null, hostname?: string) => void;
+  onComplete: (mac: string, session: MistSession | null, hostname?: string) => Promise<string | null>;
 }
 
 type Tab = 'console' | 'mist' | 'extension';
@@ -17,6 +17,7 @@ const TAB_LABELS: Record<Tab, string> = {
 
 export function SessionSetup({ onComplete }: SessionSetupProps) {
   const [tab, setTab] = useState<Tab>('console');
+  const [loading, setLoading] = useState(false);
   const [label, setLabel] = useState('');
   const [mac, setMac] = useState('');
   const [hostname, setHostname] = useState('');
@@ -26,19 +27,24 @@ export function SessionSetup({ onComplete }: SessionSetupProps) {
   const [extId, setExtId] = useState('');
   const [error, setError] = useState('');
 
-  function handleConsoleSubmit(e: React.FormEvent) {
+  async function handleConsoleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    setError('');
+    setLoading(true);
     const placeholderMac = 'local-' + Math.random().toString(16).slice(2, 10);
-    onComplete(placeholderMac, null, label.trim() || undefined);
+    const err = await onComplete(placeholderMac, null, label.trim() || undefined);
+    if (err) { setError(err); setLoading(false); }
   }
 
-  function handleMistSubmit(e: React.FormEvent) {
+  async function handleMistSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError('');
     if (!mac.trim()) { setError('Device MAC address is required'); return; }
     if (!csrf.trim() || !sid.trim()) { setError('CSRF token and session ID are required'); return; }
+    setLoading(true);
     const session = buildManualSession(cloud, csrf.trim(), sid.trim());
-    onComplete(mac.trim(), session, hostname.trim() || undefined);
+    const err = await onComplete(mac.trim(), session, hostname.trim() || undefined);
+    if (err) { setError(err); setLoading(false); }
   }
 
   function handleExtensionSave(e: React.FormEvent) {
@@ -136,9 +142,13 @@ export function SessionSetup({ onComplete }: SessionSetupProps) {
                 value={label}
                 onChange={(e) => setLabel(e.target.value)}
                 placeholder="e.g. ex2300-closet-1"
+                disabled={loading}
               />
             </div>
-            <button type="submit" style={submitStyle}>Open Console</button>
+            {error && <p style={{ fontSize: '12px', color: 'var(--color-fail)', margin: 0 }}>{error}</p>}
+            <button type="submit" style={{ ...submitStyle, opacity: loading ? 0.6 : 1 }} disabled={loading}>
+              {loading ? 'Connecting…' : 'Open Console'}
+            </button>
           </form>
         )}
 

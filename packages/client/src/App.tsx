@@ -75,20 +75,30 @@ export function App() {
     [ws, serial, sessionId],
   );
 
-  async function handleSetupComplete(mac: string, session: MistSession | null, hostname?: string) {
+  async function handleSetupComplete(
+    mac: string,
+    session: MistSession | null,
+    hostname?: string,
+  ): Promise<string | null> {
     if (session) setMistSession(session);
-    const res = await fetch('/api/sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        deviceMac: mac,
-        deviceHostname: hostname,
-        ...(session && { mistSession: session }),
-      }),
-    });
-    const json = (await res.json()) as { success: boolean; data?: { id: string } };
-    if (json.success && json.data) {
-      setSessionId(json.data.id);
+    try {
+      const res = await fetch('/api/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceMac: mac,
+          deviceHostname: hostname,
+          ...(session && { mistSession: session }),
+        }),
+      });
+      const json = (await res.json()) as { success: boolean; data?: { id: string }; error?: string };
+      if (json.success && json.data) {
+        setSessionId(json.data.id);
+        return null;
+      }
+      return json.error ?? 'Server returned an error';
+    } catch {
+      return 'Cannot reach server — make sure the Marvis Console server is running';
     }
   }
 
